@@ -2,8 +2,6 @@ import streamlit as st
 import pandas as pd
 import time
 from futu import *
-import streamlit as st
-import pandas as pd
 
 # 頁面基礎設置
 st.set_page_config(page_title="富途量化終端", layout="wide")
