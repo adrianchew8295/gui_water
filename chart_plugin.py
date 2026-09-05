@@ -1,5 +1,5 @@
 # 文件名: chart_plugin.py
-# 核心功能: 專業金融圖表 - 美東時間軸 + 盤前盤後灰色透明區塊 + ☀️/🌙 標記 + TD 趨勢通道
+# 核心功能: 專業金融圖表 - 美東時間軸 + 盤前/盤後半透明灰色陰影區塊 (ETH Shading) + 純淨 K 線 + VPA 副圖
 
 import os
 import pandas as pd
@@ -16,7 +16,7 @@ class ChartPlugin:
         self.data_dir = data_dir
 
     def get_realtime_market_price(self, code: str) -> dict:
-        """調用本地 OpenD 獲取最新即時跳動價"""
+        """調用本地 OpenD 獲取最新即時跳動價 (包含 Premarket / Postmarket)"""
         res = {"price": None, "status_text": "常規盤"}
         try:
             ctx = OpenQuoteContext(host='127.0.0.1', port=11111)
@@ -26,7 +26,7 @@ class ChartPlugin:
                 row = df_snap.iloc[0]
                 res["price"] = float(row['last_price'])
                 status = row.get('market_status', '')
-                res["status_text"] = f"即時跳動 ({status})" if status else "即時盤口"
+                res["status_text"] = f"即時跳動 ({status})" if status else "即時盤口現價"
         except Exception:
             pass
         return res
@@ -37,7 +37,7 @@ class ChartPlugin:
         
         if not os.path.exists(file_path):
             st.error(f"❌ 找不到本地數據檔案：`{file_path}`")
-            st.info(f"💡 請先在終端機執行 `python data_fetcher.py` 下載歷史數據。")
+            st.info(f"💡 請先在終端機執行 `python data_fetcher.py` 同步歷史數據。")
             return pd.DataFrame()
             
         try:
@@ -65,11 +65,9 @@ class ChartPlugin:
             time_col = 'time_key' if 'time_key' in df.columns else ('date' if 'date' in df.columns else df.columns[0])
             df['dt_obj'] = pd.to_datetime(df[time_col])
 
-            # 美東時間戳轉換
             if ktype_name in ['DAY', 'WEEK']:
                 df['time_clean'] = df['dt_obj'].dt.strftime('%Y-%m-%d')
             else:
-                # 1Hr 採用 UNIX 秒級時間戳
                 df['time_clean'] = df['dt_obj'].astype('int64') // 10**9
 
             df = df.drop_duplicates(subset=['time_clean']).sort_values('dt_obj').reset_index(drop=True)
@@ -79,7 +77,7 @@ class ChartPlugin:
             live_info = self.get_realtime_market_price(code)
             if live_info["price"]:
                 current_price = live_info["price"]
-                price_desc = f"🟢 {live_info['status_text']}: **${current_price:.2f}** (美東時間)"
+                price_desc = f"🟢 {live_info['status_text']}: **${current_price:.2f}** (美東時間 ET)"
                 df.loc[df.index[-1], 'close'] = current_price
                 if current_price > df.loc[df.index[-1], 'high']:
                     df.loc[df.index[-1], 'high'] = current_price
@@ -92,8 +90,8 @@ class ChartPlugin:
             td_res = compute_demark_trendlines(df, window=4)
             td_highs, td_lows = find_td_pivots(df, window=4)
 
-            # ---------------- 🎯 50/50 多空雙向推演 Window ----------------
-            st.markdown(f"### 🧭 {code} - {ktype_name} 戰術決策預測面板 (美東時間)")
+            # ---------------- 🎯 50/50 戰術決策預測面板 ----------------
+            st.markdown(f"### 🧭 {code} - {ktype_name} 戰術決策預測面板 (美東時間 ET)")
             st.markdown(price_desc)
 
             res_val = td_res.get('curr_res_val') or round(current_price * 1.01, 2)
@@ -111,7 +109,7 @@ class ChartPlugin:
                 st.markdown(f"""
                 - **起爆關鍵點**：站穩阻力線 **${res_val:.2f}**[cite: 2, 4]
                 - **第一目標位 (Target 1)**：🚀 **${t1:.2f}** (TD 0.618 突破浪)[cite: 1]
-                - **第二目標位 (Target 2)**：🎯 **${t2:.2f}** (TD 1.0 通道對稱浪)[cite: 1]
+                - **第二目標位 (Target 2)**：🎯 **${t2:.2f}** (TD 1.0 對稱通道)[cite: 1]
                 """)
 
             with w_right:
@@ -119,12 +117,12 @@ class ChartPlugin:
                 st.markdown(f"""
                 - **破位關鍵點**：跌破支撐線 **${sup_val:.2f}**[cite: 2, 4]
                 - **第一目標位 (Target 1)**：📉 **${b1:.2f}** (TD 0.618 下跌浪)[cite: 1]
-                - **第二目標位 (Target 2)**：🎯 **${b2:.2f}** (TD 1.0 通道對稱浪)[cite: 1]
+                - **第二目標位 (Target 2)**：🎯 **${b2:.2f}** (TD 1.0 對稱通道)[cite: 1]
                 """)
 
             st.divider()
 
-            # ---------------- 圖表數據構建 ----------------
+            # ---------------- 圖表數據解析 ----------------
             candles = []
             markers = []
             vol_bars = []
@@ -143,19 +141,17 @@ class ChartPlugin:
                 min_et = dt_item.minute
                 time_float = hour_et + min_et / 60.0
 
-                # 判定時段屬性 (美東時間基準)
-                is_pre = (time_float >= 4.0) and (time_float < 9.5)
-                is_post = (time_float >= 16.0) and (time_float <= 20.0)
+                # 判斷是否為常規交易時段 (RTH 09:30 - 16:00 ET)
                 is_rth = (time_float >= 9.5) and (time_float < 16.0)
 
-                # K 線色彩：常規時段飽和色，盤前盤後微透明/柔和色
+                # 色彩配置：常規盤高飽和，盤前盤後微柔和
                 is_up = row['close'] >= row['open']
                 if is_rth:
                     up_col = "#089981"
                     dn_col = "#F23645"
                 else:
-                    up_col = "#26a69a"
-                    dn_col = "#ef5350"
+                    up_col = "rgba(38, 166, 154, 0.65)"
+                    dn_col = "rgba(239, 83, 80, 0.65)"
 
                 candles.append({
                     "time": t,
@@ -165,13 +161,7 @@ class ChartPlugin:
                     "close": float(row['close'])
                 })
 
-                # 時段底部標記 (☀️ / 🌙)
-                if is_pre and min_et == 0 and hour_et == 4:
-                    markers.append({"time": t, "position": "belowBar", "color": "#FCD34D", "shape": "circle", "text": "☀️ Premarket"})
-                elif is_post and min_et == 0 and hour_et == 16:
-                    markers.append({"time": t, "position": "belowBar", "color": "#94A3B8", "shape": "circle", "text": "🌙 Postmarket"})
-
-                # TD 極值點標記
+                # TD 極值點箭頭標記
                 if str(row['time_clean']) in td_high_times:
                     markers.append({"time": t, "position": "aboveBar", "color": "#FF5252", "shape": "arrowDown", "text": "TD High"})
                 elif str(row['time_clean']) in td_low_times:
@@ -181,20 +171,22 @@ class ChartPlugin:
                     vol_bars.append({
                         "time": t,
                         "value": float(row['volume']),
-                        "color": up_col if is_up else dn_col
+                        "color": "#089981" if is_up else "#F23645"
                     })
                     if pd.notna(row.get('vma20')): vma20_line.append({"time": t, "value": float(row['vma20'])})
                     if pd.notna(row.get('vma_15x')): vma15_line.append({"time": t, "value": float(row['vma_15x'])})
                     if pd.notna(row.get('vma_20x')): vma20_alert_line.append({"time": t, "value": float(row['vma_20x'])})
 
-            # 主圖配置
+            # 主圖配置 (底色深黑，支援流暢縮放)
             price_chart = {
                 "height": 480,
                 "layout": {"textColor": "#8b949e", "background": {"type": "solid", "color": "#0d1117"}},
                 "grid": {"vertLines": {"color": "#161b22"}, "horzLines": {"color": "#161b22"}},
                 "crosshair": {"mode": 1},
                 "timeScale": {"timeVisible": True, "secondsVisible": False, "borderColor": "#21262d"},
-                "rightPriceScale": {"borderColor": "#21262d", "autoScale": True}
+                "rightPriceScale": {"borderColor": "#21262d", "autoScale": True},
+                "handleScroll": {"mouseWheel": True, "pressedMouseMove": True, "horzTouchDrag": True, "vertTouchDrag": True},
+                "handleScale": {"axisPressedMouseMove": True, "mouseWheel": True, "pinch": True}
             }
 
             price_series = [
@@ -212,7 +204,7 @@ class ChartPlugin:
                 }
             ]
 
-            # 疊加 TD 趨勢線
+            # 疊加 TD 趨勢線 (紅/綠虛線)
             if td_res.get("resistance_line"):
                 res_pts = [{"time": int(pt["time"]) if str(pt["time"]).isdigit() else pt["time"], "value": pt["value"]} for pt in td_res["resistance_line"]]
                 price_series.append({"type": "Line", "data": res_pts, "options": {"color": "#FF5252", "lineWidth": 2, "lineStyle": 2, "title": "TD Resistance"}})
@@ -223,7 +215,7 @@ class ChartPlugin:
 
             charts_to_render = [{"chart": price_chart, "series": price_series}]
 
-            # 副圖配置 (VPA 成交量)
+            # 副圖配置 (VPA 成交量 + 均量線)
             if has_vol and vol_bars:
                 vol_chart = {
                     "height": 160,
@@ -231,7 +223,9 @@ class ChartPlugin:
                     "grid": {"vertLines": {"color": "#161b22"}, "horzLines": {"color": "#161b22"}},
                     "crosshair": {"mode": 1},
                     "timeScale": {"timeVisible": True, "secondsVisible": False, "borderColor": "#21262d"},
-                    "rightPriceScale": {"borderColor": "#21262d", "autoScale": True}
+                    "rightPriceScale": {"borderColor": "#21262d", "autoScale": True},
+                    "handleScroll": {"mouseWheel": True, "pressedMouseMove": True, "horzTouchDrag": True, "vertTouchDrag": True},
+                    "handleScale": {"axisPressedMouseMove": True, "mouseWheel": True, "pinch": True}
                 }
                 vol_series = [
                     {"type": "Histogram", "data": vol_bars, "options": {"priceFormat": {"type": "volume"}, "priceScaleId": ""}},
