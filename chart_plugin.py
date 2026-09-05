@@ -1,5 +1,5 @@
 # 文件名: chart_plugin.py
-# 核心特性: 零阻塞秒級渲染 + 絕對路徑防呆 + 預判雷達 + 富途 1:2 結構純數據座艙
+# 核心特性: 零阻塞秒級渲染 + 預判雷達 + 富途指標 1:2 結構 (純數據座艙)
 
 import os
 import time
@@ -12,7 +12,7 @@ from moomoo import OpenQuoteContext, RET_OK
 
 tz_ny = pytz.timezone("America/New_York")
 
-# 使用絕對路徑定位 market_data，防止路徑錯誤
+# 絕對路徑防呆定位
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, 'market_data')
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -22,7 +22,7 @@ class ChartPlugin:
         self.data_dir = data_dir
 
     def calculate_atr(self, df: pd.DataFrame, period: int = 14) -> pd.Series:
-        """計算 ATR14 波動率 (純 Numpy/Pandas 向量化計算，0 延遲)"""
+        """計算 ATR14 波動率"""
         if len(df) < 2:
             return pd.Series([1.0] * len(df))
         high = df['high']
@@ -32,7 +32,7 @@ class ChartPlugin:
         return tr.rolling(window=period).mean().bfill()
 
     def get_realtime_snapshot(self, code: str) -> dict:
-        """極速非阻塞撮合快照 (嚴格超時控制，小於 10ms)"""
+        """極速非阻塞快照"""
         res = {
             "price": 0.0, "source": "未連線", "server_time": "--",
             "latency_ms": 0, "open": 0.0, "high": 0.0, "low": 0.0, "vol": 0.0
@@ -40,7 +40,6 @@ class ChartPlugin:
         t_start = time.time()
         target_symbol = "CC.BTCUSD" if "BTC" in code.upper() else code
 
-        # 嘗試 OpenD 本機快照
         quote_ctx = None
         try:
             quote_ctx = OpenQuoteContext(host='127.0.0.1', port=11111)
@@ -63,14 +62,13 @@ class ChartPlugin:
                 try: quote_ctx.close()
                 except: pass
 
-        # 若無 OpenD 連線，返回默認保底快照，絕不卡死
         res["source"] = "🟡 本地保底數據"
         res["server_time"] = datetime.datetime.now(tz_ny).strftime('%H:%M:%S')
         res["latency_ms"] = int((time.time() - t_start) * 1000)
         return res
 
     def load_safe_kline(self, code: str, ktype_name: str) -> pd.DataFrame:
-        """純本地讀取 K 線，完全杜絕在渲染循環中發起網絡下載"""
+        """純本地讀取 CSV，絕不阻塞"""
         is_btc = "BTC" in code.upper()
         save_prefix = "CC_BTCUSD" if is_btc else code.replace('.', '_')
         file_path = os.path.join(self.data_dir, f"{save_prefix}_{ktype_name}.csv")
@@ -86,7 +84,7 @@ class ChartPlugin:
             except Exception:
                 pass
 
-        # 若本地無 CSV，生成 20 根標準結構數據供界面立即渲染
+        # 預設保底數據
         base_p = 79700.0 if is_btc else 488.0
         now = datetime.datetime.now(tz_ny)
         dummy_times = [now - datetime.timedelta(minutes=5 * i) for i in range(20)][::-1]
@@ -101,21 +99,20 @@ class ChartPlugin:
         return dummy_df
 
     def render_cockpit(self, code: str):
-        """【實戰座艙主渲染】：全防禦式設計，100% 杜絕白屏"""
-        # 1. 抓取快照與 K 線
+        """【主座艙渲染】：純原生組件，秒出結果"""
         snap = self.get_realtime_snapshot(code)
         df_day = self.load_safe_kline(code, "DAY")
         df_1h = self.load_safe_kline(code, "1Hr")
         df_5m = self.load_safe_kline(code, "5M")
 
-        # 2. 確定當前現價
+        # 1. 現價計算
         live_price = snap["price"]
         if live_price <= 0 and not df_5m.empty:
             live_price = float(df_5m['close'].iloc[-1])
         if live_price <= 0:
             live_price = 79700.0 if "BTC" in code.upper() else 488.0
 
-        # 3. 宏觀方向 (TREND_BIAS)
+        # 2. 宏觀方向 (TREND_BIAS)
         trend_bias = 0
         trend_bias_str = "⚪ 0 (中立震盪)"
         pdh_line, pdl_line = live_price * 1.008, live_price * 0.992
@@ -133,7 +130,7 @@ class ChartPlugin:
                 trend_bias = -1
                 trend_bias_str = "🔴 -1 (空頭壓制 [日線<EMA20])"
 
-        # 4. 天花板與地板 (SBR / RBS)
+        # 3. 天花板與地板 (SBR / RBS)
         hr_res = pdh_line
         hr_sup = pdl_line
         if not df_1h.empty and len(df_1h) >= 5:
@@ -143,14 +140,13 @@ class ChartPlugin:
         dist_res = hr_res - live_price
         dist_sup = live_price - hr_sup
 
-        # 5. 5M 量能門禁與形態判定
+        # 4. 5M 量能門禁與形態判定
         vol_ratio = 1.0
         vol_heavy = False
         bar_time_str = datetime.datetime.now(tz_ny).strftime('%Y-%m-%d %H:%M')
         atr_val = live_price * 0.003
 
         bull_2b, bear_2b = False, False
-        bull_star, bear_star = False, False
 
         if not df_5m.empty and len(df_5m) >= 5:
             bar_time_str = str(df_5m['time_key'].iloc[-1])
@@ -158,9 +154,6 @@ class ChartPlugin:
             df_5m['atr14'] = self.calculate_atr(df_5m, 14)
 
             last_5m = df_5m.iloc[-1]
-            prev_5m = df_5m.iloc[-2]
-            prev2_5m = df_5m.iloc[-3] if len(df_5m) >= 3 else prev_5m
-
             c_curr, o_curr = float(last_5m['close']), float(last_5m['open'])
             h_curr, l_curr = float(last_5m['high']), float(last_5m['low'])
             v_curr = float(last_5m['volume'])
@@ -174,10 +167,8 @@ class ChartPlugin:
 
             bull_2b = (l_curr < llv5 or l_curr < pdl_line) and (c_curr > llv5) and (c_curr > o_curr)
             bear_2b = (h_curr > hhv5 or h_curr > pdh_line) and (c_curr < hhv5) and (c_curr < o_curr)
-            bull_star = (float(prev2_5m['close']) < float(prev2_5m['open'])) and (c_curr > o_curr)
-            bear_star = (float(prev2_5m['close']) > float(prev2_5m['open'])) and (c_curr < o_curr)
 
-        # 6. 1:2 結構預案與當前指令
+        # 5. 1:2 結構預案
         plan_sell_sl = hr_res + 0.5 * atr_val
         plan_sell_tp = hr_res - 2.0 * (plan_sell_sl - hr_res)
         plan_buy_sl = hr_sup - 0.5 * atr_val
@@ -204,19 +195,16 @@ class ChartPlugin:
             action_detail = f"👀 價格已逼近地板 (${hr_sup:,.2f})！正在等待 5M 扎針破底翻且放量 ≥ 1.25x 立即做多"
 
         # ====== 畫面渲染 (純 Streamlit 官方原生組件) ======
-        # 1. 頂部狀態憑證
         st.success(f"📶 數據通道: **{snap['source']}** | 撮合時間: **{snap['server_time']} ET** | 延遲: **{snap['latency_ms']} ms** | 📅 5M 棒線: **{bar_time_str}**")
 
-        # 2. 4 大核心指標卡片
         col1, col2, col3, col4 = st.columns(4)
-        col1.metric("最新跳動現價 (Live)", f"${live_price:,.2f}")
+        col1.metric("最新現價 (Live)", f"${live_price:,.2f}")
         col2.metric("宏觀方向 (Trend Bias)", trend_bias_str)
         col3.metric("5M 量能門禁", f"{vol_ratio:.2f}x", "🟢 放量達標" if vol_heavy else "⚪ 常規縮量")
-        col4.metric("戰術信號 (Signal)", tactical_sig)
+        col4.metric("戰術信號", tactical_sig)
 
         st.divider()
 
-        # 3. 預判雷達表格 (Prediction Radar Table)
         st.markdown("##### 🎯 預判雷達 (清楚掌握上下邊界與 1:2 預案)")
         radar_df = pd.DataFrame({
             "戰區方向": ["🔴 上方阻力 (天花板 / SBR)", "🟢 下方支撐 (地板 / RBS)"],
@@ -229,5 +217,4 @@ class ChartPlugin:
         })
         st.dataframe(radar_df, use_container_width=True, hide_index=True)
 
-        # 4. 具體操作指令框
         st.info(f"**🎯 0DTE 操作指示**：{action_detail}")
