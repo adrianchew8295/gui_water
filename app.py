@@ -1,5 +1,5 @@
 # 文件名: app.py
-# 核心功能: 極簡純數據實戰座艙主入口 (移除死循環，秒級直接加載)
+# 核心功能: 極簡純數據實戰座艙主入口 (0 網絡阻塞，秒級即時加載)
 
 import streamlit as st
 from chart_plugin import ChartPlugin
