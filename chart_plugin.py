@@ -10,27 +10,27 @@ class ChartPlugin:
     def __init__(self, data_dir: str = './market_data'):
         self.data_dir = data_dir
 
-    def get_live_snapshot_price(self, code: str) -> float:
-        """從本地 OpenD 獲取包含盤前/盤後的最新真實跳動價格"""
+    def get_realtime_market_price(self, code: str) -> dict:
+        """調用 OpenD 快照接口獲取包含盤前/盤後的當下跳動現價"""
+        res = {"price": None, "status_text": "常規收盤"}
         try:
             ctx = OpenQuoteContext(host='127.0.0.1', port=11111)
             ret, df_snap = ctx.get_market_snapshot([code])
             ctx.close()
             if ret == RET_OK and not df_snap.empty:
-                return float(df_snap.iloc[0]['last_price'])
+                row = df_snap.iloc[0]
+                res["price"] = float(row['last_price'])
+                # 判定當前時段 (盤前 Premarket / 盤後 Postmarket / 常規 Regular)
+                market_status = row.get('market_status', '')
+                res["status_text"] = f"即時跳動價 ({market_status})" if market_status else "即時盤口價"
         except Exception:
             pass
-        return None
+        return res
 
     def load_local_data(self, code: str, ktype_name: str) -> pd.DataFrame:
         clean_code = code.replace('.', '_')
         file_path = os.path.join(self.data_dir, f"{clean_code}_{ktype_name}.csv")
         
-        if not os.path.exists(file_path) and ktype_name == "1Hr":
-            alt_path = os.path.join(self.data_dir, f"{clean_code}_60M.csv")
-            if os.path.exists(alt_path):
-                file_path = alt_path
-
         if not os.path.exists(file_path):
             st.error(f"❌ 找不到本地數據檔案：`{file_path}`")
             return pd.DataFrame()
@@ -58,44 +58,59 @@ class ChartPlugin:
 
             df = df.drop_duplicates(subset=['time_clean']).sort_values('time_clean').reset_index(drop=True)
 
+            # 獲取最新實時盤前/盤後價格快照
+            live_info = self.get_realtime_market_price(code)
+            real_live_price = live_info["price"]
+            
+            # 若獲取到即時跳動價，更新最後一筆 K 線 Close 與 High/Low
+            if real_live_price:
+                current_price = real_live_price
+                price_status_desc = f"🟢 {live_info['status_text']}: **${current_price:.2f}**"
+                # 即時動態修正最後一根 K 線
+                df.loc[df.index[-1], 'close'] = current_price
+                if current_price > df.loc[df.index[-1], 'high']:
+                    df.loc[df.index[-1], 'high'] = current_price
+                if current_price < df.loc[df.index[-1], 'low']:
+                    df.loc[df.index[-1], 'low'] = current_price
+            else:
+                current_price = float(df['close'].iloc[-1])
+                price_status_desc = f"📌 歷史定格價: **${current_price:.2f}**"
+
             td_res = compute_demark_trendlines(df, window=4)
             td_highs, td_lows = find_td_pivots(df, window=4)
-            
-            # 優先獲取盤後跳動快照價，若 OpenD 未開則讀取歷史最新收盤價
-            live_price = self.get_live_snapshot_price(code)
-            current_price = live_price if live_price else float(df['close'].iloc[-1])
-            price_tag = "🔴 盤前/盤後即時跳動價" if live_price else "📌 常規時段歷史收盤價"
 
-            # ---------------- 🎯 實時多空波浪推演 Window ----------------
+            # ---------------- 🎯 50/50 雙向多空路徑推演 Window ----------------
             st.markdown(f"### 🧭 {code} - {ktype_name} 戰術決策預測面板")
-            st.caption(f"{price_tag}：**${current_price:.2f}**")
-            
+            st.markdown(price_status_desc)
+
+            res_val = td_res.get('curr_res_val') if td_res.get('curr_res_val') else round(current_price * 1.01, 2)
+            sup_val = td_res.get('curr_sup_val') if td_res.get('curr_sup_val') else round(current_price * 0.99, 2)
+            channel_h = abs(res_val - sup_val)
+
+            t1 = td_res.get('bull_target_1') or round(res_val + channel_h * 0.618, 2)
+            t2 = td_res.get('bull_target_2') or round(res_val + channel_h * 1.0, 2)
+            b1 = td_res.get('bear_target_1') or round(sup_val - channel_h * 0.618, 2)
+            b2 = td_res.get('bear_target_2') or round(sup_val - channel_h * 1.0, 2)
+
             w_left, w_right = st.columns(2)
             with w_left:
                 st.success("🟢 **多頭向上推演路徑 (Bullish Wave 50%)**")
-                res_val = td_res.get('curr_res_val') or current_price * 1.01
-                t1 = td_res.get('bull_target_1') or res_val * 1.015
-                t2 = td_res.get('bull_target_2') or res_val * 1.03
                 st.markdown(f"""
-                - **起爆關鍵點**：站穩阻力線 **${res_val:.2f}**
-                - **第一目標位 (Target 1)**：🚀 **${t1:.2f}** (TD 0.618 浪)
-                - **第二目標位 (Target 2)**：🎯 **${t2:.2f}** (TD 1.0 通道對稱浪)
+                - **起爆關鍵點**：站穩阻力線 **${res_val:.2f}**[cite: 2, 4]
+                - **第一目標位 (Target 1)**：🚀 **${t1:.2f}** (TD 0.618 突破浪)
+                - **第二目標位 (Target 2)**：🎯 **${t2:.2f}** (TD 1.0 對稱通道)[cite: 1]
                 """)
 
             with w_right:
                 st.error("🔴 **空頭向下推演路徑 (Bearish Wave 50%)**")
-                sup_val = td_res.get('curr_sup_val') or current_price * 0.99
-                b1 = td_res.get('bear_target_1') or sup_val * 0.985
-                b2 = td_res.get('bear_target_2') or sup_val * 0.97
                 st.markdown(f"""
-                - **破位關鍵點**：跌破支撐線 **${sup_val:.2f}**
-                - **第一目標位 (Target 1)**：📉 **${b1:.2f}** (TD 0.618 浪)
-                - **第二目標位 (Target 2)**：🎯 **${b2:.2f}** (TD 1.0 通道對稱浪)
+                - **破位關鍵點**：跌破支撐線 **${sup_val:.2f}**[cite: 2, 4]
+                - **第一目標位 (Target 1)**：📉 **${b1:.2f}** (TD 0.618 下跌浪)[cite: 1]
+                - **第二目標位 (Target 2)**：🎯 **${b2:.2f}** (TD 1.0 對稱通道)[cite: 1]
                 """)
 
             st.divider()
 
-            # 渲染 K 線與 TD 趨勢射線
             candles = []
             markers = []
             vol_bars = []
