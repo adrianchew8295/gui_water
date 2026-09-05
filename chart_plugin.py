@@ -1,10 +1,11 @@
 # 文件名: chart_plugin.py
-# 核心功能: 專業金融圖表 - 秒級時間戳 + Push 數據無縫融合 + TD 趨勢通道與 VPA 副圖
+# 核心功能: 專業金融圖表 - 支援多源快照 (OpenD / yfinance) + TD 趨勢通道與 50/50 決策
 
 import os
 import pandas as pd
 import pytz
 import streamlit as st
+import yfinance as yf
 from streamlit_lightweight_charts import renderLightweightCharts
 from moomoo import OpenQuoteContext, RET_OK
 from trendline_engine import compute_demark_trendlines, find_td_pivots
@@ -16,7 +17,10 @@ class ChartPlugin:
         self.data_dir = data_dir
 
     def get_realtime_market_price(self, code: str) -> dict:
-        res = {"price": None, "status_text": "常規盤"}
+        """多源實時現價獲取：OpenD 優先 -> yfinance 備援"""
+        res = {"price": None, "source_text": "常規盤"}
+        
+        # 1. 嘗試 OpenD 快照
         try:
             ctx = OpenQuoteContext(host='127.0.0.1', port=11111)
             ret, df_snap = ctx.get_market_snapshot([code])
@@ -25,9 +29,24 @@ class ChartPlugin:
                 row = df_snap.iloc[0]
                 res["price"] = float(row['last_price'])
                 status = row.get('market_status', '')
-                res["status_text"] = f"即時跳動 ({status})" if status else "即時盤口"
+                res["source_text"] = f"🟢 OpenD 即時 ({status})" if status else "🟢 OpenD 盤口"
+                return res
         except Exception:
             pass
+
+        # 2. 備援 yfinance 快速提取
+        try:
+            yf_map = {"US.QQQ": "QQQ", "US.BTC": "BTC-USD"}
+            sym = yf_map.get(code, "QQQ")
+            ticker = yf.Ticker(sym)
+            fast_info = ticker.fast_info
+            if hasattr(fast_info, 'last_price') and fast_info.last_price:
+                res["price"] = float(fast_info.last_price)
+                res["source_text"] = "🟡 yfinance 即時"
+                return res
+        except Exception:
+            pass
+
         return res
 
     def load_local_data(self, code: str, ktype_name: str) -> pd.DataFrame:
@@ -36,6 +55,7 @@ class ChartPlugin:
         
         if not os.path.exists(file_path):
             st.error(f"❌ 找不到本地數據檔案：`{file_path}`")
+            st.info(f"💡 請在終端機執行 `python data_fetcher.py` 啟動三級互補下載。")
             return pd.DataFrame()
             
         try:
@@ -74,11 +94,11 @@ class ChartPlugin:
             live_info = self.get_realtime_market_price(code)
             if live_info["price"]:
                 current_price = live_info["price"]
-                price_desc = f"🟢 {live_info['status_text']}: **${current_price:.2f}** (美東時間 ET)"
+                price_desc = f"{live_info['source_text']}: **${current_price:.2f}** (美東時間 ET)"
                 df.loc[df.index[-1], 'close'] = current_price
             else:
                 current_price = float(df['close'].iloc[-1])
-                price_desc = f"📌 美東定格價: **${current_price:.2f}**"
+                price_desc = f"📌 本地歷史收盤價: **${current_price:.2f}**"
 
             td_res = compute_demark_trendlines(df, window=4)
             td_highs, td_lows = find_td_pivots(df, window=4)
@@ -100,17 +120,17 @@ class ChartPlugin:
             with w_left:
                 st.success("🟢 **多頭向上推演路徑 (Bullish Wave 50%)**")
                 st.markdown(f"""
-                - **起爆關鍵點**：站穩阻力線 **${res_val:.2f}**[cite: 2]
-                - **第一目標位 (Target 1)**：🚀 **${t1:.2f}** (TD 0.618 突破浪)[cite: 1]
-                - **第二目標位 (Target 2)**：🎯 **${t2:.2f}** (TD 1.0 對稱通道)[cite: 1]
+                - **起爆關鍵點**：站穩阻力線 **${res_val:.2f}**
+                - **第一目標位 (Target 1)**：🚀 **${t1:.2f}** (TD 0.618 突破浪)
+                - **第二目標位 (Target 2)**：🎯 **${t2:.2f}** (TD 1.0 對稱通道)
                 """)
 
             with w_right:
                 st.error("🔴 **空頭向下推演路徑 (Bearish Wave 50%)**")
                 st.markdown(f"""
-                - **破位關鍵點**：跌破支撐線 **${sup_val:.2f}**[cite: 2]
-                - **第一目標位 (Target 1)**：📉 **${b1:.2f}** (TD 0.618 下跌浪)[cite: 1]
-                - **第二目標位 (Target 2)**：🎯 **${b2:.2f}** (TD 1.0 對稱通道)[cite: 1]
+                - **破位關鍵點**：跌破支撐線 **${sup_val:.2f}**
+                - **第一目標位 (Target 1)**：📉 **${b1:.2f}** (TD 0.618 下跌浪)
+                - **第二目標位 (Target 2)**：🎯 **${b2:.2f}** (TD 1.0 對稱通道)
                 """)
 
             st.divider()
@@ -163,7 +183,11 @@ class ChartPlugin:
                 "layout": {"textColor": "#8b949e", "background": {"type": "solid", "color": "#0d1117"}},
                 "grid": {"vertLines": {"color": "#161b22"}, "horzLines": {"color": "#161b22"}},
                 "crosshair": {"mode": 1},
-                "timeScale": {"timeVisible": True, "secondsVisible": False, "borderColor": "#21262d"},
+                "timeScale": {
+                    "timeVisible": True,
+                    "secondsVisible": False,
+                    "borderColor": "#21262d"
+                },
                 "rightPriceScale": {"borderColor": "#21262d", "autoScale": True},
                 "handleScroll": {"mouseWheel": True, "pressedMouseMove": True, "horzTouchDrag": True, "vertTouchDrag": True},
                 "handleScale": {"axisPressedMouseMove": True, "mouseWheel": True, "pinch": True}
@@ -211,7 +235,7 @@ class ChartPlugin:
                 ]
                 charts_to_render.append({"chart": vol_chart, "series": vol_series})
 
-            renderLightweightCharts(charts_to_render, key=f"tv_push_{code}_{ktype_name}")
+            renderLightweightCharts(charts_to_render, key=f"tv_failover_{code}_{ktype_name}")
 
         except Exception as e:
             st.error(f"❌ 渲染失敗: {str(e)}")
