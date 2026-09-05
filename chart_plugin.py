@@ -1,5 +1,5 @@
 # 文件名: chart_plugin.py
-# 核心功能: 毫秒快照 + Plotly 圖表 (Tab1) + 5M 實戰信號跳動 Table (Tab2)
+# 核心功能: 多週期 (Day/1Hr/5M) 綜合戰略分析 + 現價位置雷達 + 0DTE 扳機 Table
 
 import os
 import datetime
@@ -135,15 +135,13 @@ class ChartPlugin:
         return pd.DataFrame(), "❌ 無可用數據源"
 
     def render_live_monitor_table(self, code: str, ktype_name: str):
-        """【即時跳動頂部表】"""
+        """頂部快速即時報價表格"""
         snap_info = self.get_realtime_snapshot_price(code)
-        
         is_btc = "BTC" in code.upper()
         save_prefix = "CC_BTCUSD" if is_btc else code.replace('.', '_')
         file_path = os.path.join(self.data_dir, f"{save_prefix}_{ktype_name}.csv")
         
         last_close, last_high, last_low, last_vol = 0.0, 0.0, 0.0, 0.0
-        
         if os.path.exists(file_path):
             try:
                 df_temp = pd.read_csv(file_path)
@@ -157,82 +155,124 @@ class ChartPlugin:
 
         current_live_price = snap_info["price"] if snap_info["price"] else last_close
         display_source = snap_info["source"] if snap_info["price"] else "🟢 數據通訊中"
-        
         chg_pts = (current_live_price - last_close) if last_close > 0 else 0.0
         chg_pct = (chg_pts / last_close) * 100 if last_close > 0 else 0.0
         now_et_str = datetime.datetime.now(tz_ny).strftime('%Y-%m-%d %H:%M:%S')
 
         monitor_data = {
             "監控標的": [code],
-            "數據通道": [display_source],
-            "美東時間 (ET)": [now_et_str],
-            "最新現價 (Live)": [f"${current_live_price:,.2f}"],
-            "當根最高 (High)": [f"${max(last_high, current_live_price):,.2f}"],
-            "當根最低 (Low)": [f"${min(last_low, current_live_price):,.2f}"],
-            "當根成交量 (Vol)": [f"{last_vol:,.2f}"],
-            "即時漲跌": [f"{chg_pts:+.2f} ({chg_pct:+.2f}%)"]
+            "通道狀態": [display_source],
+            "紐約時間 (ET)": [now_et_str],
+            "最新跳動現價": [f"${current_live_price:,.2f}"],
+            "當根最高價": [f"${max(last_high, current_live_price):,.2f}"],
+            "當根最低價": [f"${min(last_low, current_live_price):,.2f}"],
+            "當根量能": [f"{last_vol:,.2f}"],
+            "瞬時漲跌": [f"{chg_pts:+.2f} ({chg_pct:+.2f}%)"]
         }
         st.dataframe(pd.DataFrame(monitor_data), use_container_width=True, hide_index=True)
 
     def render_operation_signals_table(self, code: str):
-        """【Tab 2 專屬】：5分鐘日內實際操作信號判定 Table"""
+        """【實戰操作主艙】：整合 Day 大局、1Hr 戰區與 5M 扳機"""
+        # 1. 抓取三週期數據
+        df_day, _ = self.get_live_data_and_upsert(code, "DAY")
+        df_1hr, _ = self.get_live_data_and_upsert(code, "1Hr")
         df_5m, _ = self.get_live_data_and_upsert(code, "5M")
-        if df_5m.empty:
-            st.warning("⚠️ 正在等待 5M 數據載入中...")
-            return
 
         snap_info = self.get_realtime_snapshot_price(code)
-        live_price = snap_info["price"] if snap_info["price"] else float(df_5m['close'].iloc[-1])
+        live_price = snap_info["price"] if snap_info["price"] else (float(df_5m['close'].iloc[-1]) if not df_5m.empty else 0.0)
 
-        # 計算 5M 量能比
-        df_5m['vma20'] = df_5m['volume'].rolling(window=20).mean()
-        last_row = df_5m.iloc[-1]
-        vma20 = last_row['vma20'] if pd.notna(last_row.get('vma20')) and last_row['vma20'] > 0 else 1.0
-        vol_ratio = float(last_row['volume']) / vma20
+        # ====== 模組 A：日線 (Day) 與 1小時 (1Hr) 大級別趨勢分析 ======
+        st.markdown("#### 🗺️ 第一步：多週期大局戰略定位（Day & 1Hr 宏觀背景）")
+        
+        day_bias = "區間震盪"
+        pdh_val, pdl_val = 0.0, 0.0
+        if not df_day.empty and len(df_day) >= 2:
+            prev_day = df_day.iloc[-2]
+            curr_day = df_day.iloc[-1]
+            pdh_val = float(prev_day['high'])
+            pdl_val = float(prev_day['low'])
+            df_day['ema20'] = df_day['close'].ewm(span=20, adjust=False).mean()
+            if float(curr_day['close']) > float(df_day['ema20'].iloc[-1]):
+                day_bias = "🟢 多頭掌控 (日線在 EMA20 上方，回踩做多勝率高)"
+            else:
+                day_bias = "🔴 空頭承壓 (日線在 EMA20 下方，逢高做空勝率高)"
 
-        # 計算 TD 趨勢與邊界點位
-        td_res = compute_demark_trendlines(df_5m, window=4)
-        res_val = td_res.get('curr_res_val') or (live_price * 1.005)
-        sup_val = td_res.get('curr_sup_val') or (live_price * 0.995)
+        hr_res, hr_sup = 0.0, 0.0
+        hr_status = "1Hr 通道計算中"
+        if not df_1hr.empty:
+            td_1h = compute_demark_trendlines(df_1hr, window=4)
+            hr_res = td_1h.get('curr_res_val') or (live_price * 1.01)
+            hr_sup = td_1h.get('curr_sup_val') or (live_price * 0.99)
+            if live_price >= hr_res - 0.5:
+                hr_status = "⚠️ 逼近 1Hr 阻力天花板"
+            elif live_price <= hr_sup + 0.5:
+                hr_status = "🛡️ 逼近 1Hr 支撐地板"
+            else:
+                hr_status = "⚪ 處於 1Hr 中間震盪區（不可盲目追單）"
 
-        dist_res = res_val - live_price
-        dist_sup = live_price - sup_val
+        macro_data = {
+            "週期": ["日線圖 (Day - 全局主方向)", "1小時圖 (1Hr - 日內戰區範圍)"],
+            "戰略判斷": [day_bias, hr_status],
+            "上方關鍵天花板 (阻力)": [f"昨日高點 PDH: ${pdh_val:,.2f}" if pdh_val > 0 else "--", f"1Hr TD 阻力: ${hr_res:,.2f}"],
+            "下方關鍵地板 (支撐)": [f"昨日低點 PDL: ${pdl_val:,.2f}" if pdl_val > 0 else "--", f"1Hr TD 支撐: ${hr_sup:,.2f}"]
+        }
+        st.dataframe(pd.DataFrame(macro_data), use_container_width=True, hide_index=True)
 
-        # 信號觸發判定
-        if dist_res <= 0.30 and vol_ratio >= 1.5:
-            action = "🔴 【觸發 2B 假突破】做空信號 - 買入 ATM Put"
-            status_color = "🔴 賣出 / 逢高做空"
-        elif dist_sup <= 0.30 and vol_ratio >= 1.5:
-            action = "🟢 【觸發 2B 破底翻】做多信號 - 買入 ATM Call"
-            status_color = "🟢 買入 / 破底翻多"
-        elif vol_ratio >= 2.0:
-            action = "⚡ 【機構巨量異動】關注突破方向"
-            status_color = "🟡 警惕變盤"
+        st.divider()
+
+        # ====== 模組 B：現價相對位置與 5M 微觀操作指令 ======
+        st.markdown(f"#### 🎯 第二步：現價位置與 5M 實際操作指令（現價: :green[**${live_price:,.2f}**]）")
+
+        vol_ratio = 1.0
+        td_count_str = "TD 計數中"
+        if not df_5m.empty:
+            df_5m['vma20'] = df_5m['volume'].rolling(window=20).mean()
+            last_5m = df_5m.iloc[-1]
+            vma = last_5m['vma20'] if pd.notna(last_5m.get('vma20')) and last_5m['vma20'] > 0 else 1.0
+            vol_ratio = float(last_5m['volume']) / vma
+            td_5m = compute_demark_trendlines(df_5m, window=4)
+            td_res_5m = td_5m.get('curr_res_val') or hr_res
+            td_sup_5m = td_5m.get('curr_sup_val') or hr_sup
         else:
-            action = "⚪ 區間震盪中，維持紀律觀望"
-            status_color = "⚪ 觀望等待"
+            td_res_5m = hr_res
+            td_sup_5m = hr_sup
+
+        dist_res = td_res_5m - live_price
+        dist_sup = live_price - td_sup_5m
+
+        # 判定操作指令與具體動作建議
+        if dist_res <= 0.35 and vol_ratio >= 1.5:
+            tactical_state = "🔴 【衝頂阻力 + 放量受阻】"
+            action_guidance = "🔥 動作：準備在券商買入 0DTE ATM Put（做空），止損設在剛才最高點上方 $0.30"
+        elif dist_sup <= 0.35 and vol_ratio >= 1.5:
+            tactical_state = "🟢 【踩線地板 + 放量拉回】"
+            action_guidance = "🔥 動作：準備在券商買入 0DTE ATM Call（做多），止損設在剛才最低點下方 $0.30"
+        elif dist_res <= 0.35 or dist_sup <= 0.35:
+            tactical_state = "🟡 【已進入戰區邊界】"
+            action_guidance = "👀 動作：價格已到邊界！盯緊 5M 是否放量或刺穿收回，量能一出立刻跟進"
+        else:
+            tactical_state = "⚪ 【處於半山腰無效區】"
+            action_guidance = f"☕ 動作：現價距離天花板還有 ${dist_res:.2f}，距離地板還有 ${dist_sup:.2f}。耐心等待價格到位，嚴禁在半山腰開倉！"
 
         op_data = {
-            "標的": [code],
-            "最新跳動價": [f"${live_price:,.2f}"],
-            "5M 量能倍數 (VPA)": [f"{vol_ratio:.2f}x ({'放量' if vol_ratio >= 1.5 else '常規'})"],
-            "動態阻力 (TD High)": [f"${res_val:,.2f} (差 ${dist_res:+.2f})"],
-            "動態支撐 (TD Low)": [f"${sup_val:,.2f} (差 ${dist_sup:+.2f})"],
-            "戰術狀態": [status_color],
-            "0DTE 操作指示 (Action Signal)": [action]
+            "最新跳動現價": [f"${live_price:,.2f}"],
+            "距離上方阻力": [f"${dist_res:+.2f} (${td_res_5m:,.2f})"],
+            "距離下方支撐": [f"${dist_sup:+.2f} (${td_sup_5m:,.2f})"],
+            "5M 量能狀態": [f"{vol_ratio:.2f}x ({'⚡ 放量異動' if vol_ratio >= 1.5 else '常規量'})"],
+            "當前戰況": [tactical_state],
+            "你現在該執行的具體動作": [action_guidance]
         }
         st.dataframe(pd.DataFrame(op_data), use_container_width=True, hide_index=True)
 
     def render_static_chart(self, code: str, ktype_name: str):
-        """【Tab 1 專屬】：完全保留原有 Plotly 專業帶圖圖表"""
+        """Tab 1：Plotly 專業圖表視圖"""
         try:
-            df, data_source = self.get_live_data_and_upsert(code, ktype_name)
+            df, _ = self.get_live_data_and_upsert(code, ktype_name)
             if df.empty:
-                st.error(f"❌ 暫時無法獲取 {code} 數據，請檢查網絡連接。")
+                st.error(f"❌ 暫時無法獲取 {code} 數據")
                 return
 
             current_price = float(df['close'].iloc[-1])
-
             df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
             df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
             df['time_clean'] = df['time_key'].dt.strftime('%m-%d %H:%M') if ktype_name in ['5M', '1Hr'] else df['time_key'].dt.strftime('%Y-%m-%d')
@@ -241,7 +281,6 @@ class ChartPlugin:
             df['vma_20x'] = df['vma20'] * 2.0
 
             td_res = compute_demark_trendlines(df, window=4)
-
             df_plot = df.tail(200).copy().reset_index(drop=True)
             fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.75, 0.25])
 
@@ -262,12 +301,9 @@ class ChartPlugin:
                 fig.add_trace(go.Scatter(x=df_plot['time_clean'].iloc[-len(sup_df):], y=sup_df['value'], mode='lines', line=dict(color='#00E676', width=2, dash='dash'), name="TD 支撐線"), row=1, col=1)
 
             fig.add_hline(
-                y=current_price,
-                line=dict(color="#FFD700", width=1.5, dash="dashdot"),
-                annotation_text=f"📌 現價: ${current_price:,.2f}",
-                annotation_position="top right",
-                annotation_font=dict(color="#FFD700", size=11),
-                row=1, col=1
+                y=current_price, line=dict(color="#FFD700", width=1.5, dash="dashdot"),
+                annotation_text=f"📌 現價: ${current_price:,.2f}", annotation_position="top right",
+                annotation_font=dict(color="#FFD700", size=11), row=1, col=1
             )
 
             bar_colors = ["#089981" if c >= o else "#F23645" for o, c in zip(df_plot['open'], df_plot['close'])]
@@ -278,19 +314,10 @@ class ChartPlugin:
 
             fig.update_xaxes(type='category', rangeslider_visible=False, gridcolor="#161b22")
             fig.update_yaxes(gridcolor="#161b22")
-            
             fig.update_layout(
-                height=620,
-                template="plotly_dark",
-                paper_bgcolor="#0d1117",
-                plot_bgcolor="#0d1117",
-                margin=dict(l=10, r=10, t=10, b=10),
-                hovermode="x unified",
-                dragmode="pan",
-                uirevision=f"{code}_{ktype_name}"
+                height=620, template="plotly_dark", paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
+                margin=dict(l=10, r=10, t=10, b=10), hovermode="x unified", dragmode="pan", uirevision=f"{code}_{ktype_name}"
             )
-
             st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True, "displayModeBar": True, "displaylogo": False})
-
         except Exception as e:
             st.error(f"❌ 圖表模組渲染異常: {str(e)}")
