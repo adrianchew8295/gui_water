@@ -11,6 +11,6 @@ sidebar_col = st.sidebar
 target_code = sidebar_col.selectbox("選擇標的", ["US.QQQ", "US.BTC"])
 target_ktype = sidebar_col.selectbox("選擇週期", ["1Hr", "DAY", "WEEK"])
 
-st.subheader(f"{target_code} - {target_ktype} 走勢與預測通道")
+st.subheader(f"{target_code} - {target_ktype} 專業走勢與預測通道")
 
 plugin.render_chart(code=target_code, ktype_name=target_ktype)
