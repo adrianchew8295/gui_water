@@ -1,8 +1,7 @@
 # 文件名: chart_plugin.py
-# 核心特性: 訂閱修復 + 5M 倒數計時 + 後台狀態透明化 + 一鍵複製文本塊 + 保守開火
+# 核心特性: BTC/QQQ 通用訂閱 + 大字倒數 HUD + 保守右側開火 + 全行高亮 + 一鍵複製文本框
 
 import os
-import time
 import datetime
 import numpy as np
 import pandas as pd
@@ -18,7 +17,6 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 class MarketDataEngine:
     """單例常駐連線引擎，確保訂閱通道長駐"""
-    _instance = None
     _quote_ctx = None
     _subscribed_symbols = set()
 
@@ -101,7 +99,7 @@ class ChartPlugin:
                     df_5m['time_key'] = pd.to_datetime(df_5m['time_key'])
                     df_5m = df_5m.sort_values('time_key').reset_index(drop=True)
                     source_str = "🟢 OpenD 直連 (實時推送)"
-                    status_msg = "後台已成功訂閱 5M 通道，數據正常同步"
+                    status_msg = f"已成功訂閱 {target_symbol} 5M 通道，數據正常同步"
                     # 落盤備份
                     save_prefix = "CC_BTCUSD" if "BTC" in code.upper() else code.replace('.', '_')
                     df_5m.to_csv(os.path.join(self.data_dir, f"{save_prefix}_5M.csv"), index=False)
@@ -298,12 +296,22 @@ class ChartPlugin:
                 "_raw": f"TD:{td_s} | 診斷:{diag_str} | 指令:{action_str}"
             })
 
-        # ====== 模組 1: 頂部心跳憑證與倒數計時 ======
+        # ====== 模組 1: 頂部心跳與大字倒數 HUD ======
         latest_time_str = pd.to_datetime(bars_6.iloc[0]['time_key']).strftime('%H:%M ET')
-        st.success(
-            f"📶 通道: **{source_str}** | 最新定格柱: **{latest_time_str}** | ⏱️ 距離下根 5M 換棒: **{countdown_str}** | 宏觀: **{trend_text}**"
-        )
-        st.caption(f"⚙️ 後台狀態更新 (Status): `{status_msg}` | 💾 CSV 自動同步完成")
+        
+        st.markdown(f"""
+        <div style="background-color: #0d1117; border: 1px solid #30363d; border-radius: 8px; padding: 12px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; font-family: monospace;">
+            <div>
+                <span style="font-size: 14px; color: #8b949e;">📶 通道: <b>{source_str}</b></span><br>
+                <span style="font-size: 13px; color: #58a6ff;">最新定格柱: <b>{latest_time_str}</b> | 宏觀: <b>{trend_text}</b></span>
+            </div>
+            <div style="text-align: right; background: #161b22; padding: 8px 16px; border-radius: 6px; border: 1px solid #238636;">
+                <span style="font-size: 12px; color: #8b949e;">距離下根 5M 收盤定格</span><br>
+                <span style="font-size: 22px; font-weight: bold; color: #00E676;">⏱️ {countdown_str}</span>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        st.caption(f"⚙️ 後台狀態更新: `{status_msg}` | 💾 CSV 歷史數據自動同步完成")
 
         # ====== 模組 3: 表 1 —— 5M 閉合量價核心表 ======
         st.markdown("##### 📊 表 1：5M 閉合量價核心表 (黃金 30 分鐘定格窗口)")
@@ -367,14 +375,15 @@ class ChartPlugin:
         </div>
         """, unsafe_allow_html=True)
 
-        # ====== 模組 7: 一鍵複製診斷文本 (Copy-Paste Text Block) ======
-        with st.expander("📋 點擊展開：當前數據快照文本 (隨時複製貼上反饋排查)"):
-            text_dump = f"=== 癸水數據快照 ===\n時間: {datetime.datetime.now(tz_ny).strftime('%Y-%m-%d %H:%M:%S ET')}\n通道: {source_str}\n狀態: {status_msg}\n倒數: {countdown_str}\n宏觀: {trend_text}\n"
-            text_dump += "\n【表1 5M量價核心】\n"
-            for r in table1_rows:
-                text_dump += f"• {r['_raw']}\n"
-            text_dump += "\n【表2 戰術與TD指令】\n"
-            for r in table2_rows:
-                text_dump += f"• {r['_raw']}\n"
-            text_dump += f"\n【模組6 期權建議】\n{latest_trigger_action}\n"
-            st.text_area("直接點擊下方文字框全選 (Ctrl+A) 複製 (Ctrl+C)：", value=text_dump, height=180)
+        # ====== 模組 7: 一鍵複製診斷文本塊 (直接敞開呈現) ======
+        st.markdown("<div style='margin-top: 20px;'></div>", unsafe_allow_html=True)
+        st.markdown("##### 📋 診斷數據快照文本 (隨時全選複製發給我排查)")
+        text_dump = f"=== 癸水數據快照 ===\n時間: {datetime.datetime.now(tz_ny).strftime('%Y-%m-%d %H:%M:%S ET')}\n通道: {source_str}\n狀態: {status_msg}\n倒數: {countdown_str}\n宏觀: {trend_text}\n"
+        text_dump += "\n【表1 5M量價核心】\n"
+        for r in table1_rows:
+            text_dump += f"• {r['_raw']}\n"
+        text_dump += "\n【表2 戰術與TD指令】\n"
+        for r in table2_rows:
+            text_dump += f"• {r['_raw']}\n"
+        text_dump += f"\n【模組6 期權建議】\n{latest_trigger_action}\n"
+        st.text_area("下方框內點擊後按 Ctrl+A 全選，再按 Ctrl+C 複製：", value=text_dump, height=180)
