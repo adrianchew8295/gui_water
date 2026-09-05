@@ -1,5 +1,5 @@
 # 文件名: chart_plugin.py
-# 核心特性: OpenD 超時熔斷防死鎖 + 多重備援秒出 + 預判雷達 + 富途指標 1:2 結構
+# 核心特性: 即時 5M K 線同步 + 毫秒快照 + 預判雷達 + 富途指標 1:2 結構
 
 import os
 import time
@@ -8,8 +8,7 @@ import numpy as np
 import pandas as pd
 import pytz
 import streamlit as st
-import yfinance as yf
-from moomoo import OpenQuoteContext, RET_OK
+from moomoo import OpenQuoteContext, RET_OK, KLType, AuType
 
 tz_ny = pytz.timezone("America/New_York")
 
@@ -31,31 +30,41 @@ class ChartPlugin:
         tr = np.maximum(high - low, np.maximum((high - close).abs(), (low - close).abs()))
         return tr.rolling(window=period).mean().bfill()
 
-    def get_realtime_snapshot(self, code: str) -> dict:
-        """極速超時保護快照 (OpenD 超時立即切換備援，絕不卡死)"""
-        res = {
+    def get_realtime_data_and_kline(self, code: str) -> tuple:
+        """【雙通道極速同步】同時獲取撮合快照與最新 5M K 線"""
+        snap = {
             "price": 0.0, "source": "未連線", "server_time": "--",
             "latency_ms": 0, "open": 0.0, "high": 0.0, "low": 0.0, "vol": 0.0
         }
+        df_5m = pd.DataFrame()
         t_start = time.time()
         target_symbol = "CC.BTCUSD" if "BTC" in code.upper() else code
 
-        # 1. 嘗試 OpenD 連線
         quote_ctx = None
         try:
             quote_ctx = OpenQuoteContext(host='127.0.0.1', port=11111)
-            ret, df_snap = quote_ctx.get_market_snapshot([target_symbol])
-            if ret == RET_OK and not df_snap.empty:
+            # 1. 抓取撮合快照
+            ret_s, df_snap = quote_ctx.get_market_snapshot([target_symbol])
+            if ret_s == RET_OK and not df_snap.empty:
                 row = df_snap.iloc[0]
-                res["price"] = float(row['last_price'])
-                res["open"] = float(row.get('open_price', row['last_price']))
-                res["high"] = float(row.get('high_price', row['last_price']))
-                res["low"] = float(row.get('low_price', row['last_price']))
-                res["vol"] = float(row.get('volume', 0.0))
-                res["source"] = "🟢 OpenD 直連"
-                res["server_time"] = str(row.get('update_time', datetime.datetime.now(tz_ny).strftime('%H:%M:%S.%f')[:-3]))
-                res["latency_ms"] = int((time.time() - t_start) * 1000)
-                return res
+                snap["price"] = float(row['last_price'])
+                snap["open"] = float(row.get('open_price', row['last_price']))
+                snap["high"] = float(row.get('high_price', row['last_price']))
+                snap["low"] = float(row.get('low_price', row['last_price']))
+                snap["vol"] = float(row.get('volume', 0.0))
+                snap["source"] = "🟢 OpenD 直連"
+                snap["server_time"] = str(row.get('update_time', datetime.datetime.now(tz_ny).strftime('%H:%M:%S.%f')[:-3]))
+                snap["latency_ms"] = int((time.time() - t_start) * 1000)
+
+            # 2. 抓取最新 5M K 線 (獲取最新未閉合棒線)
+            ret_k, df_k = quote_ctx.get_cur_kline(target_symbol, 60, KLType.K_5M, AuType.NONE)
+            if ret_k == RET_OK and not df_k.empty:
+                df_5m = df_k[['time_key', 'open', 'close', 'high', 'low', 'volume']].copy()
+                df_5m['time_key'] = pd.to_datetime(df_5m['time_key'])
+                df_5m = df_5m.sort_values('time_key').reset_index(drop=True)
+                # 自動沉澱至本地 CSV
+                save_prefix = "CC_BTCUSD" if "BTC" in code.upper() else code.replace('.', '_')
+                df_5m.to_csv(os.path.join(self.data_dir, f"{save_prefix}_5M.csv"), index=False)
         except Exception:
             pass
         finally:
@@ -63,26 +72,22 @@ class ChartPlugin:
                 try: quote_ctx.close()
                 except: pass
 
-        # 2. 自動切換 yfinance 備援 (OpenD 離線時啟用)
-        try:
-            yf_sym = "BTC-USD" if "BTC" in code.upper() else "QQQ"
-            fast_p = yf.Ticker(yf_sym).fast_info.last_price
-            if fast_p:
-                res["price"] = float(fast_p)
-                res["source"] = "🟡 yfinance 實時備援"
-                res["server_time"] = datetime.datetime.now(tz_ny).strftime('%H:%M:%S')
-                res["latency_ms"] = int((time.time() - t_start) * 1000)
-                return res
-        except Exception:
-            pass
+        # 若 OpenD 暫未拉到 5M，讀取本地檔案保底
+        if df_5m.empty:
+            save_prefix = "CC_BTCUSD" if "BTC" in code.upper() else code.replace('.', '_')
+            f_path = os.path.join(self.data_dir, f"{save_prefix}_5M.csv")
+            if os.path.exists(f_path):
+                try:
+                    df_5m = pd.read_csv(f_path)
+                    df_5m.columns = [c.lower().strip() for c in df_5m.columns]
+                    df_5m['time_key'] = pd.to_datetime(df_5m['time_key'])
+                except Exception:
+                    pass
 
-        # 3. 本地保底
-        res["source"] = "🛡️ 本地快照模式"
-        res["server_time"] = datetime.datetime.now(tz_ny).strftime('%H:%M:%S')
-        return res
+        return snap, df_5m
 
     def load_safe_kline(self, code: str, ktype_name: str) -> pd.DataFrame:
-        """純本地讀取 CSV，0 網絡依賴"""
+        """讀取大週期歷史基座 (Day / 1Hr)"""
         is_btc = "BTC" in code.upper()
         save_prefix = "CC_BTCUSD" if is_btc else code.replace('.', '_')
         file_path = os.path.join(self.data_dir, f"{save_prefix}_{ktype_name}.csv")
@@ -97,29 +102,15 @@ class ChartPlugin:
                     return df
             except Exception:
                 pass
-
-        # 若本地無檔案，生成 20 根標準結構數據
-        base_p = 79700.0 if is_btc else 488.0
-        now = datetime.datetime.now(tz_ny)
-        dummy_times = [now - datetime.timedelta(minutes=5 * i) for i in range(20)][::-1]
-        dummy_df = pd.DataFrame({
-            'time_key': dummy_times,
-            'open': [base_p + np.sin(i) * 5 for i in range(20)],
-            'high': [base_p + np.sin(i) * 5 + 3 for i in range(20)],
-            'low': [base_p + np.sin(i) * 5 - 3 for i in range(20)],
-            'close': [base_p + np.sin(i) * 5 + 1 for i in range(20)],
-            'volume': [1000.0 + i * 50 for i in range(20)]
-        })
-        return dummy_df
+        return pd.DataFrame()
 
     def render_cockpit(self, code: str):
-        """【主座艙渲染】：全防禦式設計，100% 杜絕白屏與卡死"""
-        snap = self.get_realtime_snapshot(code)
+        """【主座艙渲染】"""
+        snap, df_5m = self.get_realtime_data_and_kline(code)
         df_day = self.load_safe_kline(code, "DAY")
         df_1h = self.load_safe_kline(code, "1Hr")
-        df_5m = self.load_safe_kline(code, "5M")
 
-        # 1. 現價計算
+        # 1. 確定現價
         live_price = snap["price"]
         if live_price <= 0 and not df_5m.empty:
             live_price = float(df_5m['close'].iloc[-1])
@@ -209,7 +200,7 @@ class ChartPlugin:
             action_detail = f"👀 價格已逼近地板 (${hr_sup:,.2f})！正在等待 5M 扎針破底翻且放量 ≥ 1.25x 立即做多"
 
         # ====== 畫面渲染 ======
-        st.success(f"📶 數據通道: **{snap['source']}** | 撮合時間: **{snap['server_time']} ET** | 延遲: **{snap['latency_ms']} ms** | 📅 5M 棒線: **{bar_time_str}**")
+        st.success(f"📶 數據通道: **{snap['source']}** | 撮合時間: **{snap['server_time']} ET** | 延遲: **{snap['latency_ms']} ms** | 📅 5M 當前棒線: **{bar_time_str}**")
 
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("最新現價 (Live)", f"${live_price:,.2f}")
