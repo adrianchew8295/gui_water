@@ -1,4 +1,6 @@
 # 文件名: chart_plugin.py
+# 核心功能: 專業金融圖表 - 100% 穩定秒級時間戳 + 消除黑屏 + TD 趨勢通道與波浪預測
+
 import os
 import pandas as pd
 import pytz
@@ -60,7 +62,14 @@ class ChartPlugin:
         try:
             time_col = 'time_key' if 'time_key' in df.columns else ('date' if 'date' in df.columns else df.columns[0])
             df['dt_obj'] = pd.to_datetime(df[time_col])
-            df = df.sort_values('dt_obj').reset_index(drop=True)
+
+            # 關鍵修復：日/周用 YYYY-MM-DD，1Hr 與分鐘級嚴格轉為標準 int 秒級時間戳
+            if ktype_name in ['DAY', 'WEEK']:
+                df['time_clean'] = df['dt_obj'].dt.strftime('%Y-%m-%d')
+            else:
+                df['time_clean'] = df['dt_obj'].astype('int64') // 10**9
+
+            df = df.drop_duplicates(subset=['time_clean']).sort_values('dt_obj').reset_index(drop=True)
             df = self.calculate_vpa_indicators(df)
 
             live_info = self.get_realtime_market_price(code)
@@ -72,7 +81,6 @@ class ChartPlugin:
                 current_price = float(df['close'].iloc[-1])
                 price_desc = f"📌 美東定格價: **${current_price:.2f}**"
 
-            # 德馬克計算通道
             td_res = compute_demark_trendlines(df, window=4)
             td_highs, td_lows = find_td_pivots(df, window=4)
 
@@ -111,52 +119,38 @@ class ChartPlugin:
             candles = []
             markers = []
             vol_bars = []
-            vma20_line = []
-            vma15_line = []
-            vma20_alert_line = []
-
-            has_vol = 'volume' in df.columns
             td_high_times = {str(p['time']) for p in td_highs}
             td_low_times = {str(p['time']) for p in td_lows}
+            has_vol = 'volume' in df.columns
 
-            for idx, row in df.iterrows():
+            for _, row in df.iterrows():
+                t = int(row['time_clean']) if isinstance(row['time_clean'], (int, float)) else str(row['time_clean'])
                 dt_item = row['dt_obj']
-                
-                # 統一時間格式：日線用字串，1Hr用物件格式以緊密對齊消除 Gap
-                if ktype_name in ['DAY', 'WEEK']:
-                    t_val = dt_item.strftime('%Y-%m-%d')
-                else:
-                    t_val = {
-                        "year": int(dt_item.year),
-                        "month": int(dt_item.month),
-                        "day": int(dt_item.day),
-                        "hour": int(dt_item.hour),
-                        "minute": int(dt_item.minute)
-                    }
+                hour_et = dt_item.hour
+                min_et = dt_item.minute
+                time_float = hour_et + min_et / 60.0
+
+                is_rth = (time_float >= 9.5) and (time_float < 16.0)
 
                 candles.append({
-                    "time": t_val,
+                    "time": t,
                     "open": float(row['open']),
                     "high": float(row['high']),
                     "low": float(row['low']),
                     "close": float(row['close'])
                 })
 
-                t_str_key = str(row[time_col])
-                if t_str_key in td_high_times:
-                    markers.append({"time": t_val, "position": "aboveBar", "color": "#FF5252", "shape": "arrowDown", "text": "TD High"})
-                elif t_str_key in td_low_times:
-                    markers.append({"time": t_val, "position": "belowBar", "color": "#00E676", "shape": "arrowUp", "text": "TD Low"})
+                if str(row['time_clean']) in td_high_times:
+                    markers.append({"time": t, "position": "aboveBar", "color": "#FF5252", "shape": "arrowDown", "text": "TD High"})
+                elif str(row['time_clean']) in td_low_times:
+                    markers.append({"time": t, "position": "belowBar", "color": "#00E676", "shape": "arrowUp", "text": "TD Low"})
 
                 if has_vol:
                     vol_bars.append({
-                        "time": t_val,
+                        "time": t,
                         "value": float(row['volume']),
-                        "color": "#089981" if row['close'] >= row['open'] else "#F23645"
+                        "color": ("#089981" if row['close'] >= row['open'] else "#F23645") if is_rth else ("rgba(8, 153, 129, 0.45)" if row['close'] >= row['open'] else "rgba(242, 54, 69, 0.45)")
                     })
-                    if pd.notna(row.get('vma20')): vma20_line.append({"time": t_val, "value": float(row['vma20'])})
-                    if pd.notna(row.get('vma_15x')): vma15_line.append({"time": t_val, "value": float(row['vma_15x'])})
-                    if pd.notna(row.get('vma_20x')): vma20_alert_line.append({"time": t_val, "value": float(row['vma_20x'])})
 
             price_chart = {
                 "height": 500,
@@ -166,9 +160,7 @@ class ChartPlugin:
                 "timeScale": {
                     "timeVisible": True,
                     "secondsVisible": False,
-                    "borderColor": "#21262d",
-                    "fixLeftEdge": True,
-                    "fixRightEdge": True
+                    "borderColor": "#21262d"
                 },
                 "rightPriceScale": {"borderColor": "#21262d", "autoScale": True},
                 "handleScroll": {"mouseWheel": True, "pressedMouseMove": True, "horzTouchDrag": True, "vertTouchDrag": True},
@@ -190,6 +182,14 @@ class ChartPlugin:
                 }
             ]
 
+            if td_res.get("resistance_line"):
+                res_pts = [{"time": int(pt["time"]) if str(pt["time"]).isdigit() else pt["time"], "value": pt["value"]} for pt in td_res["resistance_line"]]
+                price_series.append({"type": "Line", "data": res_pts, "options": {"color": "#FF5252", "lineWidth": 2, "lineStyle": 2, "title": "TD Resistance"}})
+
+            if td_res.get("support_line"):
+                sup_pts = [{"time": int(pt["time"]) if str(pt["time"]).isdigit() else pt["time"], "value": pt["value"]} for pt in td_res["support_line"]]
+                price_series.append({"type": "Line", "data": sup_pts, "options": {"color": "#00E676", "lineWidth": 2, "lineStyle": 2, "title": "TD Support"}})
+
             charts_to_render = [{"chart": price_chart, "series": price_series}]
 
             if has_vol and vol_bars:
@@ -201,15 +201,10 @@ class ChartPlugin:
                     "timeScale": {"timeVisible": True, "secondsVisible": False, "borderColor": "#21262d"},
                     "rightPriceScale": {"borderColor": "#21262d", "autoScale": True}
                 }
-                vol_series = [
-                    {"type": "Histogram", "data": vol_bars, "options": {"priceFormat": {"type": "volume"}, "priceScaleId": ""}},
-                    {"type": "Line", "data": vma20_line, "options": {"color": "#ffffff", "lineWidth": 1, "title": "VMA20"}},
-                    {"type": "Line", "data": vma15_line, "options": {"color": "#8b949e", "lineWidth": 1, "lineStyle": 2, "title": "1.5X"}},
-                    {"type": "Line", "data": vma20_alert_line, "options": {"color": "#ffd700", "lineWidth": 1, "lineStyle": 2, "title": "2.0X"}}
-                ]
+                vol_series = [{"type": "Histogram", "data": vol_bars, "options": {"priceFormat": {"type": "volume"}, "priceScaleId": ""}}]
                 charts_to_render.append({"chart": vol_chart, "series": vol_series})
 
-            renderLightweightCharts(charts_to_render, key=f"tv_chart_final_{code}_{ktype_name}")
+            renderLightweightCharts(charts_to_render, key=f"tv_fixed_{code}_{ktype_name}")
 
         except Exception as e:
             st.error(f"❌ 渲染失敗: {str(e)}")
