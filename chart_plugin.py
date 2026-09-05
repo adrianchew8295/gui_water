@@ -1,12 +1,12 @@
 # 文件名: chart_plugin.py
-# 核心功能: 專業金融圖表 - 支援多源快照 (OpenD / yfinance) + TD 趨勢通道與 50/50 決策
+# 核心功能: 基於 Plotly 金融時間序列標準架構，自動消除時間軸 Gap + TD 德馬克通道 + VPA 量能副圖
 
 import os
 import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import pytz
 import streamlit as st
-import yfinance as yf
-from streamlit_lightweight_charts import renderLightweightCharts
 from moomoo import OpenQuoteContext, RET_OK
 from trendline_engine import compute_demark_trendlines, find_td_pivots
 
@@ -17,10 +17,8 @@ class ChartPlugin:
         self.data_dir = data_dir
 
     def get_realtime_market_price(self, code: str) -> dict:
-        """多源實時現價獲取：OpenD 優先 -> yfinance 備援"""
-        res = {"price": None, "source_text": "常規盤"}
-        
-        # 1. 嘗試 OpenD 快照
+        """獲取實時盤口價格快照"""
+        res = {"price": None, "status_text": "常規盤"}
         try:
             ctx = OpenQuoteContext(host='127.0.0.1', port=11111)
             ret, df_snap = ctx.get_market_snapshot([code])
@@ -29,24 +27,9 @@ class ChartPlugin:
                 row = df_snap.iloc[0]
                 res["price"] = float(row['last_price'])
                 status = row.get('market_status', '')
-                res["source_text"] = f"🟢 OpenD 即時 ({status})" if status else "🟢 OpenD 盤口"
-                return res
+                res["status_text"] = f"即時跳動 ({status})" if status else "即時盤口"
         except Exception:
             pass
-
-        # 2. 備援 yfinance 快速提取
-        try:
-            yf_map = {"US.QQQ": "QQQ", "US.BTC": "BTC-USD"}
-            sym = yf_map.get(code, "QQQ")
-            ticker = yf.Ticker(sym)
-            fast_info = ticker.fast_info
-            if hasattr(fast_info, 'last_price') and fast_info.last_price:
-                res["price"] = float(fast_info.last_price)
-                res["source_text"] = "🟡 yfinance 即時"
-                return res
-        except Exception:
-            pass
-
         return res
 
     def load_local_data(self, code: str, ktype_name: str) -> pd.DataFrame:
@@ -55,7 +38,7 @@ class ChartPlugin:
         
         if not os.path.exists(file_path):
             st.error(f"❌ 找不到本地數據檔案：`{file_path}`")
-            st.info(f"💡 請在終端機執行 `python data_fetcher.py` 啟動三級互補下載。")
+            st.info("💡 請先在終端機執行 `python data_fetcher.py` 同步數據。")
             return pd.DataFrame()
             
         try:
@@ -82,29 +65,27 @@ class ChartPlugin:
         try:
             time_col = 'time_key' if 'time_key' in df.columns else ('date' if 'date' in df.columns else df.columns[0])
             df['dt_obj'] = pd.to_datetime(df[time_col])
-
-            if ktype_name in ['DAY', 'WEEK']:
-                df['time_clean'] = df['dt_obj'].dt.strftime('%Y-%m-%d')
-            else:
-                df['time_clean'] = df['dt_obj'].astype('int64') // 10**9
-
-            df = df.drop_duplicates(subset=['time_clean']).sort_values('dt_obj').reset_index(drop=True)
+            df = df.sort_values('dt_obj').reset_index(drop=True)
+            df['time_str'] = df['dt_obj'].dt.strftime('%Y-%m-%d %H:%M') if ktype_name in ['1Hr', '5M'] else df['dt_obj'].dt.strftime('%Y-%m-%d')
+            
             df = self.calculate_vpa_indicators(df)
 
+            # 融合實時現價
             live_info = self.get_realtime_market_price(code)
             if live_info["price"]:
                 current_price = live_info["price"]
-                price_desc = f"{live_info['source_text']}: **${current_price:.2f}** (美東時間 ET)"
+                price_desc = f"🟢 {live_info['status_text']}: **${current_price:.2f}** (美東時間 ET)"
                 df.loc[df.index[-1], 'close'] = current_price
             else:
                 current_price = float(df['close'].iloc[-1])
-                price_desc = f"📌 本地歷史收盤價: **${current_price:.2f}**"
+                price_desc = f"📌 美東定格價: **${current_price:.2f}**"
 
+            # 計算 TD 趨勢通道
             td_res = compute_demark_trendlines(df, window=4)
             td_highs, td_lows = find_td_pivots(df, window=4)
 
-            # ---------------- 🎯 50/50 戰術決策預測面板 ----------------
-            st.markdown(f"### 🧭 {code} - {ktype_name} 戰術決策預測面板 (美東時間 ET)")
+            # ---------------- 🎯 50/50 戰術決策面板 ----------------
+            st.markdown(f"### 🧭 {code} - {ktype_name} 專業量化走勢 (Plotly 緊湊無間隙引擎)")
             st.markdown(price_desc)
 
             res_val = td_res.get('curr_res_val') or round(current_price * 1.01, 2)
@@ -118,124 +99,89 @@ class ChartPlugin:
 
             w_left, w_right = st.columns(2)
             with w_left:
-                st.success("🟢 **多頭向上推演路徑 (Bullish Wave 50%)**")
-                st.markdown(f"""
-                - **起爆關鍵點**：站穩阻力線 **${res_val:.2f}**
-                - **第一目標位 (Target 1)**：🚀 **${t1:.2f}** (TD 0.618 突破浪)
-                - **第二目標位 (Target 2)**：🎯 **${t2:.2f}** (TD 1.0 對稱通道)
-                """)
-
+                st.success("🟢 **多頭向上推演 (Bullish 50%)**")
+                st.markdown(f"- **突破點**：`${res_val:.2f}` | **Target 1**: `${t1:.2f}` | **Target 2**: `${t2:.2f}`")
             with w_right:
-                st.error("🔴 **空頭向下推演路徑 (Bearish Wave 50%)**")
-                st.markdown(f"""
-                - **破位關鍵點**：跌破支撐線 **${sup_val:.2f}**
-                - **第一目標位 (Target 1)**：📉 **${b1:.2f}** (TD 0.618 下跌浪)
-                - **第二目標位 (Target 2)**：🎯 **${b2:.2f}** (TD 1.0 對稱通道)
-                """)
+                st.error("🔴 **空頭向下推演 (Bearish 50%)**")
+                st.markdown(f"- **破位點**：`${sup_val:.2f}` | **Target 1**: `${b1:.2f}` | **Target 2**: `${b2:.2f}`")
 
             st.divider()
 
-            candles = []
-            markers = []
-            vol_bars = []
-            vma20_line = []
-            vma15_line = []
-            vma20_alert_line = []
+            # ---------------- Plotly 雙層畫布架構 ----------------
+            fig = make_subplots(
+                rows=2, cols=1, 
+                shared_xaxes=True, 
+                vertical_spacing=0.03, 
+                row_heights=[0.75, 0.25]
+            )
 
-            td_high_times = {str(p['time']) for p in td_highs}
-            td_low_times = {str(p['time']) for p in td_lows}
-            has_vol = 'volume' in df.columns
+            # 1. 主圖：K 線
+            fig.add_trace(go.Candlestick(
+                x=df['time_str'],
+                open=df['open'],
+                high=df['high'],
+                low=df['low'],
+                close=df['close'],
+                name="K線",
+                increasing_line_color="#089981",
+                decreasing_line_color="#F23645"
+            ), row=1, col=1)
 
-            for _, row in df.iterrows():
-                t = int(row['time_clean']) if isinstance(row['time_clean'], (int, float)) else str(row['time_clean'])
-                dt_item = row['dt_obj']
-                hour_et = dt_item.hour
-                min_et = dt_item.minute
-                time_float = hour_et + min_et / 60.0
-
-                is_rth = (time_float >= 9.5) and (time_float < 16.0)
-
-                candles.append({
-                    "time": t,
-                    "open": float(row['open']),
-                    "high": float(row['high']),
-                    "low": float(row['low']),
-                    "close": float(row['close'])
-                })
-
-                if str(row['time_clean']) in td_high_times:
-                    markers.append({"time": t, "position": "aboveBar", "color": "#FF5252", "shape": "arrowDown", "text": "TD High"})
-                elif str(row['time_clean']) in td_low_times:
-                    markers.append({"time": t, "position": "belowBar", "color": "#00E676", "shape": "arrowUp", "text": "TD Low"})
-
-                if has_vol:
-                    vol_bars.append({
-                        "time": t,
-                        "value": float(row['volume']),
-                        "color": ("#089981" if row['close'] >= row['open'] else "#F23645") if is_rth else ("rgba(8, 153, 129, 0.45)" if row['close'] >= row['open'] else "rgba(242, 54, 69, 0.45)")
-                    })
-                    if pd.notna(row.get('vma20')): vma20_line.append({"time": t, "value": float(row['vma20'])})
-                    if pd.notna(row.get('vma_15x')): vma15_line.append({"time": t, "value": float(row['vma_15x'])})
-                    if pd.notna(row.get('vma_20x')): vma20_alert_line.append({"time": t, "value": float(row['vma_20x'])})
-
-            price_chart = {
-                "height": 500,
-                "layout": {"textColor": "#8b949e", "background": {"type": "solid", "color": "#0d1117"}},
-                "grid": {"vertLines": {"color": "#161b22"}, "horzLines": {"color": "#161b22"}},
-                "crosshair": {"mode": 1},
-                "timeScale": {
-                    "timeVisible": True,
-                    "secondsVisible": False,
-                    "borderColor": "#21262d"
-                },
-                "rightPriceScale": {"borderColor": "#21262d", "autoScale": True},
-                "handleScroll": {"mouseWheel": True, "pressedMouseMove": True, "horzTouchDrag": True, "vertTouchDrag": True},
-                "handleScale": {"axisPressedMouseMove": True, "mouseWheel": True, "pinch": True}
-            }
-
-            price_series = [
-                {
-                    "type": "Candlestick",
-                    "data": candles,
-                    "options": {
-                        "upColor": "#089981",
-                        "downColor": "#F23645",
-                        "borderVisible": False,
-                        "wickUpColor": "#089981",
-                        "wickDownColor": "#F23645"
-                    },
-                    "markers": markers
-                }
-            ]
-
+            # 2. TD 阻力線與支撐線
             if td_res.get("resistance_line"):
-                res_pts = [{"time": int(pt["time"]) if str(pt["time"]).isdigit() else pt["time"], "value": pt["value"]} for pt in td_res["resistance_line"]]
-                price_series.append({"type": "Line", "data": res_pts, "options": {"color": "#FF5252", "lineWidth": 2, "lineStyle": 2, "title": "TD Resistance"}})
+                res_df = pd.DataFrame(td_res["resistance_line"])
+                fig.add_trace(go.Scatter(
+                    x=df['time_str'].iloc[-len(res_df):],
+                    y=res_df['value'],
+                    mode='lines',
+                    line=dict(color='#FF5252', width=2, dash='dash'),
+                    name="TD 阻力線"
+                ), row=1, col=1)
 
             if td_res.get("support_line"):
-                sup_pts = [{"time": int(pt["time"]) if str(pt["time"]).isdigit() else pt["time"], "value": pt["value"]} for pt in td_res["support_line"]]
-                price_series.append({"type": "Line", "data": sup_pts, "options": {"color": "#00E676", "lineWidth": 2, "lineStyle": 2, "title": "TD Support"}})
+                sup_df = pd.DataFrame(td_res["support_line"])
+                fig.add_trace(go.Scatter(
+                    x=df['time_str'].iloc[-len(sup_df):],
+                    y=sup_df['value'],
+                    mode='lines',
+                    line=dict(color='#00E676', width=2, dash='dash'),
+                    name="TD 支撐線"
+                ), row=1, col=1)
 
-            charts_to_render = [{"chart": price_chart, "series": price_series}]
+            # 3. 副圖：VPA 量能柱與均量線
+            bar_colors = ["#089981" if c >= o else "#F23645" for o, c in zip(df['open'], df['close'])]
+            fig.add_trace(go.Bar(
+                x=df['time_str'],
+                y=df['volume'],
+                name="成交量",
+                marker=dict(color=bar_colors)
+            ), row=2, col=1)
 
-            if has_vol and vol_bars:
-                vol_chart = {
-                    "height": 160,
-                    "layout": {"textColor": "#8b949e", "background": {"type": "solid", "color": "#0d1117"}},
-                    "grid": {"vertLines": {"color": "#161b22"}, "horzLines": {"color": "#161b22"}},
-                    "crosshair": {"mode": 1},
-                    "timeScale": {"timeVisible": True, "secondsVisible": False, "borderColor": "#21262d"},
-                    "rightPriceScale": {"borderColor": "#21262d", "autoScale": True}
-                }
-                vol_series = [
-                    {"type": "Histogram", "data": vol_bars, "options": {"priceFormat": {"type": "volume"}, "priceScaleId": ""}},
-                    {"type": "Line", "data": vma20_line, "options": {"color": "#ffffff", "lineWidth": 1, "title": "VMA20"}},
-                    {"type": "Line", "data": vma15_line, "options": {"color": "#8b949e", "lineWidth": 1, "lineStyle": 2, "title": "1.5X"}},
-                    {"type": "Line", "data": vma20_alert_line, "options": {"color": "#ffd700", "lineWidth": 1, "lineStyle": 2, "title": "2.0X"}}
-                ]
-                charts_to_render.append({"chart": vol_chart, "series": vol_series})
+            if 'vma20' in df.columns:
+                fig.add_trace(go.Scatter(x=df['time_str'], y=df['vma20'], line=dict(color="#ffffff", width=1), name="VMA20"), row=2, col=1)
+                fig.add_trace(go.Scatter(x=df['time_str'], y=df['vma_15x'], line=dict(color="#8b949e", width=1, dash="dot"), name="1.5X 警戒"), row=2, col=1)
+                fig.add_trace(go.Scatter(x=df['time_str'], y=df['vma_20x'], line=dict(color="#ffd700", width=1, dash="dot"), name="2.0X 異動"), row=2, col=1)
 
-            renderLightweightCharts(charts_to_render, key=f"tv_failover_{code}_{ktype_name}")
+            # 核心關鍵：將 X 軸設為 'category' 類型，完全消除夜間與週末休市的大片空白 (Gap)
+            fig.update_xaxes(type='category', rangeslider_visible=False, gridcolor="#161b22")
+            fig.update_yaxes(gridcolor="#161b22")
+
+            fig.update_layout(
+                height=650,
+                template="plotly_dark",
+                paper_bgcolor="#0d1117",
+                plot_bgcolor="#0d1117",
+                margin=dict(l=10, r=10, t=10, b=10),
+                hovermode="x unified",
+                dragmode="pan"
+            )
+
+            # 渲染圖表 (開啟滑鼠滾輪縮放)
+            st.plotly_chart(
+                fig, 
+                use_container_width=True, 
+                config={"scrollZoom": True, "displayModeBar": True, "displaylogo": False}
+            )
 
         except Exception as e:
-            st.error(f"❌ 渲染失敗: {str(e)}")
+            st.error(f"❌ 圖表渲染失敗: {str(e)}")
