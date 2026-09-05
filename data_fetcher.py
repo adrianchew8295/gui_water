@@ -1,70 +1,56 @@
+# 文件名: data_fetcher.py
+import datetime
 import os
-import pandas as pd
-from futu import OpenQuoteContext, KLType, SubType, RET_OK
+import time
+import pytz
+from moomoo import OpenQuoteContext, RET_OK, KLType, AuType
 
-HOST = '127.0.0.1'
-PORT = 11111
-WATCHLIST = ['US.QQQ', 'US.BTC']
+tz_ny = pytz.timezone("America/New_York")
 DATA_DIR = './market_data'
+os.makedirs(DATA_DIR, exist_ok=True)
 
-class HistoryDataEngine:
-    def __init__(self, host: str = HOST, port: int = PORT, save_dir: str = DATA_DIR):
-        self.host = host
-        self.port = port
-        self.save_dir = save_dir
-        self._ensure_dir()
+# 抓取清單：加入 60M (1小時)
+TARGETS = [
+    ("US.QQQ", [("DAY", KLType.K_DAY, 120), ("WEEK", KLType.K_WEEK, 60), ("60M", KLType.K_60M, 240)]),
+    ("US.BTC", [("DAY", KLType.K_DAY, 120), ("WEEK", KLType.K_WEEK, 60), ("60M", KLType.K_60M, 240)])
+]
 
-    def _ensure_dir(self):
-        try:
-            if not os.path.exists(self.save_dir):
-                os.makedirs(self.save_dir)
-        except Exception as e:
-            print(f"【系統提示】創建本地數據目錄失敗: {str(e)}")
+def fetch_and_save_kline():
+    print("【任務啟動】開始同步 1H / 日線 / 周線 歷史數據基座...")
+    today = datetime.datetime.now(tz_ny).date()
+    start_date = (today - datetime.timedelta(days=180)).strftime("%Y-%m-%d")
+    end_date = today.strftime("%Y-%m-%d")
 
-    def fetch_and_save_kline(self, code: str, ktype: KLType, count: int = 500) -> bool:
-        quote_ctx = None
-        ktype_name = "DAY" if ktype == KLType.K_DAY else "WEEK"
-        sub_type = SubType.K_DAY if ktype == KLType.K_DAY else SubType.K_WEEK
-        try:
-            quote_ctx = OpenQuoteContext(host=self.host, port=self.port)
-            
-            # 第一步：訂閱 K 線類型
-            sub_ret, sub_err = quote_ctx.subscribe([code], [sub_type])
-            if sub_ret != RET_OK:
-                print(f"【訂閱報錯】標的 {code} 訂閱 {ktype_name} 失敗: {sub_err}")
-                return False
-
-            # 第二步：拉取歷史 K 線數據 (精確修復為接收兩個返回值)
-            ret, data = quote_ctx.get_cur_kline(code, count, ktype)
-            if ret != RET_OK:
-                print(f"【獲取報錯】標的 {code} 拉取 {ktype_name} 失敗: {data}")
-                return False
-
-            # 第三步：數據清洗與標準化
-            df = data[['time_key', 'open', 'close', 'high', 'low', 'volume', 'pe_ratio', 'turnover_rate']].copy()
-            
-            # 第四步：本地落盤存儲
+    for code, tasks in TARGETS:
+        for ktype_name, ktype_enum, count in tasks:
             clean_code = code.replace('.', '_')
-            file_path = os.path.join(self.save_dir, f"{clean_code}_{ktype_name}.csv")
-            df.to_csv(file_path, index=False)
-            print(f"【成功存盤】標的 {code} 的 {ktype_name} 數據已保存至: {file_path}")
-            return True
+            file_path = os.path.join(DATA_DIR, f"{clean_code}_{ktype_name}.csv")
+            
+            quote_ctx = None
+            try:
+                quote_ctx = OpenQuoteContext(host='127.0.0.1', port=11111)
+                ret, df_k, msg = quote_ctx.request_history_kline(
+                    code=code,
+                    start=start_date,
+                    end=end_date,
+                    ktype=ktype_enum,
+                    autype=AuType.NONE,
+                    max_count=count
+                )
+                if ret == RET_OK and not df_k.empty:
+                    df_k.to_csv(file_path, index=False)
+                    print(f"【成功存盤】標的 {code} 的 {ktype_name} 數據已保存至: {file_path}")
+                else:
+                    print(f"❌ 拉取 {code} {ktype_name} 失敗: {msg}")
+            except Exception as e:
+                print(f"❌ 異常: {e}")
+            finally:
+                if quote_ctx:
+                    try: quote_ctx.close()
+                    except: pass
+            time.sleep(0.1)
 
-        except Exception as e:
-            print(f"【運行異常】處理 {code} 時發生未預期錯誤: {str(e)}")
-            return False
-        finally:
-            if quote_ctx:
-                quote_ctx.close()
+    print("【任務完成】所有週期歷史數據同步完畢。")
 
-    def run_batch_sync(self):
-        print("【任務啟動】開始同步周線與日線歷史數據基座...")
-        for code in WATCHLIST:
-            self.fetch_and_save_kline(code=code, ktype=KLType.K_DAY, count=500)
-            self.fetch_and_save_kline(code=code, ktype=KLType.K_WEEK, count=200)
-        print("【任務完成】所有標的歷史數據同步完畢。")
-
-
-if __name__ == '__main__':
-    engine = HistoryDataEngine()
-    engine.run_batch_sync()
+if __name__ == "__main__":
+    fetch_and_save_kline()
