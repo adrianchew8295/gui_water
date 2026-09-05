@@ -1,5 +1,5 @@
 # 文件名: chart_plugin.py
-# 核心特性: 超低延遲單例通道 + 5M 雙表護眼排版 + 通欄整行高亮 + 0DTE 預算期權雷達
+# 核心特性: 保守右側確認開火 + 5M 雙表護眼排版 + 閉合柱通欄高亮 + 0DTE $200 預算雷達
 
 import os
 import time
@@ -12,7 +12,6 @@ from moomoo import OpenQuoteContext, RET_OK, KLType, SubType, AuType
 
 tz_ny = pytz.timezone("America/New_York")
 
-# 絕對路徑防呆定位 market_data 資料夾
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, 'market_data')
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -58,7 +57,6 @@ class ChartPlugin:
 
     def compute_td_setup(self, df: pd.DataFrame) -> list:
         """依據彭博 Bloomberg 標準計算德馬克 TD Setup (1~9 轉)"""
-        counts = [0] * len(df)
         setup_type = ["⚪ --"] * len(df)
         if len(df) < 5:
             return setup_type
@@ -71,17 +69,15 @@ class ChartPlugin:
             if curr_c < ref_c:
                 buy_count += 1
                 sell_count = 0
-                counts[i] = buy_count
                 setup_type[i] = f"🟢 買入 S{buy_count}" if buy_count < 9 else "🔥 買入 S9轉"
             elif curr_c > ref_c:
                 sell_count += 1
                 buy_count = 0
-                counts[i] = sell_count
                 setup_type[i] = f"🔴 賣出 S{sell_count}" if sell_count < 9 else "⚡ 賣出 S9轉"
             else:
                 buy_count = 0
                 sell_count = 0
-                setup_type[i] = "⚪ 震盪"
+                setup_type[i] = "⚪ 待機中"
         return setup_type
 
     def get_realtime_data_and_kline(self, code: str) -> tuple:
@@ -118,13 +114,11 @@ class ChartPlugin:
                     df_5m.columns = [c.lower().strip() for c in df_5m.columns]
                     df_5m['time_key'] = pd.to_datetime(df_5m['time_key'])
                     df_5m = df_5m.sort_values('time_key').reset_index(drop=True)
-                    # 自動落盤沉澱
                     save_prefix = "CC_BTCUSD" if "BTC" in code.upper() else code.replace('.', '_')
                     df_5m.to_csv(os.path.join(self.data_dir, f"{save_prefix}_5M.csv"), index=False)
             except Exception:
                 pass
 
-        # 若 OpenD 未通，讀取本地 CSV 保底
         if df_5m.empty:
             save_prefix = "CC_BTCUSD" if "BTC" in code.upper() else code.replace('.', '_')
             f_path = os.path.join(self.data_dir, f"{save_prefix}_5M.csv")
@@ -157,10 +151,9 @@ class ChartPlugin:
         return pd.DataFrame()
 
     def render_cockpit(self, code: str, budget_usd: float = 200.0):
-        """【極速雙表實戰座艙主渲染】"""
+        """【保守右側確認 · 極速雙表實戰座艙】"""
         snap, df_5m = self.get_realtime_data_and_kline(code)
         df_day = self.load_cold_data(code, "DAY")
-        df_1h = self.load_cold_data(code, "1Hr")
 
         # 1. 確定現價與跳動比對
         curr_price = snap["price"]
@@ -169,17 +162,16 @@ class ChartPlugin:
         if curr_price <= 0:
             curr_price = 79700.0 if "BTC" in code.upper() else 488.50
 
-        # Session State 記憶上一跳價格以判定 Flash 顏色
         prev_p_key = f"{code}_prev_price"
         prev_p = st.session_state.get(prev_p_key, curr_price)
         st.session_state[prev_p_key] = curr_price
 
         delta_val = curr_price - prev_p
         if delta_val > 0:
-            flash_color = "#00E676"  # 綠色
+            flash_color = "#00E676"
             flash_sym = f"▲ +${delta_val:.2f}"
         elif delta_val < 0:
-            flash_color = "#FF5252"  # 紅色
+            flash_color = "#FF5252"
             flash_sym = f"▼ -${abs(delta_val):.2f}"
         else:
             flash_color = "#f0f6fc"
@@ -204,24 +196,44 @@ class ChartPlugin:
                 trend_bias = -1
                 trend_text = "🔴 -1 (空頭壓制 [日線<EMA20])"
 
-        # 3. 處理 5M K 線與指標計算
-        if df_5m.empty or len(df_5m) < 6:
+        if df_5m.empty or len(df_5m) < 8:
             st.warning("⏳ 正在等待 5M 數據流連通中...")
             return
 
+        # 3. 指標計算與形態識別 (完全按照富途 13 行規則)
         df_5m['vma20'] = df_5m['volume'].rolling(20).mean().bfill()
         df_5m['atr14'] = self.calculate_atr(df_5m, 14)
         df_5m['td_setup'] = self.compute_td_setup(df_5m)
 
-        # 截取最近 6 根（30 分鐘黃金窗口）並倒序排列（最新在第 1 行）
+        # 基礎形態標記 (RAW 形態)
+        llv5 = df_5m['low'].rolling(5).min().shift(1).bfill()
+        hhv5 = df_5m['high'].rolling(5).max().shift(1).bfill()
+
+        # 富途 5.1 獨立 2B 假突破
+        bull_2b_raw = ((df_5m['low'] < llv5) | (df_5m['low'] < pdl_line)) & (df_5m['close'] > llv5) & (df_5m['close'] > df_5m['open'])
+        bear_2b_raw = ((df_5m['high'] > hhv5) | (df_5m['high'] > pdh_line)) & (df_5m['close'] < hhv5) & (df_5m['close'] < df_5m['open'])
+
+        # 富途 5.2 吞沒與晨星
+        c1, o1 = df_5m['close'].shift(1), df_5m['open'].shift(1)
+        c2, o2 = df_5m['close'].shift(2), df_5m['open'].shift(2)
+        h1, l1 = df_5m['high'].shift(1), df_5m['low'].shift(1)
+
+        bull_engulf = (df_5m['close'] > df_5m['open']) & (c1 < o1) & (df_5m['close'] >= o1) & (df_5m['open'] <= c1)
+        bear_engulf = (df_5m['close'] < df_5m['open']) & (c1 > o1) & (df_5m['close'] <= o1) & (df_5m['open'] >= c1)
+
+        bull_star = (c2 < o2) & ((c1 - o1).abs() <= 0.35 * (h1 - l1)) & (df_5m['close'] > df_5m['open']) & (df_5m['close'] >= (o2 + c2) / 2)
+        bear_star = (c2 > o2) & ((c1 - o1).abs() <= 0.35 * (h1 - l1)) & (df_5m['close'] < df_5m['open']) & (df_5m['close'] <= (o2 + c2) / 2)
+
+        raw_bull_pattern = bull_2b_raw | bull_engulf | bull_star
+        raw_bear_pattern = bear_2b_raw | bear_engulf | bear_star
+
+        # 截取最近 6 根（倒序排列，最新在第 1 行）
         bars_6 = df_5m.tail(6).iloc[::-1].copy().reset_index(drop=True)
 
-        # ====== 建立表 1 與 表 2 數據行 ======
         table1_rows = []
         table2_rows = []
-        highlight_rows = []  # 標記哪一行需要通欄高亮
 
-        latest_trigger_action = "☕ 處於安全中繼區，距離上下邊界均有空間，嚴禁半山腰開單，耐心等待觸碰戰區"
+        latest_trigger_action = "☕ 處於安全中繼區，耐心等待 5M 收盤確認右側突破"
         latest_trigger_type = "NONE"
 
         for idx, row in bars_6.iterrows():
@@ -234,46 +246,72 @@ class ChartPlugin:
             vol_ratio = v / vma
             is_heavy = vol_ratio >= 1.25
 
-            # 形態判定 (2B / 晨星 / 暮星)
-            is_bull_2b = (l < pdl_line) and (c > pdl_line) and (c > o)
-            is_bear_2b = (h > pdh_line) and (c < pdh_line) and (c < o)
-            
             candle_color = "🟢 陽線" if c >= o else "🔴 陰線"
-            
-            # 行狀態與指令
             row_style = ""
             action_str = "⚪ 待機中"
             diag_str = "⚪ 常規波動"
 
             if idx == 0:
+                # ─── 第 1 行：正在走動的 LIVE 棒（嚴格閹割信號，只看跳動）───
                 state_str = "⚡ LIVE"
                 c_display = f"${curr_price:,.2f} ({flash_sym})"
+                diag_str = "⚪ 棒線走動中 (等待 5M 收盤定格)"
+                action_str = "☕ 觀望待機 (未收盤禁止開單)"
             else:
+                # ─── 第 2~6 行：已收盤定格棒線 ───
                 state_str = "🔒 收盤"
                 c_display = f"${c:,.2f} [{candle_color}]"
 
-            # 判斷信號觸發
-            if is_bull_2b and is_heavy and trend_bias >= 0:
-                row_style = "background-color: #06301d; color: #ffffff; font-weight: bold; border-left: 5px solid #00E676;"
-                diag_str = "🔥 2B 破底翻 (扎穿PML拉回)"
-                sl = l - 0.5 * atr
-                tp = c + 2.0 * (c - sl)
-                action_str = f"🎯 買入 CALL (入: ${c:.2f} | 止: ${sl:.2f} | 盈: ${tp:.2f})"
-                if idx == 0 or idx == 1:
-                    latest_trigger_type = "CALL"
-                    latest_trigger_action = f"🔥 【立即買入 0DTE CALL】 正股入場: ${curr_price:.2f} | 止損: ${sl:.2f} | 2R止盈: ${tp:.2f}"
-            elif is_bear_2b and is_heavy and trend_bias <= 0:
-                row_style = "background-color: #380a0e; color: #ffffff; font-weight: bold; border-left: 5px solid #FF5252;"
-                diag_str = "🔥 2B 假突破衝頂 (刺穿PMH收回)"
-                sl = h + 0.5 * atr
-                tp = c - 2.0 * (sl - c)
-                action_str = f"🎯 買入 PUT (入: ${c:.2f} | 止: ${sl:.2f} | 盈: ${tp:.2f})"
-                if idx == 0 or idx == 1:
-                    latest_trigger_type = "PUT"
-                    latest_trigger_action = f"🔥 【立即買入 0DTE PUT】 正股入場: ${curr_price:.2f} | 止損: ${sl:.2f} | 2R止盈: ${tp:.2f}"
-            else:
-                diag_str = "⚪ 均線上方蓄勢" if c > o else "⚪ 區間震盪整理"
-                action_str = "☕ 觀望 (等待觸碰邊界)"
+                # 提取前一根的真實數據以執行【保守右側確認】
+                # 在 bars_6 中，idx+1 對應的就是前一根 (T-1) 棒線
+                if idx + 1 < len(bars_6):
+                    prev_bar = bars_6.iloc[idx + 1]
+                    p_h, p_l = float(prev_bar['high']), float(prev_bar['low'])
+                    p_vol_ratio = float(prev_bar['volume']) / (float(prev_bar['vma20']) if prev_bar['vma20'] > 0 else 1.0)
+                    p_heavy = p_vol_ratio >= 1.25
+
+                    orig_idx = df_5m.index[df_5m['time_key'] == row['time_key']].tolist()
+                    if orig_idx:
+                        p_orig_idx = orig_idx[0] - 1
+                        has_prev_bull = raw_bull_pattern.iloc[p_orig_idx] if p_orig_idx >= 0 else False
+                        has_prev_bear = raw_bear_pattern.iloc[p_orig_idx] if p_orig_idx >= 0 else False
+                    else:
+                        has_prev_bull, has_prev_bear = False, False
+
+                    # 【富途 PART 6 保守右側確認開火公式】
+                    # 做多: 前一根有形態 + 當前根衝破前高 + 收陽線 + (當前或前一根放量) + 宏觀允許
+                    is_bull_confirmed = has_prev_bull and (h > p_h) and (c > o) and (is_heavy or p_heavy) and (trend_bias >= 0)
+                    # 做空: 前一根有形態 + 當前根跌破前低 + 收陰線 + (當前或前一根放量) + 宏觀允許
+                    is_bear_confirmed = has_prev_bear and (l < p_l) and (c < o) and (is_heavy or p_heavy) and (trend_bias <= 0)
+
+                    if is_bull_confirmed:
+                        row_style = "background-color: #06301d; color: #ffffff; font-weight: bold; border-left: 5px solid #00E676;"
+                        diag_str = "🔥 2B/晨星 右側放量衝破確認"
+                        sl = p_l - 0.5 * atr
+                        tp = c + 2.0 * (c - sl)
+                        action_str = f"🎯 【買入 CALL】(入: ${c:.2f} | 止: ${sl:.2f} | 盈: ${tp:.2f})"
+                        if idx == 1:  # 剛收盤的這一根成立
+                            latest_trigger_type = "CALL"
+                            latest_trigger_action = f"🔥 【右側確認 · 買入 0DTE CALL】 入場: ${c:.2f} | 止損: ${sl:.2f} | 2R止盈: ${tp:.2f}"
+
+                    elif is_bear_confirmed:
+                        row_style = "background-color: #380a0e; color: #ffffff; font-weight: bold; border-left: 5px solid #FF5252;"
+                        diag_str = "🔥 2B/暮星 右側放量跌破確認"
+                        sl = p_h + 0.5 * atr
+                        tp = c - 2.0 * (sl - c)
+                        action_str = f"🎯 【買入 PUT】(入: ${c:.2f} | 止: ${sl:.2f} | 盈: ${tp:.2f})"
+                        if idx == 1:
+                            latest_trigger_type = "PUT"
+                            latest_trigger_action = f"🔥 【右側確認 · 買入 0DTE PUT】 入場: ${c:.2f} | 止損: ${sl:.2f} | 2R止盈: ${tp:.2f}"
+
+                    else:
+                        if has_prev_bull:
+                            diag_str = "⚪ 扎針完成 (等待右側衝破確認)"
+                        elif has_prev_bear:
+                            diag_str = "⚪ 衝頂完成 (等待右側跌破確認)"
+                        else:
+                            diag_str = "⚪ 均線上方蓄勢" if c > o else "⚪ 區間震盪整理"
+                        action_str = "☕ 觀望待機"
 
             table1_rows.append({
                 "5M時段 (ET)": t_str,
@@ -297,7 +335,7 @@ class ChartPlugin:
             f"📶 數據通道: **{snap['source']}** | 撮合時間: **{snap['server_time']} ET** | 延遲: **{snap['latency_ms']} ms** | 宏觀方向: **{trend_text}** | 💾 CSV自動同步"
         )
 
-        # ====== 模組 3: 表 1 —— 5M 即時量價核心表 (HTML 渲染支援通欄整行高亮) ======
+        # ====== 模組 3: 表 1 —— 5M 即時量價核心表 (支援通欄整行高亮) ======
         st.markdown("##### 📊 表 1：5M 即時量價核心表 (黃金 30 分鐘滾動窗口)")
         t1_html = "<table style='width:100%; border-collapse: collapse; font-family: monospace; font-size: 14px; text-align: left; background-color: #0d1117;'>"
         t1_html += "<tr style='border-bottom: 2px solid #30363d; color: #8b949e;'>"
@@ -320,7 +358,7 @@ class ChartPlugin:
         st.markdown("<div style='margin-top: 15px;'></div>", unsafe_allow_html=True)
 
         # ====== 模組 4: 表 2 —— 德馬克 TD 9 轉與 0DTE 戰術表 ======
-        st.markdown("##### ⏱️ 表 2：德馬克 TD 9轉與 0DTE 戰術表")
+        st.markdown("##### ⏱️ 表 2：德馬克 TD 9轉與 0DTE 戰術表 (保守右側確認)")
         t2_html = "<table style='width:100%; border-collapse: collapse; font-family: monospace; font-size: 14px; text-align: left; background-color: #0d1117;'>"
         t2_html += "<tr style='border-bottom: 2px solid #30363d; color: #8b949e;'>"
         for col in ["5M時段 (ET)", "TD 9轉 (Setup)", "形態與戰區診斷", "1:2 結構指令 & 動作"]:
