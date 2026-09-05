@@ -1,5 +1,5 @@
 # 文件名: app.py
-# 核心功能: 極簡高頻純數據實戰座艙主入口 (0 繪圖負擔，毫秒級平滑跳動)
+# 核心功能: 極簡高頻純數據實戰座艙主入口 (0 繪圖負擔，安全防崩潰)
 
 import streamlit as st
 from chart_plugin import ChartPlugin
@@ -7,8 +7,7 @@ from chart_plugin import ChartPlugin
 st.set_page_config(
     page_title="癸水 · 量化實戰座艙",
     page_icon="⚡",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    layout="wide"
 )
 
 plugin = ChartPlugin()
@@ -21,7 +20,7 @@ live_speed = sidebar.slider("⚡ 實盤刷新頻率 (秒)", min_value=0.5, max_v
 
 st.title("⚡ 癸水 · 0DTE 量化實戰純數據座艙")
 
-# 局部極速刷新，無整頁閃動與繪圖負擔
+# 局部極速刷新，杜絕整頁重繪
 @st.fragment(run_every=live_speed)
 def render_live_cockpit(code: str):
     plugin.render_cockpit(code)
