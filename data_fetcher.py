@@ -9,14 +9,13 @@ tz_ny = pytz.timezone("America/New_York")
 DATA_DIR = './market_data'
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# 抓取清單：加入 60M (1小時)
 TARGETS = [
-    ("US.QQQ", [("DAY", KLType.K_DAY, 120), ("WEEK", KLType.K_WEEK, 60), ("60M", KLType.K_60M, 240)]),
-    ("US.BTC", [("DAY", KLType.K_DAY, 120), ("WEEK", KLType.K_WEEK, 60), ("60M", KLType.K_60M, 240)])
+    ("US.QQQ", [("DAY", KLType.K_DAY, 120), ("WEEK", KLType.K_WEEK, 60), ("1Hr", KLType.K_60M, 240)]),
+    ("US.BTC", [("DAY", KLType.K_DAY, 120), ("WEEK", KLType.K_WEEK, 60), ("1Hr", KLType.K_60M, 240)])
 ]
 
 def fetch_and_save_kline():
-    print("【任務啟動】開始同步 1H / 日線 / 周線 歷史數據基座...")
+    print("【任務啟動】開始同步 1Hr / 日線 / 周線 歷史數據基座...")
     today = datetime.datetime.now(tz_ny).date()
     start_date = (today - datetime.timedelta(days=180)).strftime("%Y-%m-%d")
     end_date = today.strftime("%Y-%m-%d")
