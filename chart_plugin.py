@@ -64,10 +64,12 @@ class ChartPlugin:
             vma20_line = []
             vma15_line = []
             vma20_alert_line = []
-            markers = []
+            vol_markers = []
 
             for _, row in df.iterrows():
                 t = str(row['time_clean'])
+                
+                # 主圖純 K 線數據
                 candles.append({
                     "time": t,
                     "open": float(row['open']),
@@ -76,6 +78,7 @@ class ChartPlugin:
                     "close": float(row['close'])
                 })
 
+                # 副圖成交量柱
                 vol_color = "rgba(8, 153, 129, 0.6)" if row['IS_UP'] else "rgba(242, 54, 69, 0.6)"
                 vol_bars.append({
                     "time": t,
@@ -83,6 +86,7 @@ class ChartPlugin:
                     "color": vol_color
                 })
 
+                # 均量線與警戒線
                 if pd.notna(row['VMA20']):
                     vma20_line.append({"time": t, "value": float(row['VMA20'])})
                 if pd.notna(row['VMA_15X']):
@@ -90,17 +94,17 @@ class ChartPlugin:
                 if pd.notna(row['VMA_20X']):
                     vma20_alert_line.append({"time": t, "value": float(row['VMA_20X'])})
 
-                # 异动打点
+                # 異動打點訊號全部移至副圖成交量柱上方
                 if row['BULL_20']:
-                    markers.append({"time": t, "position": "aboveBar", "color": "#089981", "shape": "arrowUp", "text": "▲▲ 巨量"})
+                    vol_markers.append({"time": t, "position": "aboveBar", "color": "#089981", "shape": "arrowUp", "text": "▲▲ 巨量"})
                 elif row['BULL_15']:
-                    markers.append({"time": t, "position": "aboveBar", "color": "#00bcd4", "shape": "arrowUp", "text": "▲ 异动"})
+                    vol_markers.append({"time": t, "position": "aboveBar", "color": "#00bcd4", "shape": "arrowUp", "text": "▲ 异动"})
                 elif row['BEAR_20']:
-                    markers.append({"time": t, "position": "aboveBar", "color": "#f23645", "shape": "arrowDown", "text": "▼▼ 巨量"})
+                    vol_markers.append({"time": t, "position": "aboveBar", "color": "#f23645", "shape": "arrowDown", "text": "▼▼ 巨量"})
                 elif row['BEAR_15']:
-                    markers.append({"time": t, "position": "aboveBar", "color": "#ff5252", "shape": "arrowDown", "text": "▼ 异动"})
+                    vol_markers.append({"time": t, "position": "aboveBar", "color": "#ff5252", "shape": "arrowDown", "text": "▼ 异动"})
 
-            # 主圖配置
+            # 主圖配置 (純淨無雜質)
             price_chart_options = {
                 "height": 450,
                 "layout": {"textColor": "#d1d4dc", "background": {"type": "solid", "color": "#131722"}},
@@ -122,14 +126,13 @@ class ChartPlugin:
                         "borderVisible": False,
                         "wickUpColor": "#089981",
                         "wickDownColor": "#f23645"
-                    },
-                    "markers": markers
+                    }
                 }
             ]
 
-            # 副圖成交量配置
+            # 副圖成交量配置 (承載所有異動訊號)
             volume_chart_options = {
-                "height": 200,
+                "height": 220,
                 "layout": {"textColor": "#d1d4dc", "background": {"type": "solid", "color": "#131722"}},
                 "grid": {"vertLines": {"color": "#242732"}, "horzLines": {"color": "#242732"}},
                 "crosshair": {"mode": 1},
@@ -143,7 +146,8 @@ class ChartPlugin:
                 {
                     "type": "Histogram",
                     "data": vol_bars,
-                    "options": {"priceFormat": {"type": "volume"}, "priceScaleId": ""}
+                    "options": {"priceFormat": {"type": "volume"}, "priceScaleId": ""},
+                    "markers": vol_markers
                 },
                 {
                     "type": "Line",
