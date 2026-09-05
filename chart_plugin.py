@@ -1,5 +1,5 @@
 # 文件名: chart_plugin.py
-# 核心功能: 專業金融圖表 - 100% 穩定秒級時間戳 + 消除黑屏 + TD 趨勢通道與波浪預測
+# 核心功能: 專業金融圖表 - 秒級時間戳 + Push 數據無縫融合 + TD 趨勢通道與 VPA 副圖
 
 import os
 import pandas as pd
@@ -63,7 +63,6 @@ class ChartPlugin:
             time_col = 'time_key' if 'time_key' in df.columns else ('date' if 'date' in df.columns else df.columns[0])
             df['dt_obj'] = pd.to_datetime(df[time_col])
 
-            # 關鍵修復：日/周用 YYYY-MM-DD，1Hr 與分鐘級嚴格轉為標準 int 秒級時間戳
             if ktype_name in ['DAY', 'WEEK']:
                 df['time_clean'] = df['dt_obj'].dt.strftime('%Y-%m-%d')
             else:
@@ -102,7 +101,7 @@ class ChartPlugin:
                 st.success("🟢 **多頭向上推演路徑 (Bullish Wave 50%)**")
                 st.markdown(f"""
                 - **起爆關鍵點**：站穩阻力線 **${res_val:.2f}**[cite: 2]
-                - **第一目標位 (Target 1)**：🚀 **${t1:.2f}** (TD 0.618 突破浪)
+                - **第一目標位 (Target 1)**：🚀 **${t1:.2f}** (TD 0.618 突破浪)[cite: 1]
                 - **第二目標位 (Target 2)**：🎯 **${t2:.2f}** (TD 1.0 對稱通道)[cite: 1]
                 """)
 
@@ -119,6 +118,10 @@ class ChartPlugin:
             candles = []
             markers = []
             vol_bars = []
+            vma20_line = []
+            vma15_line = []
+            vma20_alert_line = []
+
             td_high_times = {str(p['time']) for p in td_highs}
             td_low_times = {str(p['time']) for p in td_lows}
             has_vol = 'volume' in df.columns
@@ -151,17 +154,16 @@ class ChartPlugin:
                         "value": float(row['volume']),
                         "color": ("#089981" if row['close'] >= row['open'] else "#F23645") if is_rth else ("rgba(8, 153, 129, 0.45)" if row['close'] >= row['open'] else "rgba(242, 54, 69, 0.45)")
                     })
+                    if pd.notna(row.get('vma20')): vma20_line.append({"time": t, "value": float(row['vma20'])})
+                    if pd.notna(row.get('vma_15x')): vma15_line.append({"time": t, "value": float(row['vma_15x'])})
+                    if pd.notna(row.get('vma_20x')): vma20_alert_line.append({"time": t, "value": float(row['vma_20x'])})
 
             price_chart = {
                 "height": 500,
                 "layout": {"textColor": "#8b949e", "background": {"type": "solid", "color": "#0d1117"}},
                 "grid": {"vertLines": {"color": "#161b22"}, "horzLines": {"color": "#161b22"}},
                 "crosshair": {"mode": 1},
-                "timeScale": {
-                    "timeVisible": True,
-                    "secondsVisible": False,
-                    "borderColor": "#21262d"
-                },
+                "timeScale": {"timeVisible": True, "secondsVisible": False, "borderColor": "#21262d"},
                 "rightPriceScale": {"borderColor": "#21262d", "autoScale": True},
                 "handleScroll": {"mouseWheel": True, "pressedMouseMove": True, "horzTouchDrag": True, "vertTouchDrag": True},
                 "handleScale": {"axisPressedMouseMove": True, "mouseWheel": True, "pinch": True}
@@ -201,10 +203,15 @@ class ChartPlugin:
                     "timeScale": {"timeVisible": True, "secondsVisible": False, "borderColor": "#21262d"},
                     "rightPriceScale": {"borderColor": "#21262d", "autoScale": True}
                 }
-                vol_series = [{"type": "Histogram", "data": vol_bars, "options": {"priceFormat": {"type": "volume"}, "priceScaleId": ""}}]
+                vol_series = [
+                    {"type": "Histogram", "data": vol_bars, "options": {"priceFormat": {"type": "volume"}, "priceScaleId": ""}},
+                    {"type": "Line", "data": vma20_line, "options": {"color": "#ffffff", "lineWidth": 1, "title": "VMA20"}},
+                    {"type": "Line", "data": vma15_line, "options": {"color": "#8b949e", "lineWidth": 1, "lineStyle": 2, "title": "1.5X"}},
+                    {"type": "Line", "data": vma20_alert_line, "options": {"color": "#ffd700", "lineWidth": 1, "lineStyle": 2, "title": "2.0X"}}
+                ]
                 charts_to_render.append({"chart": vol_chart, "series": vol_series})
 
-            renderLightweightCharts(charts_to_render, key=f"tv_fixed_{code}_{ktype_name}")
+            renderLightweightCharts(charts_to_render, key=f"tv_push_{code}_{ktype_name}")
 
         except Exception as e:
             st.error(f"❌ 渲染失敗: {str(e)}")
