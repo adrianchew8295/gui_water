@@ -1,5 +1,5 @@
 # 文件名: chart_plugin.py
-# 核心功能: 頂部動態跳動監控艙 (獨立渲染) + 靜態 Plotly 圖表 (視口鎖定，絕不跳回)
+# 核心功能: 毫秒快照 + Plotly 圖表 (Tab1) + 5M 實戰信號跳動 Table (Tab2)
 
 import os
 import datetime
@@ -135,18 +135,14 @@ class ChartPlugin:
         return pd.DataFrame(), "❌ 無可用數據源"
 
     def render_live_monitor_table(self, code: str, ktype_name: str):
-        """【獨立高頻單元】頂部即時跳動監控表格"""
+        """【即時跳動頂部表】"""
         snap_info = self.get_realtime_snapshot_price(code)
         
-        # 讀取本地最近一筆數據對比
         is_btc = "BTC" in code.upper()
         save_prefix = "CC_BTCUSD" if is_btc else code.replace('.', '_')
         file_path = os.path.join(self.data_dir, f"{save_prefix}_{ktype_name}.csv")
         
-        last_close = 0.0
-        last_high = 0.0
-        last_low = 0.0
-        last_vol = 0.0
+        last_close, last_high, last_low, last_vol = 0.0, 0.0, 0.0, 0.0
         
         if os.path.exists(file_path):
             try:
@@ -169,18 +165,66 @@ class ChartPlugin:
         monitor_data = {
             "監控標的": [code],
             "數據通道": [display_source],
-            "美東即時時間 (ET)": [now_et_str],
-            "最新跳動現價 (Live)": [f"${current_live_price:,.2f}"],
+            "美東時間 (ET)": [now_et_str],
+            "最新現價 (Live)": [f"${current_live_price:,.2f}"],
             "當根最高 (High)": [f"${max(last_high, current_live_price):,.2f}"],
             "當根最低 (Low)": [f"${min(last_low, current_live_price):,.2f}"],
             "當根成交量 (Vol)": [f"{last_vol:,.2f}"],
-            "即時跳動幅度": [f"{chg_pts:+.2f} ({chg_pct:+.2f}%)"]
+            "即時漲跌": [f"{chg_pts:+.2f} ({chg_pct:+.2f}%)"]
         }
-        st.markdown("##### ⚡ 實時行情跳動監控艙 (Live Stream Engine)")
         st.dataframe(pd.DataFrame(monitor_data), use_container_width=True, hide_index=True)
 
+    def render_operation_signals_table(self, code: str):
+        """【Tab 2 專屬】：5分鐘日內實際操作信號判定 Table"""
+        df_5m, _ = self.get_live_data_and_upsert(code, "5M")
+        if df_5m.empty:
+            st.warning("⚠️ 正在等待 5M 數據載入中...")
+            return
+
+        snap_info = self.get_realtime_snapshot_price(code)
+        live_price = snap_info["price"] if snap_info["price"] else float(df_5m['close'].iloc[-1])
+
+        # 計算 5M 量能比
+        df_5m['vma20'] = df_5m['volume'].rolling(window=20).mean()
+        last_row = df_5m.iloc[-1]
+        vma20 = last_row['vma20'] if pd.notna(last_row.get('vma20')) and last_row['vma20'] > 0 else 1.0
+        vol_ratio = float(last_row['volume']) / vma20
+
+        # 計算 TD 趨勢與邊界點位
+        td_res = compute_demark_trendlines(df_5m, window=4)
+        res_val = td_res.get('curr_res_val') or (live_price * 1.005)
+        sup_val = td_res.get('curr_sup_val') or (live_price * 0.995)
+
+        dist_res = res_val - live_price
+        dist_sup = live_price - sup_val
+
+        # 信號觸發判定
+        if dist_res <= 0.30 and vol_ratio >= 1.5:
+            action = "🔴 【觸發 2B 假突破】做空信號 - 買入 ATM Put"
+            status_color = "🔴 賣出 / 逢高做空"
+        elif dist_sup <= 0.30 and vol_ratio >= 1.5:
+            action = "🟢 【觸發 2B 破底翻】做多信號 - 買入 ATM Call"
+            status_color = "🟢 買入 / 破底翻多"
+        elif vol_ratio >= 2.0:
+            action = "⚡ 【機構巨量異動】關注突破方向"
+            status_color = "🟡 警惕變盤"
+        else:
+            action = "⚪ 區間震盪中，維持紀律觀望"
+            status_color = "⚪ 觀望等待"
+
+        op_data = {
+            "標的": [code],
+            "最新跳動價": [f"${live_price:,.2f}"],
+            "5M 量能倍數 (VPA)": [f"{vol_ratio:.2f}x ({'放量' if vol_ratio >= 1.5 else '常規'})"],
+            "動態阻力 (TD High)": [f"${res_val:,.2f} (差 ${dist_res:+.2f})"],
+            "動態支撐 (TD Low)": [f"${sup_val:,.2f} (差 ${dist_sup:+.2f})"],
+            "戰術狀態": [status_color],
+            "0DTE 操作指示 (Action Signal)": [action]
+        }
+        st.dataframe(pd.DataFrame(op_data), use_container_width=True, hide_index=True)
+
     def render_static_chart(self, code: str, ktype_name: str):
-        """【低頻穩定單元】圖表畫布，只在初次或手動觸發時重繪，徹底防止視角跳動"""
+        """【Tab 1 專屬】：完全保留原有 Plotly 專業帶圖圖表"""
         try:
             df, data_source = self.get_live_data_and_upsert(code, ktype_name)
             if df.empty:
@@ -201,26 +245,22 @@ class ChartPlugin:
             df_plot = df.tail(200).copy().reset_index(drop=True)
             fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.75, 0.25])
 
-            # 主圖 K 線
             fig.add_trace(go.Candlestick(
                 x=df_plot['time_clean'], open=df_plot['open'], high=df_plot['high'], low=df_plot['low'], close=df_plot['close'],
                 name="K線", increasing_line_color="#089981", decreasing_line_color="#F23645"
             ), row=1, col=1)
 
-            # EMA 趨勢線
             fig.add_trace(go.Scatter(x=df_plot['time_clean'], y=df_plot['ema9'], mode='lines', line=dict(color='#00E5FF', width=1.5), name="EMA9"), row=1, col=1)
             fig.add_trace(go.Scatter(x=df_plot['time_clean'], y=df_plot['ema20'], mode='lines', line=dict(color='#FFA726', width=1.5), name="EMA20"), row=1, col=1)
 
-            # TD 趨勢通道
             if td_res.get("resistance_line"):
                 res_df = pd.DataFrame(td_res["resistance_line"])
                 fig.add_trace(go.Scatter(x=df_plot['time_clean'].iloc[-len(res_df):], y=res_df['value'], mode='lines', line=dict(color='#FF5252', width=2, dash='dash'), name="TD 阻力線"), row=1, col=1)
 
             if td_res.get("support_line"):
                 sup_df = pd.DataFrame(td_res["support_line"])
-                fig.add_trace(go.Scatter(x=df_plot['time_clean'].iloc[-len(sup_df):], y=sup_df['value'], mode='lines', line=dict(color='#00E676', width=2, dash='dash'), name="TD 支撐線" ), row=1, col=1)
+                fig.add_trace(go.Scatter(x=df_plot['time_clean'].iloc[-len(sup_df):], y=sup_df['value'], mode='lines', line=dict(color='#00E676', width=2, dash='dash'), name="TD 支撐線"), row=1, col=1)
 
-            # 現價動態水平射線
             fig.add_hline(
                 y=current_price,
                 line=dict(color="#FFD700", width=1.5, dash="dashdot"),
@@ -230,7 +270,6 @@ class ChartPlugin:
                 row=1, col=1
             )
 
-            # 副圖成交量
             bar_colors = ["#089981" if c >= o else "#F23645" for o, c in zip(df_plot['open'], df_plot['close'])]
             fig.add_trace(go.Bar(x=df_plot['time_clean'], y=df_plot['volume'], name="成交量", marker=dict(color=bar_colors)), row=2, col=1)
             fig.add_trace(go.Scatter(x=df_plot['time_clean'], y=df_plot['vma20'], line=dict(color="#ffffff", width=1), name="VMA20"), row=2, col=1)
