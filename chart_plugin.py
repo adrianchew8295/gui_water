@@ -1,5 +1,5 @@
 # 文件名: chart_plugin.py
-# 核心功能: 專用容災引擎 (OpenD 訂閱拉取 -> yfinance 毫秒接管) + 實時跳動監控艙 + Plotly 圖表
+# 核心功能: 毫秒級實時快照 (Snapshot) + 5M K 線 Upsert + 即時跳動監控艙 + Plotly 圖表
 
 import os
 import datetime
@@ -20,47 +20,45 @@ class ChartPlugin:
     def __init__(self, data_dir: str = DATA_DIR):
         self.data_dir = data_dir
 
-    def fetch_from_yfinance_direct(self, code: str, ktype_name: str) -> pd.DataFrame:
-        """yfinance 專屬備援快速下載 (BTC-USD / QQQ)"""
-        is_btc = "BTC" in code.upper()
-        yf_sym = "BTC-USD" if is_btc else "QQQ"
-        
-        interval_map = {"5M": "5m", "1Hr": "60m", "DAY": "1d", "WEEK": "1wk"}
-        period_map = {"5M": "5d", "1Hr": "1mo", "DAY": "1y", "WEEK": "2y"}
-        
+    def get_realtime_snapshot_price(self, code: str) -> dict:
+        """獲取毫秒級即時盤口快照 (不需等 5 分鐘，隨時跳動)"""
+        res = {"price": None, "source": "未連線", "time_str": ""}
+        quote_ctx = None
         try:
-            df_yf = yf.download(
-                tickers=yf_sym,
-                period=period_map.get(ktype_name, "5d"),
-                interval=interval_map.get(ktype_name, "5m"),
-                prepost=True,
-                progress=False,
-                auto_adjust=False
-            )
-            if not df_yf.empty:
-                if isinstance(df_yf.columns, pd.MultiIndex):
-                    df_yf.columns = [c[0].lower() for c in df_yf.columns]
-                else:
-                    df_yf.columns = [c.lower() for c in df_yf.columns]
-                
-                df_yf = df_yf.reset_index()
-                dt_col = 'Datetime' if 'Datetime' in df_yf.columns else ('Date' if 'Date' in df_yf.columns else df_yf.columns[0])
-                df_yf['time_key'] = pd.to_datetime(df_yf[dt_col])
-                
-                if df_yf['time_key'].dt.tz is None:
-                    df_yf['time_key'] = df_yf['time_key'].dt.tz_localize('UTC').dt.tz_convert(tz_ny)
-                else:
-                    df_yf['time_key'] = df_yf['time_key'].dt.tz_convert(tz_ny)
-                df_yf['time_key'] = df_yf['time_key'].dt.tz_localize(None)
+            quote_ctx = OpenQuoteContext(host='127.0.0.1', port=11111)
+            target_symbol = "CC.BTCUSD" if "BTC" in code.upper() else code
+            ret, df_snap = quote_ctx.get_market_snapshot([target_symbol])
+            if ret == RET_OK and not df_snap.empty:
+                row = df_snap.iloc[0]
+                res["price"] = float(row['last_price'])
+                res["source"] = "🟢 OpenD 毫秒快照"
+                # 取當前精確時間
+                res["time_str"] = str(row.get('update_time', datetime.datetime.now(tz_ny).strftime('%Y-%m-%d %H:%M:%S')))
+                return res
+        except Exception:
+            pass
+        finally:
+            if quote_ctx:
+                try: quote_ctx.close()
+                except: pass
 
-                clean_df = df_yf[['time_key', 'open', 'close', 'high', 'low', 'volume']].dropna()
-                return clean_df.sort_values('time_key').reset_index(drop=True)
-        except Exception as e:
-            print(f"⚠️ yfinance 下載異常: {e}")
-        return pd.DataFrame()
+        # 備援 yfinance 快速提取
+        try:
+            yf_sym = "BTC-USD" if "BTC" in code.upper() else "QQQ"
+            ticker = yf.Ticker(yf_sym)
+            fast_p = ticker.fast_info.last_price
+            if fast_p:
+                res["price"] = float(fast_p)
+                res["source"] = "🟡 yfinance 實時快照"
+                res["time_str"] = datetime.datetime.now(tz_ny).strftime('%Y-%m-%d %H:%M:%S')
+                return res
+        except Exception:
+            pass
+
+        return res
 
     def get_live_data_and_upsert(self, code: str, ktype_name: str) -> tuple:
-        """獲取最新數據流並執行 Upsert 去重合併 (OpenD -> yfinance -> 本地快照)"""
+        """獲取最新 K 線與毫秒級快照"""
         is_btc = "BTC" in code.upper()
         save_prefix = "CC_BTCUSD" if is_btc else code.replace('.', '_')
         file_path = os.path.join(self.data_dir, f"{save_prefix}_{ktype_name}.csv")
@@ -72,15 +70,13 @@ class ChartPlugin:
                 df_base = pd.read_csv(file_path)
                 df_base.columns = [c.lower() for c in df_base.columns]
                 df_base['time_key'] = pd.to_datetime(df_base['time_key'])
-                if is_btc and not df_base.empty and df_base['close'].iloc[-1] < 1000:
-                    df_base = pd.DataFrame()  # 清除舊的 $35 錯誤快取
             except Exception:
                 pass
 
         df_live = pd.DataFrame()
-        data_source = ""
+        data_source = "🟢 OpenD 原生實時"
 
-        # 2. 優先嘗試 OpenD (需先 Subscribe 訂閱)
+        # 2. 獲取 OpenD 5M K 線
         quote_ctx = None
         try:
             quote_ctx = OpenQuoteContext(host='127.0.0.1', port=11111)
@@ -94,7 +90,6 @@ class ChartPlugin:
                 if ret == RET_OK and not df_k.empty:
                     df_live = df_k[['time_key', 'open', 'close', 'high', 'low', 'volume']].copy()
                     df_live['time_key'] = pd.to_datetime(df_live['time_key'])
-                    data_source = "🟢 OpenD 原生實時"
         except Exception:
             pass
         finally:
@@ -102,13 +97,37 @@ class ChartPlugin:
                 try: quote_ctx.close()
                 except: pass
 
-        # 3. 若 OpenD 失敗或無權限，立即切換 yfinance 備援
-        if df_live.empty:
-            df_live = self.fetch_from_yfinance_direct(code, ktype_name)
-            if not df_live.empty:
-                data_source = "🟡 yfinance 實時接管"
+        # 3. 備援 yfinance
+        if df_live.empty and df_base.empty:
+            try:
+                yf_sym = "BTC-USD" if is_btc else "QQQ"
+                interval_map = {"5M": "5m", "1Hr": "60m", "DAY": "1d", "WEEK": "1wk"}
+                period_map = {"5M": "5d", "1Hr": "1mo", "DAY": "1y", "WEEK": "2y"}
+                
+                df_yf = yf.download(
+                    tickers=yf_sym,
+                    period=period_map.get(ktype_name, "5d"),
+                    interval=interval_map.get(ktype_name, "5m"),
+                    prepost=True,
+                    progress=False,
+                    auto_adjust=False
+                )
+                if not df_yf.empty:
+                    df_yf.columns = [c[0].lower() if isinstance(df_yf.columns, pd.MultiIndex) else c.lower() for c in df_yf.columns]
+                    df_yf = df_yf.reset_index()
+                    dt_col = 'Datetime' if 'Datetime' in df_yf.columns else ('Date' if 'Date' in df_yf.columns else df_yf.columns[0])
+                    df_yf['time_key'] = pd.to_datetime(df_yf[dt_col])
+                    if df_yf['time_key'].dt.tz is None:
+                        df_yf['time_key'] = df_yf['time_key'].dt.tz_localize('UTC').dt.tz_convert(tz_ny)
+                    else:
+                        df_yf['time_key'] = df_yf['time_key'].dt.tz_convert(tz_ny)
+                    df_yf['time_key'] = df_yf['time_key'].dt.tz_localize(None)
+                    df_live = df_yf[['time_key', 'open', 'close', 'high', 'low', 'volume']].dropna()
+                    data_source = "🟡 yfinance 實時接管"
+            except Exception:
+                pass
 
-        # 4. 合併落盤與去重 (Upsert)
+        # 4. 去重合併 (Upsert)
         if not df_live.empty:
             if not df_base.empty:
                 df_merged = pd.concat([df_base, df_live]).drop_duplicates(subset=['time_key'], keep='last')
@@ -126,8 +145,8 @@ class ChartPlugin:
 
         return pd.DataFrame(), "❌ 無可用數據源"
 
-    def render_live_monitor_table(self, df: pd.DataFrame, code: str, data_source: str):
-        """頂部渲染實時跳動監控表格"""
+    def render_live_monitor_table(self, df: pd.DataFrame, code: str, data_source: str, snap_info: dict):
+        """頂部渲染即時跳動監控表格 (融合毫秒級最新價)"""
         if df.empty:
             st.info("⏳ 正在建立行情通訊流...")
             return
@@ -135,18 +154,25 @@ class ChartPlugin:
         last_row = df.iloc[-1]
         prev_row = df.iloc[-2] if len(df) >= 2 else last_row
         
-        chg_pts = last_row['close'] - prev_row['close']
+        # 優先使用毫秒級快照價格，若無則用 K 線最新價
+        current_live_price = snap_info["price"] if snap_info["price"] else float(last_row['close'])
+        display_source = snap_info["source"] if snap_info["price"] else data_source
+        
+        chg_pts = current_live_price - prev_row['close']
         chg_pct = (chg_pts / prev_row['close']) * 100 if prev_row['close'] != 0 else 0.0
+
+        # 當前精確美東時間戳
+        now_et_str = datetime.datetime.now(tz_ny).strftime('%Y-%m-%d %H:%M:%S')
 
         monitor_data = {
             "監控標的": [code],
-            "數據通道": [data_source],
-            "美東時間 (ET)": [str(last_row['time_key'])],
-            "最新現價 (Last)": [f"${last_row['close']:,.2f}"],
-            "當根最高 (High)": [f"${last_row['high']:,.2f}"],
-            "當根最低 (Low)": [f"${last_row['low']:,.2f}"],
-            "當根成交量 (Vol)": [f"{float(last_row['volume']):,.2f}"],
-            "瞬時跳動": [f"{chg_pts:+.2f} ({chg_pct:+.2f}%)"]
+            "數據通道": [display_source],
+            "美東即時時間 (ET)": [now_et_str],
+            "最新跳動現價 (Live)": [f"${current_live_price:,.2f}"],
+            "5M 當根最高 (High)": [f"${max(last_row['high'], current_live_price):,.2f}"],
+            "5M 當根最低 (Low)": [f"${min(last_row['low'], current_live_price):,.2f}"],
+            "5M 成交量 (Vol)": [f"{float(last_row['volume']):,.2f}"],
+            "即時漲跌幅": [f"{chg_pts:+.2f} ({chg_pct:+.2f}%)"]
         }
         df_monitor = pd.DataFrame(monitor_data)
         st.markdown("##### ⚡ 實時行情跳動監控艙 (Live Stream Engine)")
@@ -159,7 +185,19 @@ class ChartPlugin:
                 st.error(f"❌ 暫時無法獲取 {code} 數據，請檢查網絡連接。")
                 return
 
-            self.render_live_monitor_table(df, code, data_source)
+            # 抓取毫秒級快照
+            snap_info = self.get_realtime_snapshot_price(code)
+
+            # 渲染頂部即時跳動表格 (包含即時美東秒數與價格)
+            self.render_live_monitor_table(df, code, data_source, snap_info)
+
+            # 動態把最新快照價注入最後一根 K 線的收盤價
+            if snap_info["price"]:
+                df.loc[df.index[-1], 'close'] = snap_info["price"]
+                if snap_info["price"] > df.loc[df.index[-1], 'high']:
+                    df.loc[df.index[-1], 'high'] = snap_info["price"]
+                if snap_info["price"] < df.loc[df.index[-1], 'low']:
+                    df.loc[df.index[-1], 'low'] = snap_info["price"]
 
             df['time_clean'] = df['time_key'].dt.strftime('%m-%d %H:%M') if ktype_name in ['5M', '1Hr'] else df['time_key'].dt.strftime('%Y-%m-%d')
             df['vma20'] = df['volume'].rolling(window=20).mean()
