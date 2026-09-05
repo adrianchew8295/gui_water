@@ -1,4 +1,6 @@
 # 文件名: chart_plugin.py
+# 核心功能: 專業金融看板 - 實時盤後快照融合 + 主圖(K線+TD趨勢線) + 副圖(VPA成交量+異動打點)
+
 import os
 import pandas as pd
 import streamlit as st
@@ -11,8 +13,8 @@ class ChartPlugin:
         self.data_dir = data_dir
 
     def get_realtime_market_price(self, code: str) -> dict:
-        """調用 OpenD 快照接口獲取包含盤前/盤後的當下跳動現價"""
-        res = {"price": None, "status_text": "常規收盤"}
+        """調用本地 OpenD 快照接口獲取當前跳動現價 (包含 Premarket / Postmarket)"""
+        res = {"price": None, "status_text": "常規盤"}
         try:
             ctx = OpenQuoteContext(host='127.0.0.1', port=11111)
             ret, df_snap = ctx.get_market_snapshot([code])
@@ -20,9 +22,8 @@ class ChartPlugin:
             if ret == RET_OK and not df_snap.empty:
                 row = df_snap.iloc[0]
                 res["price"] = float(row['last_price'])
-                # 判定當前時段 (盤前 Premarket / 盤後 Postmarket / 常規 Regular)
-                market_status = row.get('market_status', '')
-                res["status_text"] = f"即時跳動價 ({market_status})" if market_status else "即時盤口價"
+                status = row.get('market_status', '')
+                res["status_text"] = f"即時跳動價 ({status})" if status else "即時盤口現價"
         except Exception:
             pass
         return res
@@ -31,8 +32,15 @@ class ChartPlugin:
         clean_code = code.replace('.', '_')
         file_path = os.path.join(self.data_dir, f"{clean_code}_{ktype_name}.csv")
         
+        # 相容 60M 檔名
+        if not os.path.exists(file_path) and ktype_name == "1Hr":
+            alt_path = os.path.join(self.data_dir, f"{clean_code}_60M.csv")
+            if os.path.exists(alt_path):
+                file_path = alt_path
+
         if not os.path.exists(file_path):
             st.error(f"❌ 找不到本地數據檔案：`{file_path}`")
+            st.info(f"💡 請先在終端機執行 `python data_fetcher.py` 同步 {ktype_name} 數據。")
             return pd.DataFrame()
             
         try:
@@ -43,6 +51,14 @@ class ChartPlugin:
             st.error(f"❌ 讀取數據異常: {str(e)}")
             return pd.DataFrame()
 
+    def calculate_vpa_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty or 'volume' not in df.columns:
+            return df
+        df['vma20'] = df['volume'].rolling(window=20).mean()
+        df['vma_15x'] = df['vma20'] * 1.5
+        df['vma_20x'] = df['vma20'] * 2.0
+        return df
+
     def render_chart(self, code: str, ktype_name: str):
         df = self.load_local_data(code, ktype_name)
         if df.empty:
@@ -51,22 +67,23 @@ class ChartPlugin:
         try:
             time_col = 'time_key' if 'time_key' in df.columns else ('date' if 'date' in df.columns else df.columns[0])
             
+            # 日線/周線用 YYYY-MM-DD，1Hr 與分鐘級轉換為整數 UNIX 時間戳
             if ktype_name in ['DAY', 'WEEK']:
                 df['time_clean'] = df[time_col].astype(str).str.slice(0, 10)
             else:
                 df['time_clean'] = pd.to_datetime(df[time_col]).astype('int64') // 10**9
 
             df = df.drop_duplicates(subset=['time_clean']).sort_values('time_clean').reset_index(drop=True)
+            df = self.calculate_vpa_indicators(df)
 
-            # 獲取最新實時盤前/盤後價格快照
+            # 獲取最新實時盤前/盤後快照價
             live_info = self.get_realtime_market_price(code)
             real_live_price = live_info["price"]
             
-            # 若獲取到即時跳動價，更新最後一筆 K 線 Close 與 High/Low
+            # 若有即時現價，動態補足最後一根 K 線
             if real_live_price:
                 current_price = real_live_price
-                price_status_desc = f"🟢 {live_info['status_text']}: **${current_price:.2f}**"
-                # 即時動態修正最後一根 K 線
+                price_desc = f"🟢 {live_info['status_text']}: **${current_price:.2f}**"
                 df.loc[df.index[-1], 'close'] = current_price
                 if current_price > df.loc[df.index[-1], 'high']:
                     df.loc[df.index[-1], 'high'] = current_price
@@ -74,17 +91,17 @@ class ChartPlugin:
                     df.loc[df.index[-1], 'low'] = current_price
             else:
                 current_price = float(df['close'].iloc[-1])
-                price_status_desc = f"📌 歷史定格價: **${current_price:.2f}**"
+                price_desc = f"📌 本地歷史最新收盤價: **${current_price:.2f}**"
 
             td_res = compute_demark_trendlines(df, window=4)
             td_highs, td_lows = find_td_pivots(df, window=4)
 
-            # ---------------- 🎯 50/50 雙向多空路徑推演 Window ----------------
+            # ---------------- 🎯 50/50 多空雙向推演 Window ----------------
             st.markdown(f"### 🧭 {code} - {ktype_name} 戰術決策預測面板")
-            st.markdown(price_status_desc)
+            st.markdown(price_desc)
 
-            res_val = td_res.get('curr_res_val') if td_res.get('curr_res_val') else round(current_price * 1.01, 2)
-            sup_val = td_res.get('curr_sup_val') if td_res.get('curr_sup_val') else round(current_price * 0.99, 2)
+            res_val = td_res.get('curr_res_val') or round(current_price * 1.01, 2)
+            sup_val = td_res.get('curr_sup_val') or round(current_price * 0.99, 2)
             channel_h = abs(res_val - sup_val)
 
             t1 = td_res.get('bull_target_1') or round(res_val + channel_h * 0.618, 2)
@@ -97,7 +114,7 @@ class ChartPlugin:
                 st.success("🟢 **多頭向上推演路徑 (Bullish Wave 50%)**")
                 st.markdown(f"""
                 - **起爆關鍵點**：站穩阻力線 **${res_val:.2f}**[cite: 2, 4]
-                - **第一目標位 (Target 1)**：🚀 **${t1:.2f}** (TD 0.618 突破浪)
+                - **第一目標位 (Target 1)**：🚀 **${t1:.2f}** (TD 0.618 突破浪)[cite: 1]
                 - **第二目標位 (Target 2)**：🎯 **${t2:.2f}** (TD 1.0 對稱通道)[cite: 1]
                 """)
 
@@ -111,9 +128,14 @@ class ChartPlugin:
 
             st.divider()
 
+            # 數據解析與繪製
             candles = []
             markers = []
             vol_bars = []
+            vma20_line = []
+            vma15_line = []
+            vma20_alert_line = []
+
             td_high_times = {p['time'] for p in td_highs}
             td_low_times = {p['time'] for p in td_lows}
             has_vol = 'volume' in df.columns
@@ -134,7 +156,11 @@ class ChartPlugin:
                         "time": t, "value": float(row['volume']),
                         "color": "#26a69a" if row['close'] >= row['open'] else "#ef5350"
                     })
+                    if pd.notna(row.get('vma20')): vma20_line.append({"time": t, "value": float(row['vma20'])})
+                    if pd.notna(row.get('vma_15x')): vma15_line.append({"time": t, "value": float(row['vma_15x'])})
+                    if pd.notna(row.get('vma_20x')): vma20_alert_line.append({"time": t, "value": float(row['vma_20x'])})
 
+            # 主圖配置
             price_chart = {
                 "height": 450,
                 "layout": {"textColor": "#8b949e", "background": {"type": "solid", "color": "#0a0e17"}},
@@ -156,6 +182,7 @@ class ChartPlugin:
 
             charts_to_render = [{"chart": price_chart, "series": price_series}]
 
+            # 副圖配置
             if has_vol and vol_bars:
                 vol_chart = {
                     "height": 160,
@@ -165,7 +192,12 @@ class ChartPlugin:
                     "timeScale": {"timeVisible": True, "secondsVisible": False, "borderColor": "#21262d"},
                     "rightPriceScale": {"borderColor": "#21262d", "autoScale": True}
                 }
-                vol_series = [{"type": "Histogram", "data": vol_bars, "options": {"priceFormat": {"type": "volume"}, "priceScaleId": ""}}]
+                vol_series = [
+                    {"type": "Histogram", "data": vol_bars, "options": {"priceFormat": {"type": "volume"}, "priceScaleId": ""}},
+                    {"type": "Line", "data": vma20_line, "options": {"color": "#ffffff", "lineWidth": 1, "title": "VMA20"}},
+                    {"type": "Line", "data": vma15_line, "options": {"color": "#8b949e", "lineWidth": 1, "lineStyle": 2, "title": "1.5X"}},
+                    {"type": "Line", "data": vma20_alert_line, "options": {"color": "#ffd700", "lineWidth": 1, "lineStyle": 2, "title": "2.0X"}}
+                ]
                 charts_to_render.append({"chart": vol_chart, "series": vol_series})
 
             renderLightweightCharts(charts_to_render, key=f"tv_chart_{code}_{ktype_name}")
