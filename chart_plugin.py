@@ -3,6 +3,9 @@ import pandas as pd
 import streamlit as st
 from streamlit_lightweight_charts import renderLightweightCharts
 
+# ==============================================================================
+# 專業級富途牛牛原生復刻圖表插件 (chart_plugin.py)
+# ==============================================================================
 class ChartPlugin:
     def __init__(self, data_dir: str = './market_data'):
         self.data_dir = data_dir
@@ -69,7 +72,7 @@ class ChartPlugin:
             for _, row in df.iterrows():
                 t = str(row['time_clean'])
                 
-                # 主圖純 K 線數據
+                # 主圖 K 線 (富途牛牛原生色彩)
                 candles.append({
                     "time": t,
                     "open": float(row['open']),
@@ -79,7 +82,7 @@ class ChartPlugin:
                 })
 
                 # 副圖成交量柱
-                vol_color = "rgba(8, 153, 129, 0.6)" if row['IS_UP'] else "rgba(242, 54, 69, 0.6)"
+                vol_color = "#26a69a" if row['IS_UP'] else "#ef5350"
                 vol_bars.append({
                     "time": t,
                     "value": float(row['volume']),
@@ -94,24 +97,37 @@ class ChartPlugin:
                 if pd.notna(row['VMA_20X']):
                     vma20_alert_line.append({"time": t, "value": float(row['VMA_20X'])})
 
-                # 異動打點訊號全部移至副圖成交量柱上方
+                # 異動打點訊號 (精準打在副圖柱狀圖上方)
                 if row['BULL_20']:
-                    vol_markers.append({"time": t, "position": "aboveBar", "color": "#089981", "shape": "arrowUp", "text": "▲▲ 巨量"})
+                    vol_markers.append({"time": t, "position": "aboveBar", "color": "#00e676", "shape": "arrowUp", "text": "▲▲"})
                 elif row['BULL_15']:
-                    vol_markers.append({"time": t, "position": "aboveBar", "color": "#00bcd4", "shape": "arrowUp", "text": "▲ 异动"})
+                    vol_markers.append({"time": t, "position": "aboveBar", "color": "#00e5ff", "shape": "arrowUp", "text": "▲"})
                 elif row['BEAR_20']:
-                    vol_markers.append({"time": t, "position": "aboveBar", "color": "#f23645", "shape": "arrowDown", "text": "▼▼ 巨量"})
+                    vol_markers.append({"time": t, "position": "aboveBar", "color": "#ff1744", "shape": "arrowDown", "text": "▼▼"})
                 elif row['BEAR_15']:
-                    vol_markers.append({"time": t, "position": "aboveBar", "color": "#ff5252", "shape": "arrowDown", "text": "▼ 异动"})
+                    vol_markers.append({"time": t, "position": "aboveBar", "color": "#ff5252", "shape": "arrowDown", "text": "▼"})
 
-            # 主圖配置 (純淨無雜質)
+            # 主圖配置 (80% 大畫布純淨價格走勢)
             price_chart_options = {
-                "height": 450,
-                "layout": {"textColor": "#d1d4dc", "background": {"type": "solid", "color": "#131722"}},
-                "grid": {"vertLines": {"color": "#242732"}, "horzLines": {"color": "#242732"}},
+                "height": 520,
+                "layout": {
+                    "textColor": "#8b949e",
+                    "background": {"type": "solid", "color": "#0a0e17"}
+                },
+                "grid": {
+                    "vertLines": {"color": "#161b22"},
+                    "horzLines": {"color": "#161b22"}
+                },
                 "crosshair": {"mode": 1},
-                "timeScale": {"timeVisible": True, "secondsVisible": False, "borderColor": "#2b2b43"},
-                "rightPriceScale": {"borderColor": "#2b2b43", "autoScale": True},
+                "timeScale": {
+                    "timeVisible": True,
+                    "secondsVisible": False,
+                    "borderColor": "#21262d"
+                },
+                "rightPriceScale": {
+                    "borderColor": "#21262d",
+                    "autoScale": True
+                },
                 "handleScroll": {"mouseWheel": True, "pressedMouseMove": True, "horzTouchDrag": True, "vertTouchDrag": True},
                 "handleScale": {"axisPressedMouseMove": True, "mouseWheel": True, "pinch": True}
             }
@@ -121,23 +137,36 @@ class ChartPlugin:
                     "type": "Candlestick",
                     "data": candles,
                     "options": {
-                        "upColor": "#089981",
-                        "downColor": "#f23645",
+                        "upColor": "#26a69a",
+                        "downColor": "#ef5350",
                         "borderVisible": False,
-                        "wickUpColor": "#089981",
-                        "wickDownColor": "#f23645"
+                        "wickUpColor": "#26a69a",
+                        "wickDownColor": "#ef5350"
                     }
                 }
             ]
 
-            # 副圖成交量配置 (承載所有異動訊號)
+            # 副圖成交量配置 (20% 輕量高度專注看量)
             volume_chart_options = {
-                "height": 220,
-                "layout": {"textColor": "#d1d4dc", "background": {"type": "solid", "color": "#131722"}},
-                "grid": {"vertLines": {"color": "#242732"}, "horzLines": {"color": "#242732"}},
+                "height": 160,
+                "layout": {
+                    "textColor": "#8b949e",
+                    "background": {"type": "solid", "color": "#0a0e17"}
+                },
+                "grid": {
+                    "vertLines": {"color": "#161b22"},
+                    "horzLines": {"color": "#161b22"}
+                },
                 "crosshair": {"mode": 1},
-                "timeScale": {"timeVisible": True, "secondsVisible": False, "borderColor": "#2b2b43"},
-                "rightPriceScale": {"borderColor": "#2b2b43", "autoScale": True},
+                "timeScale": {
+                    "timeVisible": True,
+                    "secondsVisible": False,
+                    "borderColor": "#21262d"
+                },
+                "rightPriceScale": {
+                    "borderColor": "#21262d",
+                    "autoScale": True
+                },
                 "handleScroll": {"mouseWheel": True, "pressedMouseMove": True, "horzTouchDrag": True, "vertTouchDrag": True},
                 "handleScale": {"axisPressedMouseMove": True, "mouseWheel": True, "pinch": True}
             }
@@ -157,7 +186,7 @@ class ChartPlugin:
                 {
                     "type": "Line",
                     "data": vma15_line,
-                    "options": {"color": "#888888", "lineWidth": 1, "lineStyle": 2, "title": "1.5X"}
+                    "options": {"color": "#8b949e", "lineWidth": 1, "lineStyle": 2, "title": "1.5X"}
                 },
                 {
                     "type": "Line",
