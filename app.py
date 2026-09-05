@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
+import time
 from datetime import datetime
 
 # 頁面基礎設置
@@ -21,12 +22,12 @@ with st.sidebar:
     st.header("連接與標的設置")
     host = st.text_input("OpenD 監聽 IP", value="127.0.0.1")
     port = st.number_input("OpenD 監聽端口", value=11111, step=1)
-    target_symbol = st.selectbox("監控標的", ["US.QQQ", "HK.00700", "US.BTC"])
+    target_symbol = st.selectbox("監控標的", ["US.QQQ", "US.BTC"])
     timeframe = st.selectbox("查看週期", ["5M (實時)", "Daily (日線)", "Weekly (周線)", "Monthly (月線)"])
     auto_refresh = st.checkbox("開啟實時刷新 (5秒)", value=False)
     load_btn = st.button("手動獲取/刷新數據")
 
-# 數據獲取邏輯
+# 數據獲取邏輯（先訂閱、後獲取）
 def fetch_kline_data(host, port, symbol, ktype, count=500):
     if not FUTU_AVAILABLE:
         st.warning("請先安裝依賴庫再嘗試連接。")
@@ -35,6 +36,17 @@ def fetch_kline_data(host, port, symbol, ktype, count=500):
     quote_ctx = None
     try:
         quote_ctx = OpenQuoteContext(host=host, port=port)
+        
+        # 第一步：向網關訂閱對應標的與週期的 K 線數據
+        sub_ret, sub_err = quote_ctx.subscribe([symbol], [SubType.K_5M, SubType.K_DAY, SubType.K_WEEK, SubType.K_MON])
+        if sub_ret != RET_OK:
+            st.error(f"訂閱數據通道失敗: {sub_err}")
+            return pd.DataFrame()
+        
+        # 緩衝短暫時間等待網關推送信號
+        time.sleep(0.5)
+        
+        # 第二步：獲取 K 線數據
         ret, data = quote_ctx.get_cur_kline(symbol, count, ktype)
         if ret == RET_OK:
             return data
