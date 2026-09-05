@@ -9,8 +9,7 @@ plugin = ChartPlugin()
 
 sidebar_col = st.sidebar
 target_code = sidebar_col.selectbox("選擇標的", ["US.QQQ", "US.BTC"])
-# 加入 60M (1小時)
-target_ktype = sidebar_col.selectbox("選擇週期", ["60M", "DAY", "WEEK"])
+target_ktype = sidebar_col.selectbox("選擇週期", ["1Hr", "DAY", "WEEK"])
 
 st.subheader(f"{target_code} - {target_ktype} 走勢與預測通道")
 
