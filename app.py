@@ -1,5 +1,5 @@
 # 文件名: app.py
-# 核心功能: 極簡純數據實戰座艙主入口 (0 網絡阻塞，秒級即時刷新)
+# 核心功能: 極簡純數據實戰座艙主入口 (移除死循環，秒級直接加載)
 
 import streamlit as st
 from chart_plugin import ChartPlugin
@@ -16,13 +16,11 @@ plugin = ChartPlugin()
 sidebar = st.sidebar
 sidebar.header("🎛️ 控制中樞")
 target_code = sidebar.selectbox("選擇監控標的", ["CC.BTCUSD", "US.QQQ"], index=0)
-live_speed = sidebar.slider("⚡ 實盤刷新頻率 (秒)", min_value=1.0, max_value=5.0, value=1.0, step=0.5)
+
+if sidebar.button("🔄 立即刷新最新行情", use_container_width=True):
+    st.rerun()
 
 st.title(f"⚡ 癸水 · 0DTE 量化實戰純數據座艙 ({target_code})")
 
-# 局部刷新單元
-@st.fragment(run_every=live_speed)
-def render_live_cockpit(code: str):
-    plugin.render_cockpit(code)
-
-render_live_cockpit(target_code)
+# 直接執行渲染，絕無死鎖
+plugin.render_cockpit(target_code)
