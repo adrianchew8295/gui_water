@@ -15,6 +15,7 @@ class ChartPlugin:
         
         if not os.path.exists(file_path):
             st.error(f"❌ 找不到本地數據檔案：`{file_path}`")
+            st.info(f"💡 請先在終端機執行 `python data_fetcher.py` 下載 {ktype_name} 數據！")
             return pd.DataFrame()
             
         try:
@@ -25,6 +26,14 @@ class ChartPlugin:
             st.error(f"❌ 讀取數據異常: {str(e)}")
             return pd.DataFrame()
 
+    def calculate_vpa_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty or 'volume' not in df.columns:
+            return df
+        df['vma20'] = df['volume'].rolling(window=20).mean()
+        df['vma_15x'] = df['vma20'] * 1.5
+        df['vma_20x'] = df['vma20'] * 2.0
+        return df
+
     def render_chart(self, code: str, ktype_name: str):
         df = self.load_local_data(code, ktype_name)
         if df.empty:
@@ -32,50 +41,61 @@ class ChartPlugin:
 
         try:
             time_col = 'time_key' if 'time_key' in df.columns else ('date' if 'date' in df.columns else df.columns[0])
-            df['time_clean'] = df[time_col].astype(str).str.slice(0, 10)
+            
+            # 日線/周線用 YYYY-MM-DD，1H (60M) 與 5M 保留時分秒時間戳
+            if ktype_name in ['DAY', 'WEEK']:
+                df['time_clean'] = df[time_col].astype(str).str.slice(0, 10)
+            else:
+                # 轉成 UNIX 時間戳以精確對齊 Lightweight Charts 分鐘級時間軸
+                df['time_clean'] = pd.to_datetime(df[time_col]).astype('int64') // 10**9
+
             df = df.drop_duplicates(subset=['time_clean']).sort_values('time_clean').reset_index(drop=True)
+            df = self.calculate_vpa_indicators(df)
 
             td_res = compute_demark_trendlines(df, window=4)
             td_highs, td_lows = find_td_pivots(df, window=4)
             latest_close = df['close'].iloc[-1]
 
-            # ---------------- 🎯 視覺化交易決策 Window ----------------
-            st.markdown("### 🧭 戰術決策預測面板 (Tactical Prediction Window)")
+            # ---------------- 🎯 1H 雙向波浪預測 Window ----------------
+            st.markdown(f"### 🧭 {ktype_name} 戰術決策預測面板 (Tactical Prediction Window)")
             
             w_left, w_right = st.columns(2)
             with w_left:
                 st.success("🟢 **多頭向上推演路徑 (Bullish Wave 50%)**")
                 st.markdown(f"""
-                - **起爆關鍵點**：站穩阻力線 **${td_res['curr_res_val'] or 0:.2f}**[cite: 2, 4]
-                - **第一目標位 (Target 1)**：🚀 **${td_res['bull_target_1'] or 0:.2f}** (TD 0.618 突破浪)[cite: 1]
-                - **第二目標位 (Target 2)**：🎯 **${td_res['bull_target_2'] or 0:.2f}** (TD 1.0 通道對稱浪)[cite: 1]
-                - **防守止損 (SL)**：回跌跌破現價下方 1H 均線
+                - **起爆關鍵點**：站穩阻力線 **${td_res['curr_res_val'] or 0:.2f}**
+                - **第一目標位 (Target 1)**：🚀 **${td_res['bull_target_1'] or 0:.2f}** (TD 0.618 突破浪)
+                - **第二目標位 (Target 2)**：🎯 **${td_res['bull_target_2'] or 0:.2f}** (TD 1.0 通道對稱浪)
                 """)
 
             with w_right:
                 st.error("🔴 **空頭向下推演路徑 (Bearish Wave 50%)**")
                 st.markdown(f"""
-                - **破位關鍵點**：跌破支撐線 **${td_res['curr_sup_val'] or 0:.2f}**[cite: 2, 4]
-                - **第一目標位 (Target 1)**：📉 **${td_res['bear_target_1'] or 0:.2f}** (TD 0.618 下跌浪)[cite: 1]
-                - **第二目標位 (Target 2)**：🎯 **${td_res['bear_target_2'] or 0:.2f}** (TD 1.0 通道對稱浪)[cite: 1]
-                - **防守止損 (SL)**：反彈衝破現價上方 1H 均線[cite: 2]
+                - **破位關鍵點**：跌破支撐線 **${td_res['curr_sup_val'] or 0:.2f}**
+                - **第一目標位 (Target 1)**：📉 **${td_res['bear_target_1'] or 0:.2f}** (TD 0.618 下跌浪)
+                - **第二目標位 (Target 2)**：🎯 **${td_res['bear_target_2'] or 0:.2f}** (TD 1.0 通道對稱浪)
                 """)
 
             st.divider()
 
-            # ---------------- 圖表繪製 ----------------
             candles = []
             markers = []
             vol_bars = []
+            vma20_line = []
+            vma15_line = []
+            vma20_alert_line = []
+
             td_high_times = {p['time'] for p in td_highs}
             td_low_times = {p['time'] for p in td_lows}
 
             for _, row in df.iterrows():
-                t = str(row['time_clean'])
+                t = row['time_clean'] if isinstance(row['time_clean'], (int, float)) else str(row['time_clean'])
+                
                 candles.append({
                     "time": t, "open": float(row['open']), "high": float(row['high']),
                     "low": float(row['low']), "close": float(row['close'])
                 })
+
                 if t in td_high_times:
                     markers.append({"time": t, "position": "aboveBar", "color": "#FF5252", "shape": "arrowDown", "text": "TD High"})
                 elif t in td_low_times:
@@ -86,33 +106,48 @@ class ChartPlugin:
                         "time": t, "value": float(row['volume']),
                         "color": "#26a69a" if row['close'] >= row['open'] else "#ef5350"
                     })
+                    if pd.notna(row.get('vma20')): vma20_line.append({"time": t, "value": float(row['vma20'])})
+                    if pd.notna(row.get('vma_15x')): vma15_line.append({"time": t, "value": float(row['vma_15x'])})
+                    if pd.notna(row.get('vma_20x')): vma20_alert_line.append({"time": t, "value": float(row['vma_20x'])})
 
             price_chart = {
                 "height": 450,
                 "layout": {"textColor": "#8b949e", "background": {"type": "solid", "color": "#0a0e17"}},
                 "grid": {"vertLines": {"color": "#161b22"}, "horzLines": {"color": "#161b22"}},
                 "crosshair": {"mode": 1},
-                "timeScale": {"timeVisible": True, "borderColor": "#21262d"},
-                "rightPriceScale": {"borderColor": "#21262d", "autoScale": True}
+                "timeScale": {"timeVisible": True, "secondsVisible": False, "borderColor": "#21262d"},
+                "rightPriceScale": {"borderColor": "#21262d", "autoScale": True},
+                "handleScroll": {"mouseWheel": True, "pressedMouseMove": True, "horzTouchDrag": True, "vertTouchDrag": True},
+                "handleScale": {"axisPressedMouseMove": True, "mouseWheel": True, "pinch": True}
             }
 
             price_series = [{"type": "Candlestick", "data": candles, "options": {"upColor": "#26a69a", "downColor": "#ef5350", "borderVisible": False}, "markers": markers}]
+            
             if td_res.get("resistance_line"):
                 price_series.append({"type": "Line", "data": td_res["resistance_line"], "options": {"color": "#FF5252", "lineWidth": 2, "lineStyle": 2, "title": "TD Resistance"}})
             if td_res.get("support_line"):
                 price_series.append({"type": "Line", "data": td_res["support_line"], "options": {"color": "#00E676", "lineWidth": 2, "lineStyle": 2, "title": "TD Support"}})
 
             charts_to_render = [{"chart": price_chart, "series": price_series}]
+
             if vol_bars:
                 vol_chart = {
                     "height": 160,
                     "layout": {"textColor": "#8b949e", "background": {"type": "solid", "color": "#0a0e17"}},
                     "grid": {"vertLines": {"color": "#161b22"}, "horzLines": {"color": "#161b22"}},
                     "crosshair": {"mode": 1},
-                    "timeScale": {"timeVisible": True, "borderColor": "#21262d"},
-                    "rightPriceScale": {"borderColor": "#21262d", "autoScale": True}
+                    "timeScale": {"timeVisible": True, "secondsVisible": False, "borderColor": "#21262d"},
+                    "rightPriceScale": {"borderColor": "#21262d", "autoScale": True},
+                    "handleScroll": {"mouseWheel": True, "pressedMouseMove": True, "horzTouchDrag": True, "vertTouchDrag": True},
+                    "handleScale": {"axisPressedMouseMove": True, "mouseWheel": True, "pinch": True}
                 }
-                charts_to_render.append({"chart": vol_chart, "series": [{"type": "Histogram", "data": vol_bars, "options": {"priceFormat": {"type": "volume"}, "priceScaleId": ""}}]})
+                vol_series = [
+                    {"type": "Histogram", "data": vol_bars, "options": {"priceFormat": {"type": "volume"}, "priceScaleId": ""}},
+                    {"type": "Line", "data": vma20_line, "options": {"color": "#ffffff", "lineWidth": 1, "title": "VMA20"}},
+                    {"type": "Line", "data": vma15_line, "options": {"color": "#8b949e", "lineWidth": 1, "lineStyle": 2, "title": "1.5X"}},
+                    {"type": "Line", "data": vma20_alert_line, "options": {"color": "#ffd700", "lineWidth": 1, "lineStyle": 2, "title": "2.0X"}}
+                ]
+                charts_to_render.append({"chart": vol_chart, "series": vol_series})
 
             renderLightweightCharts(charts_to_render, key=f"tv_{code}_{ktype_name}")
 
