@@ -1,5 +1,5 @@
 # 文件名: chart_plugin.py
-# 核心特性: streamlit-extras 高階整合 + 一鍵剪貼板秒複製 + 專業高對比雙表 + 保守右側確認
+# 核心特性: 表格瘦身合併 + Timer 歸位 LIVE 行 + 審核日誌 Audit Logs + 保守右側確認
 
 import os
 import time
@@ -10,11 +10,10 @@ import pytz
 import streamlit as st
 from moomoo import OpenQuoteContext, RET_OK, KLType, SubType, AuType
 
-# 引入 streamlit-extras 核心套件
 from streamlit_extras.stylable_container import stylable_container
-from streamlit_extras.badges import badge
 
 tz_ny = pytz.timezone("America/New_York")
+tz_my = pytz.timezone("Asia/Kuala_Lumpur")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, 'market_data')
@@ -112,7 +111,7 @@ class ChartPlugin:
                     snap["source"] = "🟢 OpenD 直連 (LIVE 熱數據流)"
                     snap["server_time"] = str(row.get('update_time', datetime.datetime.now(tz_ny).strftime('%H:%M:%S')))
                     snap["latency_ms"] = int((time.time() - t_start) * 1000)
-                    status_msg = f"已成功訂閱 {target_symbol} 實時數據通道"
+                    status_msg = f"已成功訂閱 {target_symbol} 實時通道"
 
                 ret_k, df_k = ctx.get_cur_kline(target_symbol, 40, KLType.K_5M, AuType.NONE)
                 if ret_k == RET_OK and not df_k.empty:
@@ -170,12 +169,11 @@ class ChartPlugin:
         return f"{rem_min:02d}:{rem_sec:02d}"
 
     def render_cockpit(self, code: str, budget_usd: float = 200.0):
-        """【streamlit-extras 專業落地 · 量化座艙】"""
+        """【精簡雙表 · 實戰量化座艙】"""
         snap, status_msg, df_5m = self.get_realtime_and_kline_data(code)
         df_day = self.load_cold_data(code, "DAY")
         countdown_str = self.get_countdown_to_next_5m()
 
-        # 1. 確定現價與即時跳動價差
         curr_price = snap["price"]
         if curr_price <= 0 and not df_5m.empty:
             curr_price = float(df_5m['close'].iloc[-1])
@@ -202,7 +200,7 @@ class ChartPlugin:
             st.info(f"⚙️ 後台狀態: {status_msg}")
             return
 
-        # 2. 宏觀方向 (TREND_BIAS)
+        # 宏觀方向判定
         trend_bias = 0
         trend_text = "⚪ 0 (中立震盪)"
         pdh_line = curr_price * 1.008
@@ -221,7 +219,7 @@ class ChartPlugin:
                 trend_bias = -1
                 trend_text = "🔴 -1 (空頭壓制 [日線<EMA20])"
 
-        # 3. 形態識別與指標運算 (富途 13 行規則)
+        # 指標與形態運算 (富途 13 行規則)
         df_5m['vma20'] = df_5m['volume'].rolling(20).mean().bfill()
         df_5m['atr14'] = self.calculate_atr(df_5m, 14)
         df_5m['td_setup'] = self.compute_td_setup(df_5m)
@@ -249,6 +247,7 @@ class ChartPlugin:
 
         table1_rows = []
         table2_rows = []
+        audit_bars_log = []
 
         latest_trigger_action = "☕ 處於安全中繼區，耐心等待 5M 收盤確認右側突破"
         latest_trigger_type = "NONE"
@@ -269,15 +268,32 @@ class ChartPlugin:
             diag_str = "⚪ 常規波動"
 
             if idx == 0:
-                state_str = "<span style='background:#1f293d; color:#58a6ff; padding:2px 6px; border-radius:4px; font-weight:bold;'>⚡ LIVE</span>"
+                # 表 1 合併第 1 欄：時段 + LIVE + 倒數計時 Timer 同字體
+                col1_t1 = f"<b style='color:#58a6ff;'>{t_str}</b> <span style='background:#1f293d; color:#58a6ff; padding:2px 6px; border-radius:4px; font-weight:bold;'>⚡ LIVE</span> <span style='background:#161b22; color:#00E676; border:1px solid #238636; padding:2px 6px; border-radius:4px; font-weight:bold;'>⏱️ {countdown_str}</span>"
+                # 表 2 合併第 1 欄：時段 + TD
+                col1_t2 = f"<b style='color:#58a6ff;'>{t_str}</b> <span style='color:#8b949e;'>{td_s}</span>"
                 c_display = f"<span style='color:{flash_color}; font-weight:bold;'>${curr_price:,.2f} ({flash_sym})</span>"
                 h_display = f"{max(h, curr_price):.2f}"
                 l_display = f"{min(l, curr_price):.2f}"
                 diag_str = "⚪ 棒線走動中 (等待 5M 收盤定格)"
                 action_str = "☕ 觀望待機 (未收盤禁止開單)"
-                raw_str = f"LIVE | 現價:{curr_price:.2f} ({flash_sym}) | 極值:{h_display}/{l_display}"
+                audit_log_line = f"• {t_str} ⚡ LIVE  | 現價: ${curr_price:,.2f} ({flash_sym}) | 當根極值: {h_display}/{l_display} | 量: {vol_ratio:.2f}x ({'🟢放量' if is_heavy else '⚪常規'}) | TD: {td_s}"
             else:
-                state_str = "<span style='background:#21262d; color:#8b949e; padding:2px 6px; border-radius:4px;'>🔒 收盤</span>"
+                # 表 1 合併第 1 欄：時段 + 鎖定收盤
+                col1_t1 = f"<b style='color:#8b949e;'>{t_str}</b> <span style='background:#21262d; color:#8b949e; padding:2px 6px; border-radius:4px;'>🔒 收盤</span>"
+                
+                # TD 顏色渲染
+                if "S9" in td_s:
+                    td_html = f"<span style='background:rgba(255,82,82,0.25); color:#FF5252; padding:2px 6px; border-radius:4px; font-weight:bold;'>{td_s}</span>"
+                elif "買入" in td_s:
+                    td_html = f"<span style='color:#00E676; font-weight:bold;'>{td_s}</span>"
+                elif "賣出" in td_s:
+                    td_html = f"<span style='color:#FF5252; font-weight:bold;'>{td_s}</span>"
+                else:
+                    td_html = f"<span style='color:#8b949e;'>{td_s}</span>"
+
+                # 表 2 合併第 1 欄：時段 + TD
+                col1_t2 = f"<b style='color:#8b949e;'>{t_str}</b> {td_html}"
                 c_display = f"${c:,.2f} [{candle_color}]"
                 h_display = f"{h:.2f}"
                 l_display = f"{l:.2f}"
@@ -327,83 +343,56 @@ class ChartPlugin:
                             diag_str = "⚪ 均線上方蓄勢" if c > o else "⚪ 區間震盪整理"
                         action_str = "☕ 觀望待機"
 
-                raw_str = f"時段:{t_str} | 收盤:{c:.2f} | 極值:{h:.2f}/{l:.2f} | 量:{vol_ratio:.2f}x"
+                audit_log_line = f"• {t_str} 🔒 收盤  | 收盤: ${c:,.2f} | 影線: {h_display}/{l_display} | 量: {vol_ratio:.2f}x ({'🟢放量' if is_heavy else '⚪常規'}) | TD: {td_s} | 診斷: {diag_str}"
 
-            # VPA 量能膠囊
             vol_pill = f"<span style='background:rgba(0,230,118,0.2); color:#00E676; padding:2px 8px; border-radius:12px; font-weight:bold;'>🟢 {vol_ratio:.2f}x 放量</span>" if is_heavy else f"<span style='color:#8b949e;'>⚪ {vol_ratio:.2f}x 常規</span>"
 
-            # TD Setup 膠囊
-            if "S9" in td_s:
-                td_display = f"<span style='background:rgba(255,82,82,0.25); color:#FF5252; padding:2px 8px; border-radius:12px; font-weight:bold;'>{td_s}</span>"
-            elif "買入" in td_s:
-                td_display = f"<span style='color:#00E676; font-weight:bold;'>{td_s}</span>"
-            elif "賣出" in td_s:
-                td_display = f"<span style='color:#FF5252; font-weight:bold;'>{td_s}</span>"
-            else:
-                td_display = f"<span style='color:#8b949e;'>{td_s}</span>"
-
             table1_rows.append({
-                "5M時段 (ET)": t_str,
-                "狀態": state_str,
+                "5M時段與狀態": col1_t1,
                 "現價/收盤 (Close)": c_display,
                 "影線極值 (High / Low)": f"{h_display} / {l_display}",
                 "5M量能 (VPA)": vol_pill,
-                "_style": row_style,
-                "_raw": raw_str
+                "_style": row_style
             })
 
             table2_rows.append({
-                "5M時段 (ET)": t_str,
-                "TD 9轉 (Setup)": td_display,
+                "5M時段與TD計數": col1_t2,
                 "形態與戰區診斷": diag_str,
                 "1:2 結構指令 & 動作": action_str,
-                "_style": row_style,
-                "_raw": f"時段:{t_str} | TD:{td_s} | 診斷:{diag_str} | 指令:{action_str}"
+                "_style": row_style
             })
 
-        # ====== 模組 1: stylable_container 頂部 HUD 戰術儀表盤 ======
+            audit_bars_log.append(audit_log_line)
+
+        # ====== 頂部精準 HUD ======
         with stylable_container(
             key="hud_container",
             css_styles="""
                 {
                     background-color: #0b0f19;
                     border: 1px solid #1f293d;
-                    border-radius: 10px;
-                    padding: 16px;
-                    margin-bottom: 15px;
-                    font-family: 'JetBrains Mono', monospace;
+                    border-radius: 8px;
+                    padding: 12px;
+                    margin-bottom: 12px;
+                    font-family: monospace;
                 }
             """
         ):
-            c_left, c_right = st.columns([3, 1])
-            with c_left:
-                st.markdown(f"##### 📶 通道: `{snap['source']}` | 撮合時間: **{snap['server_time']} ET**")
-                st.markdown(f"🌐 延遲: **{snap['latency_ms']} ms** | 宏觀方向: **{trend_text}**")
-                st.caption(f"⚙️ 狀態: `{status_msg}`")
-            with c_right:
-                st.markdown(
-                    f"""
-                    <div style="background:#161b22; border:1px solid #238636; border-radius:8px; padding:10px; text-align:center;">
-                        <span style="font-size:12px; color:#8b949e;">距離下根 5M 收盤定格</span><br>
-                        <span style="font-size:24px; font-weight:bold; color:#00E676;">⏱️ {countdown_str}</span>
-                    </div>
-                    """,
-                    unsafe_allow_html=True
-                )
+            st.markdown(f"📶 通道: **{snap['source']}** | 撮合時間: **{snap['server_time']} ET** | 延遲: **{snap['latency_ms']} ms** | 宏觀方向: **{trend_text}**")
+            st.caption(f"⚙️ 狀態: `{status_msg}`")
 
-        # ====== 模組 3: 表 1 —— 5M 即時量價核心表 ======
+        # ====== 表 1：5M 即時量價核心表 (瘦身版 4 欄) ======
         st.markdown("##### 📊 表 1：5M 即時量價核心表 (黃金 30 分鐘滾動窗口)")
         t1_html = "<table style='width:100%; border-collapse: collapse; font-family: monospace; font-size: 14px; text-align: left; background-color: #0d1117; border-radius: 8px; overflow: hidden;'>"
         t1_html += "<tr style='border-bottom: 2px solid #30363d; color: #8b949e; background-color: #161b22;'>"
-        for col in ["5M時段 (ET)", "狀態", "現價/收盤 (Close)", "影線極值 (High / Low)", "5M量能 (VPA)"]:
+        for col in ["5M時段與狀態", "現價/收盤 (Close)", "影線極值 (High / Low)", "5M量能 (VPA)"]:
             t1_html += f"<th style='padding: 10px;'>{col}</th>"
         t1_html += "</tr>"
 
         for r in table1_rows:
             style = r["_style"] if r["_style"] else "border-bottom: 1px solid #21262d; color: #f0f6fc;"
             t1_html += f"<tr style='{style}'>"
-            t1_html += f"<td style='padding: 10px;'>{r['5M時段 (ET)']}</td>"
-            t1_html += f"<td style='padding: 10px;'>{r['狀態']}</td>"
+            t1_html += f"<td style='padding: 10px;'>{r['5M時段與狀態']}</td>"
             t1_html += f"<td style='padding: 10px;'>{r['現價/收盤 (Close)']}</td>"
             t1_html += f"<td style='padding: 10px;'>{r['影線極值 (High / Low)']}</td>"
             t1_html += f"<td style='padding: 10px;'>{r['5M量能 (VPA)']}</td>"
@@ -413,19 +402,18 @@ class ChartPlugin:
 
         st.markdown("<div style='margin-top: 15px;'></div>", unsafe_allow_html=True)
 
-        # ====== 模組 4: 表 2 —— 德馬克 TD 9轉與戰術表 ======
+        # ====== 表 2：德馬克 TD 9轉與戰術表 (瘦身版 3 欄) ======
         st.markdown("##### ⏱️ 表 2：德馬克 TD 9轉與戰術表 (保守右側確認)")
         t2_html = "<table style='width:100%; border-collapse: collapse; font-family: monospace; font-size: 14px; text-align: left; background-color: #0d1117; border-radius: 8px; overflow: hidden;'>"
         t2_html += "<tr style='border-bottom: 2px solid #30363d; color: #8b949e; background-color: #161b22;'>"
-        for col in ["5M時段 (ET)", "TD 9轉 (Setup)", "形態與戰區診斷", "1:2 結構指令 & 動作"]:
+        for col in ["5M時段與TD 9轉", "形態與戰區診斷", "1:2 結構指令 & 動作"]:
             t2_html += f"<th style='padding: 10px;'>{col}</th>"
         t2_html += "</tr>"
 
         for r in table2_rows:
             style = r["_style"] if r["_style"] else "border-bottom: 1px solid #21262d; color: #f0f6fc;"
             t2_html += f"<tr style='{style}'>"
-            t2_html += f"<td style='padding: 10px;'>{r['5M時段 (ET)']}</td>"
-            t2_html += f"<td style='padding: 10px;'>{r['TD 9轉 (Setup)']}</td>"
+            t2_html += f"<td style='padding: 10px;'>{r['5M時段與TD計數']}</td>"
             t2_html += f"<td style='padding: 10px;'>{r['形態與戰區診斷']}</td>"
             t2_html += f"<td style='padding: 10px;'>{r['1:2 結構指令 & 動作']}</td>"
             t2_html += "</tr>"
@@ -442,7 +430,7 @@ class ChartPlugin:
         opt_sym_str = f"QQQ {strike_atm} {'CALL' if latest_trigger_type != 'PUT' else 'PUT'}"
 
         st.markdown(f"""
-        <div style="background: #161b22; padding: 16px; border-radius: 8px; border-left: 5px solid {'#00E676' if latest_trigger_type=='CALL' else ('#FF5252' if latest_trigger_type=='PUT' else '#58a6ff')}; font-family: monospace;">
+        <div style="background: #161b22; padding: 14px; border-radius: 8px; border-left: 5px solid {'#00E676' if latest_trigger_type=='CALL' else ('#FF5252' if latest_trigger_type=='PUT' else '#58a6ff')}; font-family: monospace;">
             <div style="font-size: 13px; color: #8b949e;">🎯 模組 6：0DTE 智能期權雷達 (預算上限: ${budget_usd:.2f} USD | 方向: {opt_dir_str})</div>
             <div style="font-size: 16px; font-weight: bold; color: #ffffff; margin-top: 6px;">
                 {latest_trigger_action}
@@ -453,31 +441,26 @@ class ChartPlugin:
         </div>
         """, unsafe_allow_html=True)
 
-        # ====== 模組 7: 診斷數據一鍵秒複製 (HTML+JS 原生秒拷貝) ======
-        text_dump = f"=== 癸水數據快照 ===\n時間: {datetime.datetime.now(tz_ny).strftime('%Y-%m-%d %H:%M:%S ET')}\n通道: {snap['source']}\n狀態: {status_msg}\n倒數: {countdown_str}\n宏觀: {trend_text}\n"
-        text_dump += "\n【表1 5M量價核心】\n"
-        for r in table1_rows:
-            text_dump += f"• {r['_raw']}\n"
-        text_dump += "\n【表2 戰術與TD指令】\n"
-        for r in table2_rows:
-            text_dump += f"• {r['_raw']}\n"
-        text_dump += f"\n【模組6 期權建議】\n{latest_trigger_action}\n"
+        # ====== 模組 7: 完整 Audit Logs 審核日誌 (原生無亂碼代碼塊) ======
+        now_my_str = datetime.datetime.now(tz_my).strftime('%Y-%m-%d %H:%M:%S MYT')
+        now_ny_str = datetime.datetime.now(tz_ny).strftime('%Y-%m-%d %H:%M:%S ET')
 
-        st.markdown("<div style='margin-top: 25px;'></div>", unsafe_allow_html=True)
-        
-        # 內嵌原生 JS 剪貼板拷貝按鈕，點擊立刻完成複製
-        escaped_dump = text_dump.replace("`", "\\`").replace("$", "\\$")
-        copy_html = f"""
-        <div style="background-color: #0b0f19; border: 1px solid #1f293d; border-radius: 8px; padding: 14px; font-family: monospace;">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-                <span style="font-weight: bold; color: #58a6ff; font-size: 14px;">📋 診斷快照數據包 (點擊按鈕一鍵複製到剪貼板)</span>
-                <button onclick="navigator.clipboard.writeText(`{escaped_dump}`); document.getElementById('copy_status').innerText = '✅ 已成功複製到剪貼板！可直接 Ctrl+V 發送'; setTimeout(() => {{ document.getElementById('copy_status').innerText = ''; }}, 4000);" 
-                        style="background-color: #238636; color: white; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-weight: bold; font-size: 13px;">
-                    📋 一鍵複製診斷快照
-                </button>
-            </div>
-            <div id="copy_status" style="color: #00E676; font-size: 13px; font-weight: bold; margin-bottom: 8px; min-height: 18px;"></div>
-            <textarea readonly style="width: 100%; height: 120px; background-color: #161b22; color: #8b949e; border: 1px solid #30363d; border-radius: 6px; padding: 8px; font-family: monospace; font-size: 12px; resize: none;">{text_dump}</textarea>
-        </div>
-        """
-        st.markdown(copy_html, unsafe_allow_html=True)
+        audit_text = f"=== 癸水 0DTE 量化審核日誌 (AUDIT LOGS) ===\n"
+        audit_text += f"[時間戳憑證]\n"
+        audit_text += f"• 大馬本地時間: {now_my_str}\n"
+        audit_text += f"• 美東交易所時間: {now_ny_str}\n"
+        audit_text += f"• 通道來源: {snap['source']} (延遲: {snap['latency_ms']} ms)\n"
+        audit_text += f"• 訂閱狀態: {status_msg}\n"
+        audit_text += f"• 宏觀門禁: {trend_text}\n"
+        audit_text += f"\n[5M 閉合時序審核 (過去 6 根真實 K 線)]\n"
+        for l in audit_bars_log:
+            audit_text += f"{l}\n"
+        audit_text += f"\n[開火指令與風控驗證]\n"
+        audit_text += f"• 當前戰術動作: {latest_trigger_action}\n"
+        audit_text += f"• 0DTE 推薦合約: {opt_sym_str} | 單張預算: ${total_cost:.2f} USD\n"
+        audit_text += f"===========================================\n"
+
+        st.markdown("<div style='margin-top: 20px;'></div>", unsafe_allow_html=True)
+        st.markdown("##### 📋 審核日誌 (Audit Logs) —— 複製框 (原生代碼塊，右上角自帶複製按鈕)：")
+        # 使用 Streamlit 原生代碼塊，自帶官方「一鍵複製」小圖標，且 100% 絕無 HTML 亂碼
+        st.code(audit_text, language="text")
