@@ -4,7 +4,7 @@ import streamlit as st
 from streamlit_lightweight_charts import renderLightweightCharts
 
 # ==============================================================================
-# 獨立圖表渲染插件 (負責數據讀取、指標計算與專業金融圖表呈現)
+# 專業級金融圖表渲染插件 (升級版：全屏高幀率流暢交互)
 # ==============================================================================
 class ChartPlugin:
     def __init__(self, data_dir: str = './market_data'):
@@ -29,7 +29,6 @@ class ChartPlugin:
         try:
             if df.empty:
                 return df
-            # 默認計算一條 20 週期均線作為示範
             df['MA20'] = df['close'].rolling(window=20).mean()
             return df
         except Exception as e:
@@ -37,7 +36,7 @@ class ChartPlugin:
             return df
 
     def render_chart(self, code: str, ktype_name: str):
-        """渲染專業級 TradingView 交互圖表"""
+        """渲染媲美專業終端的高級圖表"""
         try:
             df = self.load_local_data(code, ktype_name)
             if df.empty:
@@ -49,13 +48,7 @@ class ChartPlugin:
             ma_data = []
 
             for _, row in df.iterrows():
-                # 處理時間格式，相容日期與時間戳
-                time_val = str(row['time_key'])
-                if len(time_val) == 10:  # 例如 2026-09-05
-                    time_entry = time_val
-                else:
-                    time_entry = time_val
-
+                time_entry = str(row['time_key'])
                 candles.append({
                     "time": time_entry,
                     "open": float(row['open']),
@@ -70,17 +63,47 @@ class ChartPlugin:
                         "value": float(row['MA20'])
                     })
 
+            # 高級金融終端配置 (開啟極致絲滑滾輪與手勢交互)
             chart_options = {
+                "height": 650,
                 "layout": {
                     "textColor": "#d1d4dc",
-                    "background": {"type": "solid", "color": "#131722"}
+                    "background": {"type": "solid", "color": "#0d1117"},
+                    "fontSize": 12,
+                    "fontFamily": "Roboto, sans-serif"
                 },
                 "grid": {
-                    "vertLines": {"color": "#242732"},
-                    "horzLines": {"color": "#242732"}
+                    "vertLines": {"color": "#161b22", "style": 1},
+                    "horzLines": {"color": "#161b22", "style": 1}
                 },
-                "crosshair": {"mode": 1},
-                "timeScale": {"timeVisible": True, "secondsVisible": False}
+                "crosshair": {
+                    "mode": 1,
+                    "vertLine": {"color": "#758696", "width": 1, "style": 3, "labelBackgroundColor": "#21262d"},
+                    "horzLine": {"color": "#758696", "width": 1, "style": 3, "labelBackgroundColor": "#21262d"}
+                },
+                "timeScale": {
+                    "timeVisible": True,
+                    "secondsVisible": False,
+                    "borderColor": "#30363d",
+                    "barSpacing": 10,
+                    "minBarSpacing": 2
+                },
+                "rightPriceScale": {
+                    "borderColor": "#30363d",
+                    "autoScale": True,
+                    "scaleMargins": {"top": 0.1, "bottom": 0.1}
+                },
+                "handleScroll": {
+                    "mouseWheel": True,
+                    "pressedMouseMove": True,
+                    "horzTouchDrag": True,
+                    "vertTouchDrag": True
+                },
+                "handleScale": {
+                    "axisPressedMouseMove": True,
+                    "mouseWheel": True,
+                    "pinch": True
+                }
             }
 
             series_data = [
@@ -88,25 +111,26 @@ class ChartPlugin:
                     "type": "Candlestick",
                     "data": candles,
                     "options": {
-                        "upColor": "#26a69a",
-                        "downColor": "#ef5350",
+                        "upColor": "#089981",
+                        "downColor": "#f23645",
                         "borderVisible": False,
-                        "wickUpColor": "#26a69a",
-                        "wickDownColor": "#ef5350"
+                        "wickUpColor": "#089981",
+                        "wickDownColor": "#f23645"
                     }
                 },
                 {
                     "type": "Line",
                     "data": ma_data,
                     "options": {
-                        "color": "#ff9800",
+                        "color": "#2962ff",
                         "lineWidth": 2,
-                        "title": "MA20"
+                        "title": "MA20",
+                        "priceLineVisible": False
                     }
                 }
             ]
 
-            renderLightweightCharts([{"chart": chart_options, "series": series_data}], key=f"chart_{code}_{ktype_name}")
+            renderLightweightCharts([{"chart": chart_options, "series": series_data}], key=f"pro_chart_{code}_{ktype_name}")
 
         except Exception as e:
             st.error(f"圖表渲染模塊發生異常: {str(e)}")
