@@ -1,5 +1,5 @@
 # 文件名: data_fetcher.py
-# 核心功能: 抓取美股包含 Premarket (04:00) + RTH (09:30) + Postmarket (16:00) 的完整連續 1Hr 數據
+# 核心功能: 專門以美東時間 (America/New_York) 抓取包含盤前 (04:00) / 常規 (09:30) / 盤後 (16:00) 的連續 1Hr 數據
 
 import datetime
 import os
@@ -12,21 +12,22 @@ tz_ny = pytz.timezone("America/New_York")
 DATA_DIR = './market_data'
 os.makedirs(DATA_DIR, exist_ok=True)
 
+# 抓取清單：1Hr 抓取最近 30 天 (覆蓋完整盤前 04:00 - 盤後 20:00)
 TARGETS = [
     ("US.QQQ", [
-        ("1Hr", KLType.K_60M, 60, 1000),   # 1小時 1000 根 (含盤前盤後)
+        ("1Hr", KLType.K_60M, 30, 800),
         ("DAY", KLType.K_DAY, 250, 200),
         ("WEEK", KLType.K_WEEK, 700, 100)
     ]),
     ("US.BTC", [
-        ("1Hr", KLType.K_60M, 60, 1000),
+        ("1Hr", KLType.K_60M, 30, 800),
         ("DAY", KLType.K_DAY, 250, 200),
         ("WEEK", KLType.K_WEEK, 700, 100)
     ])
 ]
 
 def fetch_and_save_kline():
-    print("【任務啟動】以【全時段連續 (Extended Hours)】同步數據...")
+    print("【任務啟動】以【美東時區 + 全時段連續 (Extended Hours)】同步數據...")
     now_ny = datetime.datetime.now(tz_ny)
     end_date_str = now_ny.strftime("%Y-%m-%d")
 
@@ -57,7 +58,7 @@ def fetch_and_save_kline():
                     
                     last_time = df['time_key'].iloc[-1]
                     last_close = df['close'].iloc[-1]
-                    print(f"【成功存盤】{code} {ktype_name:4s} ({len(df)} 根) -> 最新: {last_time} | 價格: ${last_close:.2f}")
+                    print(f"【成功存盤】{code} {ktype_name:4s} ({len(df)} 根) -> 最新時間: {last_time} | 現價: ${last_close:.2f}")
                 else:
                     print(f"❌ 拉取 {code} {ktype_name} 失敗: {msg}")
                 time.sleep(0.05)
@@ -69,7 +70,7 @@ def fetch_and_save_kline():
             try: quote_ctx.close()
             except: pass
 
-    print("【任務完成】歷史數據同步完畢。")
+    print("【任務完成】全時段連續歷史數據已沉澱至本地備份。")
 
 if __name__ == "__main__":
     fetch_and_save_kline()
