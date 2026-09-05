@@ -1,5 +1,5 @@
 # 文件名: chart_plugin.py
-# 核心功能: 毫秒快照 + uirevision 視口鎖定 (滑鼠縮放不跳動) + 現價水平射線 + TD 趨勢通道
+# 核心功能: 頂部動態跳動監控艙 (獨立渲染) + 靜態 Plotly 圖表 (視口鎖定，絕不跳回)
 
 import os
 import datetime
@@ -41,7 +41,6 @@ class ChartPlugin:
                 try: quote_ctx.close()
                 except: pass
 
-        # 備援 yfinance 快照
         try:
             yf_sym = "BTC-USD" if "BTC" in code.upper() else "QQQ"
             ticker = yf.Ticker(yf_sym)
@@ -57,7 +56,7 @@ class ChartPlugin:
         return res
 
     def get_live_data_and_upsert(self, code: str, ktype_name: str) -> tuple:
-        """獲取數據並安全 Upsert 合併"""
+        """獲取 K 線並執行安全 Upsert 合併"""
         is_btc = "BTC" in code.upper()
         save_prefix = "CC_BTCUSD" if is_btc else code.replace('.', '_')
         file_path = os.path.join(self.data_dir, f"{save_prefix}_{ktype_name}.csv")
@@ -135,20 +134,36 @@ class ChartPlugin:
 
         return pd.DataFrame(), "❌ 無可用數據源"
 
-    def render_live_monitor_table(self, df: pd.DataFrame, code: str, data_source: str, snap_info: dict):
-        """頂部即時跳動監控表格"""
-        if df.empty:
-            st.info("⏳ 正在建立行情通訊流...")
-            return
+    def render_live_monitor_table(self, code: str, ktype_name: str):
+        """【獨立高頻單元】頂部即時跳動監控表格"""
+        snap_info = self.get_realtime_snapshot_price(code)
+        
+        # 讀取本地最近一筆數據對比
+        is_btc = "BTC" in code.upper()
+        save_prefix = "CC_BTCUSD" if is_btc else code.replace('.', '_')
+        file_path = os.path.join(self.data_dir, f"{save_prefix}_{ktype_name}.csv")
+        
+        last_close = 0.0
+        last_high = 0.0
+        last_low = 0.0
+        last_vol = 0.0
+        
+        if os.path.exists(file_path):
+            try:
+                df_temp = pd.read_csv(file_path)
+                last_row = df_temp.iloc[-1]
+                last_close = float(last_row['close'])
+                last_high = float(last_row['high'])
+                last_low = float(last_row['low'])
+                last_vol = float(last_row['volume'])
+            except Exception:
+                pass
 
-        last_row = df.iloc[-1]
-        prev_row = df.iloc[-2] if len(df) >= 2 else last_row
+        current_live_price = snap_info["price"] if snap_info["price"] else last_close
+        display_source = snap_info["source"] if snap_info["price"] else "🟢 數據通訊中"
         
-        current_live_price = snap_info["price"] if snap_info["price"] else float(last_row['close'])
-        display_source = snap_info["source"] if snap_info["price"] else data_source
-        
-        chg_pts = current_live_price - prev_row['close']
-        chg_pct = (chg_pts / prev_row['close']) * 100 if prev_row['close'] != 0 else 0.0
+        chg_pts = (current_live_price - last_close) if last_close > 0 else 0.0
+        chg_pct = (chg_pts / last_close) * 100 if last_close > 0 else 0.0
         now_et_str = datetime.datetime.now(tz_ny).strftime('%Y-%m-%d %H:%M:%S')
 
         monitor_data = {
@@ -156,26 +171,23 @@ class ChartPlugin:
             "數據通道": [display_source],
             "美東即時時間 (ET)": [now_et_str],
             "最新跳動現價 (Live)": [f"${current_live_price:,.2f}"],
-            "5M 當根最高 (High)": [f"${max(last_row['high'], current_live_price):,.2f}"],
-            "5M 當根最低 (Low)": [f"${min(last_row['low'], current_live_price):,.2f}"],
-            "5M 成交量 (Vol)": [f"{float(last_row['volume']):,.2f}"],
-            "即時漲跌幅": [f"{chg_pts:+.2f} ({chg_pct:+.2f}%)"]
+            "當根最高 (High)": [f"${max(last_high, current_live_price):,.2f}"],
+            "當根最低 (Low)": [f"${min(last_low, current_live_price):,.2f}"],
+            "當根成交量 (Vol)": [f"{last_vol:,.2f}"],
+            "即時跳動幅度": [f"{chg_pts:+.2f} ({chg_pct:+.2f}%)"]
         }
         st.markdown("##### ⚡ 實時行情跳動監控艙 (Live Stream Engine)")
         st.dataframe(pd.DataFrame(monitor_data), use_container_width=True, hide_index=True)
 
-    def render_chart(self, code: str, ktype_name: str):
+    def render_static_chart(self, code: str, ktype_name: str):
+        """【低頻穩定單元】圖表畫布，只在初次或手動觸發時重繪，徹底防止視角跳動"""
         try:
             df, data_source = self.get_live_data_and_upsert(code, ktype_name)
             if df.empty:
                 st.error(f"❌ 暫時無法獲取 {code} 數據，請檢查網絡連接。")
                 return
 
-            snap_info = self.get_realtime_snapshot_price(code)
-            self.render_live_monitor_table(df, code, data_source, snap_info)
-
-            current_price = snap_info["price"] if snap_info["price"] else float(df['close'].iloc[-1])
-            df.loc[df.index[-1], 'close'] = current_price
+            current_price = float(df['close'].iloc[-1])
 
             df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
             df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
@@ -206,7 +218,7 @@ class ChartPlugin:
 
             if td_res.get("support_line"):
                 sup_df = pd.DataFrame(td_res["support_line"])
-                fig.add_trace(go.Scatter(x=df_plot['time_clean'].iloc[-len(sup_df):], y=sup_df['value'], mode='lines', line=dict(color='#00E676', width=2, dash='dash'), name="TD 支撐線"), row=1, col=1)
+                fig.add_trace(go.Scatter(x=df_plot['time_clean'].iloc[-len(sup_df):], y=sup_df['value'], mode='lines', line=dict(color='#00E676', width=2, dash='dash'), name="TD 支撐線" ), row=1, col=1)
 
             # 現價動態水平射線
             fig.add_hline(
@@ -218,7 +230,7 @@ class ChartPlugin:
                 row=1, col=1
             )
 
-            # 副圖 VPA 成交量
+            # 副圖成交量
             bar_colors = ["#089981" if c >= o else "#F23645" for o, c in zip(df_plot['open'], df_plot['close'])]
             fig.add_trace(go.Bar(x=df_plot['time_clean'], y=df_plot['volume'], name="成交量", marker=dict(color=bar_colors)), row=2, col=1)
             fig.add_trace(go.Scatter(x=df_plot['time_clean'], y=df_plot['vma20'], line=dict(color="#ffffff", width=1), name="VMA20"), row=2, col=1)
@@ -228,7 +240,6 @@ class ChartPlugin:
             fig.update_xaxes(type='category', rangeslider_visible=False, gridcolor="#161b22")
             fig.update_yaxes(gridcolor="#161b22")
             
-            # 🌟 核心關鍵：設定 uirevision 鎖定使用者手動縮放與拖曳位置
             fig.update_layout(
                 height=620,
                 template="plotly_dark",
@@ -237,10 +248,10 @@ class ChartPlugin:
                 margin=dict(l=10, r=10, t=10, b=10),
                 hovermode="x unified",
                 dragmode="pan",
-                uirevision=code  # 只要標的沒換，縮放和平移永遠保留！
+                uirevision=f"{code}_{ktype_name}"
             )
 
             st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True, "displayModeBar": True, "displaylogo": False})
 
         except Exception as e:
-            st.error(f"❌ 模組渲染異常: {str(e)}")
+            st.error(f"❌ 圖表模組渲染異常: {str(e)}")
