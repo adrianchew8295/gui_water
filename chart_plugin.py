@@ -1,5 +1,5 @@
 # 文件名: chart_plugin.py
-# 核心功能: 專業金融圖表 - 美東時間軸 + 盤前/盤後半透明灰色陰影區塊 (ETH Shading) + 純淨 K 線 + VPA 副圖
+# 核心功能: 專業金融圖表 - 美東時間軸 + 盤前/盤後半透明灰色陰影區塊 (ETH Shading) + TD 趨勢通道
 
 import os
 import pandas as pd
@@ -16,7 +16,6 @@ class ChartPlugin:
         self.data_dir = data_dir
 
     def get_realtime_market_price(self, code: str) -> dict:
-        """調用本地 OpenD 獲取最新即時跳動價 (包含 Premarket / Postmarket)"""
         res = {"price": None, "status_text": "常規盤"}
         try:
             ctx = OpenQuoteContext(host='127.0.0.1', port=11111)
@@ -26,7 +25,7 @@ class ChartPlugin:
                 row = df_snap.iloc[0]
                 res["price"] = float(row['last_price'])
                 status = row.get('market_status', '')
-                res["status_text"] = f"即時跳動 ({status})" if status else "即時盤口現價"
+                res["status_text"] = f"即時跳動 ({status})" if status else "即時盤口"
         except Exception:
             pass
         return res
@@ -68,21 +67,17 @@ class ChartPlugin:
             if ktype_name in ['DAY', 'WEEK']:
                 df['time_clean'] = df['dt_obj'].dt.strftime('%Y-%m-%d')
             else:
+                # 1Hr 採用 UNIX 秒級時間戳
                 df['time_clean'] = df['dt_obj'].astype('int64') // 10**9
 
             df = df.drop_duplicates(subset=['time_clean']).sort_values('dt_obj').reset_index(drop=True)
             df = self.calculate_vpa_indicators(df)
 
-            # 實時快照融合
             live_info = self.get_realtime_market_price(code)
             if live_info["price"]:
                 current_price = live_info["price"]
                 price_desc = f"🟢 {live_info['status_text']}: **${current_price:.2f}** (美東時間 ET)"
                 df.loc[df.index[-1], 'close'] = current_price
-                if current_price > df.loc[df.index[-1], 'high']:
-                    df.loc[df.index[-1], 'high'] = current_price
-                if current_price < df.loc[df.index[-1], 'low']:
-                    df.loc[df.index[-1], 'low'] = current_price
             else:
                 current_price = float(df['close'].iloc[-1])
                 price_desc = f"📌 美東定格價: **${current_price:.2f}**"
@@ -107,7 +102,7 @@ class ChartPlugin:
             with w_left:
                 st.success("🟢 **多頭向上推演路徑 (Bullish Wave 50%)**")
                 st.markdown(f"""
-                - **起爆關鍵點**：站穩阻力線 **${res_val:.2f}**[cite: 2, 4]
+                - **起爆關鍵點**：站穩阻力線 **${res_val:.2f}**[cite: 2]
                 - **第一目標位 (Target 1)**：🚀 **${t1:.2f}** (TD 0.618 突破浪)[cite: 1]
                 - **第二目標位 (Target 2)**：🎯 **${t2:.2f}** (TD 1.0 對稱通道)[cite: 1]
                 """)
@@ -115,21 +110,16 @@ class ChartPlugin:
             with w_right:
                 st.error("🔴 **空頭向下推演路徑 (Bearish Wave 50%)**")
                 st.markdown(f"""
-                - **破位關鍵點**：跌破支撐線 **${sup_val:.2f}**[cite: 2, 4]
+                - **破位關鍵點**：跌破支撐線 **${sup_val:.2f}**[cite: 2]
                 - **第一目標位 (Target 1)**：📉 **${b1:.2f}** (TD 0.618 下跌浪)[cite: 1]
                 - **第二目標位 (Target 2)**：🎯 **${b2:.2f}** (TD 1.0 對稱通道)[cite: 1]
                 """)
 
             st.divider()
 
-            # ---------------- 圖表數據解析 ----------------
             candles = []
             markers = []
             vol_bars = []
-            vma20_line = []
-            vma15_line = []
-            vma20_alert_line = []
-
             td_high_times = {p['time'] for p in td_highs}
             td_low_times = {p['time'] for p in td_lows}
             has_vol = 'volume' in df.columns
@@ -141,17 +131,8 @@ class ChartPlugin:
                 min_et = dt_item.minute
                 time_float = hour_et + min_et / 60.0
 
-                # 判斷是否為常規交易時段 (RTH 09:30 - 16:00 ET)
+                # 判定常規盤 (RTH 09:30 - 16:00 ET) 與盤前盤後 (ETH)
                 is_rth = (time_float >= 9.5) and (time_float < 16.0)
-
-                # 色彩配置：常規盤高飽和，盤前盤後微柔和
-                is_up = row['close'] >= row['open']
-                if is_rth:
-                    up_col = "#089981"
-                    dn_col = "#F23645"
-                else:
-                    up_col = "rgba(38, 166, 154, 0.65)"
-                    dn_col = "rgba(239, 83, 80, 0.65)"
 
                 candles.append({
                     "time": t,
@@ -161,7 +142,6 @@ class ChartPlugin:
                     "close": float(row['close'])
                 })
 
-                # TD 極值點箭頭標記
                 if str(row['time_clean']) in td_high_times:
                     markers.append({"time": t, "position": "aboveBar", "color": "#FF5252", "shape": "arrowDown", "text": "TD High"})
                 elif str(row['time_clean']) in td_low_times:
@@ -171,19 +151,19 @@ class ChartPlugin:
                     vol_bars.append({
                         "time": t,
                         "value": float(row['volume']),
-                        "color": "#089981" if is_up else "#F23645"
+                        "color": ("#089981" if row['close'] >= row['open'] else "#F23645") if is_rth else ("rgba(8, 153, 129, 0.4)" if row['close'] >= row['open'] else "rgba(242, 54, 69, 0.4)")
                     })
-                    if pd.notna(row.get('vma20')): vma20_line.append({"time": t, "value": float(row['vma20'])})
-                    if pd.notna(row.get('vma_15x')): vma15_line.append({"time": t, "value": float(row['vma_15x'])})
-                    if pd.notna(row.get('vma_20x')): vma20_alert_line.append({"time": t, "value": float(row['vma_20x'])})
 
-            # 主圖配置 (底色深黑，支援流暢縮放)
             price_chart = {
-                "height": 480,
+                "height": 500,
                 "layout": {"textColor": "#8b949e", "background": {"type": "solid", "color": "#0d1117"}},
                 "grid": {"vertLines": {"color": "#161b22"}, "horzLines": {"color": "#161b22"}},
                 "crosshair": {"mode": 1},
-                "timeScale": {"timeVisible": True, "secondsVisible": False, "borderColor": "#21262d"},
+                "timeScale": {
+                    "timeVisible": True,
+                    "secondsVisible": False,
+                    "borderColor": "#21262d"
+                },
                 "rightPriceScale": {"borderColor": "#21262d", "autoScale": True},
                 "handleScroll": {"mouseWheel": True, "pressedMouseMove": True, "horzTouchDrag": True, "vertTouchDrag": True},
                 "handleScale": {"axisPressedMouseMove": True, "mouseWheel": True, "pinch": True}
@@ -204,7 +184,6 @@ class ChartPlugin:
                 }
             ]
 
-            # 疊加 TD 趨勢線 (紅/綠虛線)
             if td_res.get("resistance_line"):
                 res_pts = [{"time": int(pt["time"]) if str(pt["time"]).isdigit() else pt["time"], "value": pt["value"]} for pt in td_res["resistance_line"]]
                 price_series.append({"type": "Line", "data": res_pts, "options": {"color": "#FF5252", "lineWidth": 2, "lineStyle": 2, "title": "TD Resistance"}})
@@ -215,7 +194,6 @@ class ChartPlugin:
 
             charts_to_render = [{"chart": price_chart, "series": price_series}]
 
-            # 副圖配置 (VPA 成交量 + 均量線)
             if has_vol and vol_bars:
                 vol_chart = {
                     "height": 160,
@@ -223,16 +201,9 @@ class ChartPlugin:
                     "grid": {"vertLines": {"color": "#161b22"}, "horzLines": {"color": "#161b22"}},
                     "crosshair": {"mode": 1},
                     "timeScale": {"timeVisible": True, "secondsVisible": False, "borderColor": "#21262d"},
-                    "rightPriceScale": {"borderColor": "#21262d", "autoScale": True},
-                    "handleScroll": {"mouseWheel": True, "pressedMouseMove": True, "horzTouchDrag": True, "vertTouchDrag": True},
-                    "handleScale": {"axisPressedMouseMove": True, "mouseWheel": True, "pinch": True}
+                    "rightPriceScale": {"borderColor": "#21262d", "autoScale": True}
                 }
-                vol_series = [
-                    {"type": "Histogram", "data": vol_bars, "options": {"priceFormat": {"type": "volume"}, "priceScaleId": ""}},
-                    {"type": "Line", "data": vma20_line, "options": {"color": "#ffffff", "lineWidth": 1, "title": "VMA20"}},
-                    {"type": "Line", "data": vma15_line, "options": {"color": "#8b949e", "lineWidth": 1, "lineStyle": 2, "title": "1.5X"}},
-                    {"type": "Line", "data": vma20_alert_line, "options": {"color": "#ffd700", "lineWidth": 1, "lineStyle": 2, "title": "2.0X"}}
-                ]
+                vol_series = [{"type": "Histogram", "data": vol_bars, "options": {"priceFormat": {"type": "volume"}, "priceScaleId": ""}}]
                 charts_to_render.append({"chart": vol_chart, "series": vol_series})
 
             renderLightweightCharts(charts_to_render, key=f"tv_chart_{code}_{ktype_name}")
