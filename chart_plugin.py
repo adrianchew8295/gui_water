@@ -1,13 +1,14 @@
 # 文件名: chart_plugin.py
-# 核心特性: 純 5M 閉合定格柱 + 保守右側突破開火 + 通欄整行高亮 + 0DTE $200 預算雷達
+# 核心特性: 訂閱修復 + 5M 倒數計時 + 後台狀態透明化 + 一鍵複製文本塊 + 保守開火
 
 import os
+import time
 import datetime
 import numpy as np
 import pandas as pd
 import pytz
 import streamlit as st
-from moomoo import OpenQuoteContext, RET_OK, KLType, AuType
+from moomoo import OpenQuoteContext, RET_OK, KLType, SubType, AuType
 
 tz_ny = pytz.timezone("America/New_York")
 
@@ -16,8 +17,10 @@ DATA_DIR = os.path.join(BASE_DIR, 'market_data')
 os.makedirs(DATA_DIR, exist_ok=True)
 
 class MarketDataEngine:
-    """單例常駐連線引擎，杜絕握手阻塞與超時"""
+    """單例常駐連線引擎，確保訂閱通道長駐"""
+    _instance = None
     _quote_ctx = None
+    _subscribed_symbols = set()
 
     @classmethod
     def get_context(cls):
@@ -27,6 +30,19 @@ class MarketDataEngine:
             except Exception:
                 cls._quote_ctx = None
         return cls._quote_ctx
+
+    @classmethod
+    def ensure_subscription(cls, symbol: str) -> bool:
+        ctx = cls.get_context()
+        if ctx and symbol not in cls._subscribed_symbols:
+            try:
+                ret, _ = ctx.subscribe([symbol], [SubType.K_5M])
+                if ret == RET_OK:
+                    cls._subscribed_symbols.add(symbol)
+                    return True
+            except Exception:
+                pass
+        return symbol in cls._subscribed_symbols
 
 class ChartPlugin:
     def __init__(self, data_dir: str = DATA_DIR):
@@ -68,13 +84,15 @@ class ChartPlugin:
         return setup_type
 
     def get_closed_kline_data(self, code: str) -> tuple:
-        """【純閉合柱獲取通道】直接抓取 40 根已收盤 5M K 線"""
+        """【閉合柱獲取通道 · 帶自動訂閱修復】"""
         df_5m = pd.DataFrame()
         source_str = "未連線"
+        status_msg = "正在檢查連線..."
         target_symbol = "CC.BTCUSD" if "BTC" in code.upper() else code
 
         ctx = MarketDataEngine.get_context()
         if ctx:
+            MarketDataEngine.ensure_subscription(target_symbol)
             try:
                 ret_k, df_k = ctx.get_cur_kline(target_symbol, 40, KLType.K_5M, AuType.NONE)
                 if ret_k == RET_OK and not df_k.empty:
@@ -82,12 +100,15 @@ class ChartPlugin:
                     df_5m.columns = [c.lower().strip() for c in df_5m.columns]
                     df_5m['time_key'] = pd.to_datetime(df_5m['time_key'])
                     df_5m = df_5m.sort_values('time_key').reset_index(drop=True)
-                    source_str = "🟢 OpenD 直連 (5M 閉合定格)"
+                    source_str = "🟢 OpenD 直連 (實時推送)"
+                    status_msg = "後台已成功訂閱 5M 通道，數據正常同步"
                     # 落盤備份
                     save_prefix = "CC_BTCUSD" if "BTC" in code.upper() else code.replace('.', '_')
                     df_5m.to_csv(os.path.join(self.data_dir, f"{save_prefix}_5M.csv"), index=False)
-            except Exception:
-                pass
+                else:
+                    status_msg = f"獲取 K 線返回代碼: {ret_k}，切換備用緩存"
+            except Exception as e:
+                status_msg = f"連線異常: {str(e)}"
 
         if df_5m.empty:
             save_prefix = "CC_BTCUSD" if "BTC" in code.upper() else code.replace('.', '_')
@@ -101,7 +122,7 @@ class ChartPlugin:
                 except Exception:
                     pass
 
-        return source_str, df_5m
+        return source_str, status_msg, df_5m
 
     def load_cold_data(self, code: str, ktype_name: str) -> pd.DataFrame:
         """冷數據讀取：日線與 1 小時線"""
@@ -121,13 +142,27 @@ class ChartPlugin:
                 pass
         return pd.DataFrame()
 
+    def get_countdown_to_next_5m(self) -> str:
+        """計算距離下一次 5 分鐘收盤換棒的倒數時間 (MM:SS)"""
+        now = datetime.datetime.now(tz_ny)
+        cur_min = now.minute
+        cur_sec = now.second
+        rem_min = 4 - (cur_min % 5)
+        rem_sec = 60 - cur_sec
+        if rem_sec == 60:
+            rem_min += 1
+            rem_sec = 0
+        return f"{rem_min:02d}:{rem_sec:02d}"
+
     def render_cockpit(self, code: str, budget_usd: float = 200.0):
-        """【純 5M 閉合定格 · 保守實戰座艙】"""
-        source_str, df_5m = self.get_closed_kline_data(code)
+        """【純 5M 閉合定格 · 實戰座艙】"""
+        source_str, status_msg, df_5m = self.get_closed_kline_data(code)
         df_day = self.load_cold_data(code, "DAY")
+        countdown_str = self.get_countdown_to_next_5m()
 
         if df_5m.empty or len(df_5m) < 8:
             st.warning("⏳ 正在等待 5M 閉合數據連通中...")
+            st.info(f"⚙️ 後台狀態: {status_msg}")
             return
 
         # 1. 宏觀方向 (TREND_BIAS) 與戰區邊界
@@ -158,11 +193,9 @@ class ChartPlugin:
         llv5 = df_5m['low'].rolling(5).min().shift(1).bfill()
         hhv5 = df_5m['high'].rolling(5).max().shift(1).bfill()
 
-        # 富途 5.1 獨立 2B 假突破 (RAW 形態)
         bull_2b_raw = ((df_5m['low'] < llv5) | (df_5m['low'] < pdl_line)) & (df_5m['close'] > llv5) & (df_5m['close'] > df_5m['open'])
         bear_2b_raw = ((df_5m['high'] > hhv5) | (df_5m['high'] > pdh_line)) & (df_5m['close'] < hhv5) & (df_5m['close'] < df_5m['open'])
 
-        # 富途 5.2 吞沒與晨星
         c1, o1 = df_5m['close'].shift(1), df_5m['open'].shift(1)
         c2, o2 = df_5m['close'].shift(2), df_5m['open'].shift(2)
         h1, l1 = df_5m['high'].shift(1), df_5m['low'].shift(1)
@@ -200,7 +233,6 @@ class ChartPlugin:
             action_str = "⚪ 待機中"
             diag_str = "⚪ 區間蓄勢"
 
-            # 提取前一根 (T-1) 棒線執行【富途 PART 6 保守右側確認】
             if idx + 1 < len(bars_6):
                 prev_bar = bars_6.iloc[idx + 1]
                 p_h, p_l = float(prev_bar['high']), float(prev_bar['low'])
@@ -215,7 +247,7 @@ class ChartPlugin:
                 else:
                     has_prev_bull, has_prev_bear = False, False
 
-                # 【保守右側確認公式】
+                # 【富途 PART 6 保守右側確認公式】
                 is_bull_confirmed = has_prev_bull and (h > p_h) and (c > o) and (is_heavy or p_heavy) and (trend_bias >= 0)
                 is_bear_confirmed = has_prev_bear and (l < p_l) and (c < o) and (is_heavy or p_heavy) and (trend_bias <= 0)
 
@@ -225,7 +257,7 @@ class ChartPlugin:
                     sl = p_l - 0.5 * atr
                     tp = c + 2.0 * (c - sl)
                     action_str = f"🎯 【買入 CALL】(入: ${c:.2f} | 止: ${sl:.2f} | 盈: ${tp:.2f})"
-                    if idx == 0:  # 最新剛收盤的這一根成立
+                    if idx == 0:
                         latest_trigger_type = "CALL"
                         latest_trigger_action = f"🔥 【右側確認 · 買入 0DTE CALL】 入場: ${c:.2f} | 止損: ${sl:.2f} | 2R止盈: ${tp:.2f}"
 
@@ -253,7 +285,8 @@ class ChartPlugin:
                 "收盤價 (Close)": f"${c:,.2f} [{candle_color}]",
                 "影線極值 (High / Low)": f"{h:.2f} / {l:.2f}",
                 "5M量能 (VPA)": f"{vol_ratio:.2f}x ({'🟢放量' if is_heavy else '⚪常規'})",
-                "_style": row_style
+                "_style": row_style,
+                "_raw": f"時段:{t_str} | 收盤:{c:.2f} | 極值:{h:.2f}/{l:.2f} | 量:{vol_ratio:.2f}x"
             })
 
             table2_rows.append({
@@ -261,14 +294,16 @@ class ChartPlugin:
                 "TD 9轉 (Setup)": td_s,
                 "形態與戰區診斷": diag_str,
                 "1:2 結構指令 & 動作": action_str,
-                "_style": row_style
+                "_style": row_style,
+                "_raw": f"TD:{td_s} | 診斷:{diag_str} | 指令:{action_str}"
             })
 
-        # ====== 模組 1: 頂部心跳憑證 ======
+        # ====== 模組 1: 頂部心跳憑證與倒數計時 ======
         latest_time_str = pd.to_datetime(bars_6.iloc[0]['time_key']).strftime('%H:%M ET')
         st.success(
-            f"📶 通道: **{source_str}** | 最新定格柱: **{latest_time_str}** | 宏觀方向: **{trend_text}** | 💾 CSV 自動同步"
+            f"📶 通道: **{source_str}** | 最新定格柱: **{latest_time_str}** | ⏱️ 距離下根 5M 換棒: **{countdown_str}** | 宏觀: **{trend_text}**"
         )
+        st.caption(f"⚙️ 後台狀態更新 (Status): `{status_msg}` | 💾 CSV 自動同步完成")
 
         # ====== 模組 3: 表 1 —— 5M 閉合量價核心表 ======
         st.markdown("##### 📊 表 1：5M 閉合量價核心表 (黃金 30 分鐘定格窗口)")
@@ -331,3 +366,15 @@ class ChartPlugin:
             </div>
         </div>
         """, unsafe_allow_html=True)
+
+        # ====== 模組 7: 一鍵複製診斷文本 (Copy-Paste Text Block) ======
+        with st.expander("📋 點擊展開：當前數據快照文本 (隨時複製貼上反饋排查)"):
+            text_dump = f"=== 癸水數據快照 ===\n時間: {datetime.datetime.now(tz_ny).strftime('%Y-%m-%d %H:%M:%S ET')}\n通道: {source_str}\n狀態: {status_msg}\n倒數: {countdown_str}\n宏觀: {trend_text}\n"
+            text_dump += "\n【表1 5M量價核心】\n"
+            for r in table1_rows:
+                text_dump += f"• {r['_raw']}\n"
+            text_dump += "\n【表2 戰術與TD指令】\n"
+            for r in table2_rows:
+                text_dump += f"• {r['_raw']}\n"
+            text_dump += f"\n【模組6 期權建議】\n{latest_trigger_action}\n"
+            st.text_area("直接點擊下方文字框全選 (Ctrl+A) 複製 (Ctrl+C)：", value=text_dump, height=180)
