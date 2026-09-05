@@ -1,82 +1,84 @@
 # 文件名: trendline_engine.py
-# 核心功能: 依據 Tom DeMark TD Lines 算法計算阻力線、支撐線與 50/50 多空目標投影
+# 核心功能: 德马克 TD 趋势线算法 (含安全边界检测，防止 IndexError / ZeroDivisionError)
 
-from typing import Dict, List, Tuple, Any
-import numpy as np
 import pandas as pd
+import numpy as np
 
-def find_td_pivots(df: pd.DataFrame, window: int = 4) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def find_td_pivots(df: pd.DataFrame, window: int = 4):
+    """提取 TD High 与 TD Low 极值点"""
     td_highs, td_lows = [], []
-    if df is None or len(df) < (2 * window + 1):
+    if df.empty or len(df) < (window * 2 + 1):
         return td_highs, td_lows
 
-    high_col = 'high' if 'high' in df.columns else 'High'
-    low_col = 'low' if 'low' in df.columns else 'Low'
-    time_col = 'time_clean' if 'time_clean' in df.columns else ('time_key' if 'time_key' in df.columns else df.columns[0])
+    highs = df['high'].values
+    lows = df['low'].values
+    times = df['time_clean'].values if 'time_clean' in df.columns else df.index.values
 
-    highs, lows = df[high_col].values, df[low_col].values
-    times = df[time_col].astype(str).values
-    n = len(df)
+    for i in range(window, len(df) - window):
+        # TD High: 当期最高价严格大于前后 window 根
+        if all(highs[i] > highs[i - k] for k in range(1, window + 1)) and \
+           all(highs[i] > highs[i + k] for k in range(1, window + 1)):
+            td_highs.append({"index": i, "time": times[i], "value": float(highs[i])})
 
-    for i in range(window, n - window):
-        curr_high = highs[i]
-        curr_low = lows[i]
-
-        if np.all(curr_high >= highs[i - window : i]) and np.all(curr_high >= highs[i + 1 : i + window + 1]):
-            td_highs.append({"bar_idx": i, "time": str(times[i]), "price": float(curr_high)})
-
-        if np.all(curr_low <= lows[i - window : i]) and np.all(curr_low <= lows[i + 1 : i + window + 1]):
-            td_lows.append({"bar_idx": i, "time": str(times[i]), "price": float(curr_low)})
+        # TD Low: 当期最低价严格小于前后 window 根
+        if all(lows[i] < lows[i - k] for k in range(1, window + 1)) and \
+           all(lows[i] < lows[i + k] for k in range(1, window + 1)):
+            td_lows.append({"index": i, "time": times[i], "value": float(lows[i])})
 
     return td_highs, td_lows
 
-def compute_demark_trendlines(df: pd.DataFrame, window: int = 4) -> Dict[str, Any]:
+def compute_demark_trendlines(df: pd.DataFrame, window: int = 4) -> dict:
+    """计算最新德马克动态阻力线、支撑线及 50/50 目标推演"""
     res = {
-        "status": "fail",
-        "resistance_line": [],
-        "support_line": [],
-        "curr_res_val": None,
-        "curr_sup_val": None,
-        "bull_target_1": None,
-        "bull_target_2": None,
-        "bear_target_1": None,
-        "bear_target_2": None
+        "resistance_line": [], "support_line": [],
+        "curr_res_val": None, "curr_sup_val": None,
+        "bull_target_1": None, "bull_target_2": None,
+        "bear_target_1": None, "bear_target_2": None
     }
-    if df is None or len(df) < (2 * window + 1):
+    
+    if df.empty or len(df) < (window * 2 + 1):
         return res
 
-    td_highs, td_lows = find_td_pivots(df, window=window)
+    td_highs, td_lows = find_td_pivots(df, window)
     last_idx = len(df) - 1
-    time_col = 'time_clean' if 'time_clean' in df.columns else ('time_key' if 'time_key' in df.columns else df.columns[0])
-    times = df[time_col].astype(str).values
+    times = df['time_clean'].values if 'time_clean' in df.columns else df.index.values
 
-    # 計算阻力線
+    # 1. 阻力线 (连接最近两个 TD High)
     if len(td_highs) >= 2:
         p1, p2 = td_highs[-2], td_highs[-1]
-        dx, dy = p2["bar_idx"] - p1["bar_idx"], p2["price"] - p1["price"]
-        if dx > 0:
-            slope = dy / dx
-            curr_res_val = p2["price"] + slope * (last_idx - p2["bar_idx"])
-            res["curr_res_val"] = round(curr_res_val, 2)
-            res["resistance_line"] = [{"time": str(times[i]), "value": round(float(p1["price"] + slope * (i - p1["bar_idx"])), 2)} for i in range(p1["bar_idx"], last_idx + 1)]
+        x1, y1 = p1["index"], p1["value"]
+        x2, y2 = p2["index"], p2["value"]
+        if x2 != x1:
+            slope = (y2 - y1) / (x2 - x1)
+            curr_val = y2 + slope * (last_idx - x2)
+            res["curr_res_val"] = round(float(curr_val), 2)
+            res["resistance_line"] = [
+                {"time": p1["time"], "value": y1},
+                {"time": p2["time"], "value": y2},
+                {"time": times[last_idx], "value": res["curr_res_val"]}
+            ]
 
-    # 計算支撐線
+    # 2. 支撑线 (连接最近两个 TD Low)
     if len(td_lows) >= 2:
         p1, p2 = td_lows[-2], td_lows[-1]
-        dx, dy = p2["bar_idx"] - p1["bar_idx"], p2["price"] - p1["price"]
-        if dx > 0:
-            slope = dy / dx
-            curr_sup_val = p2["price"] + slope * (last_idx - p2["bar_idx"])
-            res["curr_sup_val"] = round(curr_sup_val, 2)
-            res["support_line"] = [{"time": str(times[i]), "value": round(float(p1["price"] + slope * (i - p1["bar_idx"])), 2)} for i in range(p1["bar_idx"], last_idx + 1)]
+        x1, y1 = p1["index"], p1["value"]
+        x2, y2 = p2["index"], p2["value"]
+        if x2 != x1:
+            slope = (y2 - y1) / (x2 - x1)
+            curr_val = y2 + slope * (last_idx - x2)
+            res["curr_sup_val"] = round(float(curr_val), 2)
+            res["support_line"] = [
+                {"time": p1["time"], "value": y1},
+                {"time": p2["time"], "value": y2},
+                {"time": times[last_idx], "value": res["curr_sup_val"]}
+            ]
 
-    # 德馬克突破目標價量化投影 (TD Target Projections)
+    # 3. 50/50 空间测算
     if res["curr_res_val"] and res["curr_sup_val"]:
-        channel_height = abs(res["curr_res_val"] - res["curr_sup_val"])
-        res["bull_target_1"] = round(res["curr_res_val"] + channel_height * 0.618, 2)
-        res["bull_target_2"] = round(res["curr_res_val"] + channel_height * 1.0, 2)
-        res["bear_target_1"] = round(res["curr_sup_val"] - channel_height * 0.618, 2)
-        res["bear_target_2"] = round(res["curr_sup_val"] - channel_height * 1.0, 2)
-        res["status"] = "success"
+        h = abs(res["curr_res_val"] - res["curr_sup_val"])
+        res["bull_target_1"] = round(res["curr_res_val"] + h * 0.618, 2)
+        res["bull_target_2"] = round(res["curr_res_val"] + h * 1.0, 2)
+        res["bear_target_1"] = round(res["curr_sup_val"] - h * 0.618, 2)
+        res["bear_target_2"] = round(res["curr_sup_val"] - h * 1.0, 2)
 
     return res
