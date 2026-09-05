@@ -1,5 +1,5 @@
 # 文件名: data_fetcher.py
-# 核心功能: 以美東紐約時間 (America/New_York) 抓取包含盤前/盤後的全時段 1Hr / 日線 / 周線數據
+# 核心功能: 鎖定美東紐約時區 (America/New_York)，下載包含盤前/常規/盤後全時段連續 K 線
 
 import datetime
 import os
@@ -12,7 +12,7 @@ tz_ny = pytz.timezone("America/New_York")
 DATA_DIR = './market_data'
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# 抓取配置：1Hr 抓取最近 45 天 (含盤前盤後)，日線 200 根，周線 100 根
+# 抓取配置：1Hr 抓取最近 45 天 (含盤前 04:00 - 盤後 20:00 全時段)，日線 200 根，周線 100 根
 TARGETS = [
     ("US.QQQ", [
         ("1Hr", KLType.K_60M, 45, 600),
@@ -27,7 +27,7 @@ TARGETS = [
 ]
 
 def fetch_and_save_kline():
-    print("【任務啟動】開始以【美東紐約時區 + 全時段交易】同步歷史數據基座...")
+    print("【任務啟動】以【美東紐約時區 + 全時段交易 (Extended Hours)】同步數據...")
     now_ny = datetime.datetime.now(tz_ny)
     end_date_str = now_ny.strftime("%Y-%m-%d")
 
@@ -46,14 +46,12 @@ def fetch_and_save_kline():
                     start=start_date_str,
                     end=end_date_str,
                     ktype=ktype_enum,
-                    autype=AuType.NONE,
+                    autype=AuType.NONE, # 真實不復權
                     max_count=count
                 )
                 
                 if ret == RET_OK and not df_k.empty:
                     df = df_k[['time_key', 'open', 'close', 'high', 'low', 'volume']].copy()
-                    
-                    # 統一轉為美東時間字串並排序
                     df['time_key'] = pd.to_datetime(df['time_key'])
                     df = df.sort_values('time_key').reset_index(drop=True)
                     df.to_csv(file_path, index=False)
@@ -72,7 +70,7 @@ def fetch_and_save_kline():
             try: quote_ctx.close()
             except: pass
 
-    print("【任務完成】全時段歷史數據落盤完畢。")
+    print("【任務完成】全時段歷史數據沉澱完畢。")
 
 if __name__ == "__main__":
     fetch_and_save_kline()
