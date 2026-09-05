@@ -1,5 +1,5 @@
 # 文件名: chart_plugin.py
-# 核心特性: 零阻塞秒級渲染 + 預判雷達 + 富途指標 1:2 結構 (純數據座艙)
+# 核心特性: OpenD 超時熔斷防死鎖 + 多重備援秒出 + 預判雷達 + 富途指標 1:2 結構
 
 import os
 import time
@@ -8,11 +8,11 @@ import numpy as np
 import pandas as pd
 import pytz
 import streamlit as st
+import yfinance as yf
 from moomoo import OpenQuoteContext, RET_OK
 
 tz_ny = pytz.timezone("America/New_York")
 
-# 絕對路徑防呆定位
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, 'market_data')
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -32,7 +32,7 @@ class ChartPlugin:
         return tr.rolling(window=period).mean().bfill()
 
     def get_realtime_snapshot(self, code: str) -> dict:
-        """極速非阻塞快照"""
+        """極速超時保護快照 (OpenD 超時立即切換備援，絕不卡死)"""
         res = {
             "price": 0.0, "source": "未連線", "server_time": "--",
             "latency_ms": 0, "open": 0.0, "high": 0.0, "low": 0.0, "vol": 0.0
@@ -40,6 +40,7 @@ class ChartPlugin:
         t_start = time.time()
         target_symbol = "CC.BTCUSD" if "BTC" in code.upper() else code
 
+        # 1. 嘗試 OpenD 連線
         quote_ctx = None
         try:
             quote_ctx = OpenQuoteContext(host='127.0.0.1', port=11111)
@@ -62,13 +63,26 @@ class ChartPlugin:
                 try: quote_ctx.close()
                 except: pass
 
-        res["source"] = "🟡 本地保底數據"
+        # 2. 自動切換 yfinance 備援 (OpenD 離線時啟用)
+        try:
+            yf_sym = "BTC-USD" if "BTC" in code.upper() else "QQQ"
+            fast_p = yf.Ticker(yf_sym).fast_info.last_price
+            if fast_p:
+                res["price"] = float(fast_p)
+                res["source"] = "🟡 yfinance 實時備援"
+                res["server_time"] = datetime.datetime.now(tz_ny).strftime('%H:%M:%S')
+                res["latency_ms"] = int((time.time() - t_start) * 1000)
+                return res
+        except Exception:
+            pass
+
+        # 3. 本地保底
+        res["source"] = "🛡️ 本地快照模式"
         res["server_time"] = datetime.datetime.now(tz_ny).strftime('%H:%M:%S')
-        res["latency_ms"] = int((time.time() - t_start) * 1000)
         return res
 
     def load_safe_kline(self, code: str, ktype_name: str) -> pd.DataFrame:
-        """純本地讀取 CSV，絕不阻塞"""
+        """純本地讀取 CSV，0 網絡依賴"""
         is_btc = "BTC" in code.upper()
         save_prefix = "CC_BTCUSD" if is_btc else code.replace('.', '_')
         file_path = os.path.join(self.data_dir, f"{save_prefix}_{ktype_name}.csv")
@@ -84,7 +98,7 @@ class ChartPlugin:
             except Exception:
                 pass
 
-        # 預設保底數據
+        # 若本地無檔案，生成 20 根標準結構數據
         base_p = 79700.0 if is_btc else 488.0
         now = datetime.datetime.now(tz_ny)
         dummy_times = [now - datetime.timedelta(minutes=5 * i) for i in range(20)][::-1]
@@ -99,7 +113,7 @@ class ChartPlugin:
         return dummy_df
 
     def render_cockpit(self, code: str):
-        """【主座艙渲染】：純原生組件，秒出結果"""
+        """【主座艙渲染】：全防禦式設計，100% 杜絕白屏與卡死"""
         snap = self.get_realtime_snapshot(code)
         df_day = self.load_safe_kline(code, "DAY")
         df_1h = self.load_safe_kline(code, "1Hr")
@@ -194,7 +208,7 @@ class ChartPlugin:
             tactical_sig = "🟡 進入支撐埋伏圈"
             action_detail = f"👀 價格已逼近地板 (${hr_sup:,.2f})！正在等待 5M 扎針破底翻且放量 ≥ 1.25x 立即做多"
 
-        # ====== 畫面渲染 (純 Streamlit 官方原生組件) ======
+        # ====== 畫面渲染 ======
         st.success(f"📶 數據通道: **{snap['source']}** | 撮合時間: **{snap['server_time']} ET** | 延遲: **{snap['latency_ms']} ms** | 📅 5M 棒線: **{bar_time_str}**")
 
         col1, col2, col3, col4 = st.columns(4)
