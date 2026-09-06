@@ -1,5 +1,5 @@
 # 文件名: journal_plugin.py
-# 核心職責: 【100% 對齊 Moomoo 官方原生 5M 走勢 · 大馬時間軸 · 零跳轉 · 視角鎖定】
+# 核心職責: 【策略記帳與高級可視化復盤插件】支援打點標籤、1H EMA20、RBS/SBR 戰區與純前端 Timer
 
 import os
 import sys
@@ -50,6 +50,14 @@ class JournalPlugin:
                     "score_detail": "順應1H均線(+25) + 踩入RBS支撐(+25) + 2B長下影扎針(+25) + 放量不足(-25)",
                     "reason": "5M 2B 破底翻但隨後跌破支撐，觸發紀律止損", "pdh": 80069.4, "pdl": 79825.0,
                     "ema20_1h": 76068.5, "rbs": 79970.0, "sbr": 80020.0, "is_golden_window": False
+                },
+                {
+                    "trade_id": "#20260904_01", "code": "US.QQQ", "date": "2026-09-04", "time_et": "10:15", "time_myt": "22:15", "exit_time_et": "10:45",
+                    "month": "2026-09", "direction": "🟢 CALL", "strategy": "Strategy 1", "entry": 718.50, "sl": 717.30, "tp": 720.90,
+                    "exit_price": 720.90, "status": "WIN_TP", "net_r": 2.0, "pnl_usd": 400.0, "score": 95,
+                    "score_detail": "順應1H均線(+25) + 踩入RBS支撐(+25) + 2B破底翻(+25) + VPA 1.85x巨量(+20)",
+                    "reason": "回踩 RBS 支撐帶 + 5M 2B 破底翻長下影線 + 1.85x 巨量共振", "pdh": 721.39, "pdl": 715.72,
+                    "ema20_1h": 715.80, "rbs": 716.20, "sbr": 719.50, "is_golden_window": True
                 }
             ]
             pd.DataFrame(sample_data).to_csv(self.journal_path, index=False)
@@ -107,11 +115,9 @@ class JournalPlugin:
         }
 
     def _convert_time_to_myt(self, time_key_str: str) -> str:
-        """將時間戳轉換為大馬本地時間 (MYT) 字串，精確匹配 Moomoo 座標軸"""
         try:
             if " " in time_key_str:
                 dt_part = time_key_str.split(" ")[1][:5]
-                # 若為美東時戳，自動 +12 小時轉換為大馬時間
                 h, m = map(int, dt_part.split(":"))
                 h_my = (h + 12) % 24
                 return f"{h_my:02d}:{m:02d}"
@@ -130,7 +136,6 @@ class JournalPlugin:
                 df_raw = pd.read_csv(csv_path)
                 df_raw.columns = [c.lower() for c in df_raw.columns]
                 
-                # 歷史訂單切片
                 if entry_date_str and entry_time_str:
                     match_indices = df_raw[df_raw['time_key'].astype(str).str.contains(entry_date_str, na=False)].index.tolist()
                     if match_indices:
@@ -145,7 +150,6 @@ class JournalPlugin:
                         times = [self._convert_time_to_myt(str(t)) for t in df_slice['time_key']]
                         return times, df_slice['open'].astype(float).tolist(), df_slice['high'].astype(float).tolist(), df_slice['low'].astype(float).tolist(), df_slice['close'].astype(float).tolist(), df_slice['volume'].astype(float).tolist(), (mid_idx - start_i), str(df_slice.iloc[-1]['time_key'])
 
-                # 實盤展示最近 48 根 (4小時) 走勢
                 df_slice = df_raw.tail(48).copy().reset_index(drop=True)
                 times = [self._convert_time_to_myt(str(t)) for t in df_slice['time_key']]
                 last_ts = str(df_slice.iloc[-1]['time_key']) if not df_slice.empty else "N/A"
@@ -187,7 +191,6 @@ class JournalPlugin:
 
         fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.70, 0.30])
 
-        # 主圖真實 5M 蠟燭 (漲綠跌紅)
         fig.add_trace(go.Candlestick(
             x=times, open=opens, high=highs, low=lows, close=closes,
             increasing_line_color='#00E676', decreasing_line_color='#FF5252',
@@ -256,6 +259,10 @@ class JournalPlugin:
         st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True, 'displayModeBar': True})
         return last_ts
 
+    def render_journal_view(self, code: str, budget_usd: float = 200.0):
+        """主入口方法：相容 app.py 的 render_journal_view 呼叫"""
+        self.render_journal_dashboard(code, budget_usd)
+
     def render_journal_dashboard(self, code: str, budget_usd: float = 200.0):
         st.markdown("""
         <style>
@@ -320,7 +327,6 @@ class JournalPlugin:
 
             selected_row = df_day.iloc[sel_sig_idx]
 
-        # 頂部通欄 Timer (大馬時間軸，流暢倒數，零跳轉)
         chart_timer_html = f"""
         <div style="background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 6px 12px; margin-bottom: 4px; display: flex; justify-content: space-between; align-items: center; font-family: monospace; font-size: 13px; color: #c9d1d9;">
             <div>
