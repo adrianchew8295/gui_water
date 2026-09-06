@@ -1,5 +1,5 @@
 # 文件名: audit_comparator_plugin.py
-# 核心功能: 【數據真偽交叉審核插件】OpenD vs Tiingo IEX vs yfinance 5M 逐根比對
+# 核心功能: 【數據真偽交叉審核插件】標註三源 K 線顏色形態 + 逐根比對價差與時間漂移
 
 import datetime
 import json
@@ -20,6 +20,33 @@ class AuditComparatorPlugin:
     def __init__(self, tiingo_token: str = TIINGO_TOKEN):
         self.tiingo_token = tiingo_token
 
+    @staticmethod
+    def classify_candle(open_p: float, high_p: float, low_p: float, close_p: float) -> str:
+        """K 線顏色與幾何形態解剖"""
+        total_range = high_p - low_p
+        is_up = close_p >= open_p
+
+        if total_range <= 0.0001:
+            return "🟢 青陽漲" if is_up else "🔴 紅陰跌"
+
+        body = abs(close_p - open_p)
+        upper_wick = high_p - max(open_p, close_p)
+        lower_wick = min(open_p, close_p) - low_p
+
+        if body <= total_range * 0.15:
+            return "🟢 十字漲 ⚖️" if is_up else "🔴 十字跌 ⚖️"
+
+        if body >= 0.75 * total_range:
+            return "🟢 大陽衝鋒 🚀" if is_up else "🔴 大陰破位 💥"
+
+        if lower_wick >= 1.3 * upper_wick and lower_wick >= 0.30 * total_range:
+            return "🟢 鐵錘漲 🔨" if is_up else "🔴 吊頸跌 🪓"
+
+        if upper_wick >= 1.3 * lower_wick and upper_wick >= 0.30 * total_range:
+            return "🟢 倒錘漲 🛸" if is_up else "🔴 射星跌 🌠"
+
+        return "🟢 青陽漲" if is_up else "🔴 紅陰跌"
+
     def fetch_opend_5m(self, code: str) -> pd.DataFrame:
         """獲取 OpenD 5M 數據"""
         target = "CC.BTCUSD" if "BTC" in code.upper() else code
@@ -37,9 +64,8 @@ class AuditComparatorPlugin:
         return pd.DataFrame()
 
     def fetch_tiingo_5m(self, symbol: str) -> pd.DataFrame:
-        """從 Tiingo IEX API 獲取真實 5M 數據"""
+        """從 Tiingo IEX / Crypto API 獲取真實 5M 數據"""
         ticker = "BTCUSD" if "BTC" in symbol.upper() else "QQQ"
-        # 加密貨幣走 Tiingo Crypto，美股走 IEX
         if "BTC" in symbol.upper():
             url = f"https://api.tiingo.com/tiingo/crypto/prices?tickers=btcusd&interval=5min&token={self.tiingo_token}"
         else:
@@ -61,7 +87,7 @@ class AuditComparatorPlugin:
                     df = df[['time_key', 'open', 'close', 'high', 'low', 'volume']].dropna()
                     return df.sort_values('time_key').reset_index(drop=True)
         except Exception as e:
-            st.caption(f"Tiingo 連線提示: {e}")
+            st.caption(f"Tiingo 通道提示: {e}")
         return pd.DataFrame()
 
     def fetch_yfinance_5m(self, symbol: str) -> pd.DataFrame:
@@ -89,69 +115,89 @@ class AuditComparatorPlugin:
 
     def render_audit_dashboard(self, code: str):
         st.markdown("### 🔍 多源數據真偽交叉審核艙 (Data Audit Engine)")
-        st.caption("同時比對 OpenD（富途實盤）、Tiingo（IEX 機構源）與 yfinance（公共源），逐根排查價差與時間漂移。")
+        st.caption("同時比對 OpenD（富途實盤）、Tiingo（IEX 機構源）與 yfinance（公共源），逐根標註 K 線顏色形態並計算偏差。")
 
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.info("📡 源 1: Moomoo OpenD (本地網關)")
-        with col2:
-            st.info("🌐 源 2: Tiingo API (IEX 專屬通道)")
-        with col3:
-            st.info("🟡 源 3: Yahoo Finance (備援通道)")
+        c1, c2, c3 = st.columns(3)
+        c1.info("📡 源 1: Moomoo OpenD (本地網關)")
+        c2.info("🌐 源 2: Tiingo API (IEX 專屬通道)")
+        c3.info("🟡 源 3: Yahoo Finance (備援通道)")
 
-        with st.spinner("正在對齊三方數據源..."):
+        with st.spinner("正在對齊三方數據源與形態計算..."):
             df_open = self.fetch_opend_5m(code)
             df_tiin = self.fetch_tiingo_5m(code)
             df_yf = self.fetch_yfinance_5m(code)
 
-        # 構建對比表
+        base_df = df_open.tail(6) if not df_open.empty else (df_tiin.tail(6) if not df_tiin.empty else df_yf.tail(6))
+
+        if base_df.empty:
+            st.error("❌ 三大數據源暫時無法連接，請檢查網絡或 OpenD 網關狀態。")
+            return
+
         rows = []
         audit_log = []
         now_et = datetime.datetime.now(tz_ny).strftime('%H:%M:%S')
 
-        # 以 OpenD 的最近 5 根為基準時間軸
-        base_df = df_open.tail(5) if not df_open.empty else (df_tiin.tail(5) if not df_tiin.empty else df_yf.tail(5))
-
-        if base_df.empty:
-            st.error("❌ 三大數據源暫時無法連接，請檢查網絡。")
-            return
-
-        for _, base_row in base_df.iterrows():
+        for _, base_row in base_df.iloc[::-1].iterrows():
             t = base_row['time_key']
             t_str = t.strftime('%H:%M')
 
-            # 抓取各源在該時段的 Close
-            p_open = df_open[df_open['time_key'] == t]['close'].values[0] if (not df_open.empty and len(df_open[df_open['time_key'] == t]) > 0) else None
-            p_tiin = df_tiin[df_tiin['time_key'] == t]['close'].values[0] if (not df_tiin.empty and len(df_tiin[df_tiin['time_key'] == t]) > 0) else None
-            p_yf = df_yf[df_yf['time_key'] == t]['close'].values[0] if (not df_yf.empty and len(df_yf[df_yf['time_key'] == t]) > 0) else None
+            # 1. OpenD 提取
+            row_o = df_open[df_open['time_key'] == t] if not df_open.empty else pd.DataFrame()
+            if not row_o.empty:
+                o_c, o_o, o_h, o_l = float(row_o['close'].values[0]), float(row_o['open'].values[0]), float(row_o['high'].values[0]), float(row_o['low'].values[0])
+                shape_open = self.classify_candle(o_o, o_h, o_l, o_c)
+                str_open = f"${o_c:,.2f} [{shape_open}]"
+            else:
+                o_c, str_open, shape_open = None, "無數據", "--"
 
+            # 2. Tiingo 提取
+            row_t = df_tiin[df_tiin['time_key'] == t] if not df_tiin.empty else pd.DataFrame()
+            if not row_t.empty:
+                t_c, t_o, t_h, t_l = float(row_t['close'].values[0]), float(row_t['open'].values[0]), float(row_t['high'].values[0]), float(row_t['low'].values[0])
+                shape_tiin = self.classify_candle(t_o, t_h, t_l, t_c)
+                str_tiin = f"${t_c:,.2f} [{shape_tiin}]"
+            else:
+                t_c, str_tiin, shape_tiin = None, "無數據", "--"
+
+            # 3. yfinance 提取
+            row_y = df_yf[df_yf['time_key'] == t] if not df_yf.empty else pd.DataFrame()
+            if not row_y.empty:
+                y_c, y_o, y_h, y_l = float(row_y['close'].values[0]), float(row_y['open'].values[0]), float(row_y['high'].values[0]), float(row_y['low'].values[0])
+                shape_yf = self.classify_candle(y_o, y_h, y_l, y_c)
+                str_yf = f"${y_c:,.2f} [{shape_yf}]"
+            else:
+                y_c, str_yf, shape_yf = None, "無數據", "--"
+
+            # 偏差分析
             diff_str = "--"
-            if p_open and p_tiin:
-                diff = abs(p_open - p_tiin)
+            if o_c and t_c:
+                diff = abs(o_c - t_c)
                 diff_str = f"±${diff:.2f}" if diff < 1.0 else f"⚠️ 差 ${diff:.2f}"
 
             rows.append({
                 "時段 (ET)": t_str,
-                "OpenD 現價": f"${p_open:,.2f}" if p_open else "無數據",
-                "Tiingo IEX": f"${p_tiin:,.2f}" if p_tiin else "無數據",
-                "yfinance": f"${p_yf:,.2f}" if p_yf else "無數據",
-                "OpenD vs Tiingo 價差": diff_str
+                "OpenD (富途實盤)": str_open,
+                "Tiingo IEX": str_tiin,
+                "yfinance": str_yf,
+                "OpenD vs Tiingo 偏差": diff_str
             })
 
-            audit_log.append(f"• {t_str} ET | OpenD: {p_open} | Tiingo: {p_tiin} | yf: {p_yf} | 偏差: {diff_str}")
+            audit_log.append(f"• {t_str} ET | OpenD: {str_open} | Tiingo: {str_tiin} | yf: {str_yf} | 偏差: {diff_str}")
 
+        # 渲染審核表格
         df_table = pd.DataFrame(rows)
         st.dataframe(df_table, use_container_width=True, hide_index=True)
 
-        # 輸出審核日誌代碼塊
+        # 輸出帶形態柱體的 Logs 文本框
         now_my = datetime.datetime.now(tz_my).strftime('%Y-%m-%d %H:%M:%S MYT')
         log_text = f"=== 數據跨源交叉審核日誌 (CROSS-SOURCE AUDIT) ===\n"
         log_text += f"• 審核時間: {now_my} (美東: {now_et} ET)\n"
-        log_text += f"• 標的代碼: {code} | Tiingo 通道: 啟用\n"
-        log_text += f"\n[5M 時序逐根對齊]\n"
+        log_text += f"• 標的代碼: {code} | 形態檢驗: 啟用\n"
+        log_text += f"\n[5M 時序逐根對齊 (含 K 線柱體顏色標籤)]\n"
         for l in audit_log:
             log_text += f"{l}\n"
         log_text += f"==============================================\n"
 
-        st.caption("📋 交叉審核日誌 (一鍵複製)：")
+        st.markdown("<div style='margin-top: 15px;'></div>", unsafe_allow_html=True)
+        st.caption("📋 交叉審核日誌 (含柱體標籤 - 右上角一鍵複製)：")
         st.code(log_text, language="text")
