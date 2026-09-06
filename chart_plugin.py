@@ -1,5 +1,5 @@
 # 文件名: chart_plugin.py
-# 核心特性: get_cur_kline 獲取真實 60 根當前 5M 柱 + 毫秒級 Snapshot 現價推進 + 無縫時序對齊
+# 核心特性: 物理時間門禁 (徹底剔除未走完動態柱) + 毫秒級 Snapshot 現價動態推進 + 零時序重疊
 
 import os
 import sys
@@ -54,7 +54,7 @@ class ChartPlugin:
         self.data_dir = data_dir
 
     def fetch_real_cur_5m(self, code: str) -> pd.DataFrame:
-        """【真理數據源】調用 get_cur_kline 獲取當前真實 60 根 5M 柱 (自帶真實 High/Low/Volume)"""
+        """調用 get_cur_kline 獲取當前真實 60 根 5M 柱"""
         ctx = MarketDataEngine.get_context()
         target_symbol = "CC.BTCUSD" if "BTC" in code.upper() else code
         if ctx:
@@ -176,7 +176,7 @@ class ChartPlugin:
         return bar_data['open'], bar_data['high'], bar_data['low'], bar_data['close']
 
     def render_cockpit(self, code: str, budget_usd: float = 200.0):
-        # 1. 抓取真實 5M 歷史與即時快照
+        # 1. 獲取數據
         df_5m_all = self.fetch_real_cur_5m(code)
         snap, status_msg = self.get_realtime_snapshot(code)
         df_day = self.load_cold_data(code, "DAY")
@@ -210,17 +210,16 @@ class ChartPlugin:
             st.info(f"⚙️ 後台狀態: {status_msg}")
             return
 
-        # 2. 策略大腦計算
+        # 2. 策略計算
         trend_bias, trend_text, pdh_line, pdl_line = StrategyEngine.evaluate_trend_bias(df_day, curr_price)
         df_5m_calc, raw_bull, raw_bear = StrategyEngine.evaluate_5m_signals(df_5m_all, trend_bias, pdh_line, pdl_line)
 
-        # 審核防禦：檢查最後一根是否為當前走動中的柱子，若是則剔除，確保歷史行只顯示已閉合定格的柱子
-        last_k_time = pd.to_datetime(df_5m_calc['time_key'].iloc[-1]).strftime('%H:%M')
-        if last_k_time == live_slot_str and len(df_5m_calc) > 5:
-            closed_df = df_5m_calc.iloc[:-1]
-        else:
-            closed_df = df_5m_calc
+        # ─── 核心防禦：物理時間門禁 (徹底剔除當前走動中的未閉合棒線) ───
+        naive_cur_slot = cur_slot_time.replace(tzinfo=None)
+        # 凡是時間戳大於等於當前 5M 開始時間的，一律排除在歷史收盤表之外
+        closed_df = df_5m_calc[pd.to_datetime(df_5m_calc['time_key']) < naive_cur_slot].copy()
 
+        # 取最近 5 根已閉合定格的歷史柱
         closed_bars_5 = closed_df.tail(5).iloc[::-1].copy().reset_index(drop=True)
 
         table1_rows = []
@@ -253,7 +252,7 @@ class ChartPlugin:
 
         audit_bars_log.append(f"• {live_slot_str} ⚡ LIVE  | 現價: ${curr_price:,.2f} ({flash_sym}) [{live_shape}] | 當根極值: {live_h:.2f}/{live_l:.2f} | 狀態: 即時撮合動態推進")
 
-        # ─── 第 2~6 行：已收盤定格行 ───
+        # ─── 第 2~6 行：已收盤定格歷史行 ───
         for idx, row in closed_bars_5.iterrows():
             t_str = pd.to_datetime(row['time_key']).strftime('%H:%M')
             o, c, h, l, v = float(row['open']), float(row['close']), float(row['high']), float(row['low']), float(row['volume'])
@@ -364,7 +363,7 @@ class ChartPlugin:
             """
         ):
             st.markdown(f"📶 通道: **{snap['source']}** | 撮合時間: **{snap['server_time']} ET** | 延遲: **{snap['latency_ms']} ms** | 宏觀方向: **{trend_text}**")
-            st.caption(f"⚙️ 狀態: `{status_msg}` | 🎯 當前真實 5M 連續時序已對齊")
+            st.caption(f"⚙️ 狀態: `{status_msg}` | 🎯 時序門禁已校準，零重複、零幽靈柱")
 
         # ====== 表 1 ======
         st.markdown("##### 📊 表 1：5M 即時量價核心表 (黃金 30 分鐘滾動窗口)")
