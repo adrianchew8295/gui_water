@@ -1,5 +1,5 @@
 # 文件名: strategy_engine.py
-# 核心職責: 【獨立策略大腦】非青即紅 (純粹 🟢 漲 / 🔴 跌 雙色標準，徹底剔除灰色)
+# 核心職責: 【獨立策略大腦】雙重判定對齊 K 線顏色 + 多空對稱形態分類 + 0DTE 智能換算
 
 import numpy as np
 import pandas as pd
@@ -45,38 +45,46 @@ class StrategyEngine:
         return setup_type
 
     @staticmethod
-    def classify_candle_shape(open_p: float, high_p: float, low_p: float, close_p: float) -> str:
+    def classify_candle_shape(open_p: float, high_p: float, low_p: float, close_p: float, prev_close: float = None) -> str:
         """
-        【純粹雙色 K 線形態解剖】
-        🟢 青色 (收盤 >= 開盤 / 多頭偏向) | 🔴 紅色 (收盤 < 開盤 / 空頭偏向)
+        【雙重判定 K 線解剖與顏色對齊】
+        若 High == Low (歷史點位)，自動比對 prev_close 判定紅綠
         """
         total_range = high_p - low_p
-        is_up = close_p >= open_p  # 平盤或收陽一律歸為青色
 
+        # 1. 處理缺乏振幅的歷史點位 (與上一根收盤價對比)
         if total_range <= 0.0001:
-            return "🟢 十字漲 ⚖️" if is_up else "🔴 十字跌 ⚖️"
+            if prev_close is not None and prev_close > 0:
+                if close_p < prev_close:
+                    return "🔴 紅陰跌"
+                elif close_p > prev_close:
+                    return "🟢 青陽漲"
+            return "🟢 青陽漲" if close_p >= open_p else "🔴 紅陰跌"
 
         body = abs(close_p - open_p)
         upper_wick = high_p - max(open_p, close_p)
         lower_wick = min(open_p, close_p) - low_p
+        is_up = close_p >= open_p
 
-        # 1. 實體極窄 (≤ 15% 振幅) -> 長腿十字星 (依收盤歸為青十字或紅十字)
+        # 2. 實體極窄 (≤ 15% 振幅) -> 長腿十字星
         if body <= total_range * 0.15:
+            if prev_close is not None and prev_close > 0:
+                return "🔴 十字跌 ⚖️" if close_p < prev_close else "🟢 十字漲 ⚖️"
             return "🟢 十字漲 ⚖️" if is_up else "🔴 十字跌 ⚖️"
 
-        # 2. 長上影線形態 (上影線 ≥ 2 倍實體)
+        # 3. 長上影線形態 (上影線 ≥ 2 倍實體)
         if upper_wick >= 2.0 * body and lower_wick <= 0.20 * total_range:
             return "🟢 倒錘漲 🛸" if is_up else "🔴 射星跌 🌠"
 
-        # 3. 長下影線形態 (下影線 ≥ 2 倍實體)
+        # 4. 長下影線形態 (下影線 ≥ 2 倍實體)
         if lower_wick >= 2.0 * body and upper_wick <= 0.20 * total_range:
             return "🟢 鐵錘漲 🔨" if is_up else "🔴 吊頸跌 🪓"
 
-        # 4. 實體大陽 / 大陰 (實體佔比 ≥ 75%)
+        # 5. 實體大陽 / 大陰 (實體佔比 ≥ 75%)
         if body >= 0.75 * total_range:
             return "🟢 大陽衝鋒 🚀" if is_up else "🔴 大陰破位 💥"
 
-        # 5. 常規常態 K 線
+        # 6. 常規 K 線
         return "🟢 青陽漲" if is_up else "🔴 紅陰跌"
 
     @staticmethod
@@ -113,7 +121,6 @@ class StrategyEngine:
         llv5 = df['low'].rolling(5).min().shift(1).bfill()
         hhv5 = df['high'].rolling(5).max().shift(1).bfill()
 
-        # 2B 假突破 (RAW 形態)
         bull_2b_raw = ((df['low'] < llv5) | (df['low'] < pdl_line)) & (df['close'] > llv5) & (df['close'] >= df['open'])
         bear_2b_raw = ((df['high'] > hhv5) | (df['high'] > pdh_line)) & (df['close'] < hhv5) & (df['close'] < df['open'])
 
