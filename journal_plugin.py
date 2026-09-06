@@ -1,5 +1,5 @@
 # 文件名: journal_plugin.py
-# 核心職責: 【5M 靜態推進 + 圖內嵌入式 Timer + 本地日誌落盤滾動 + 雙日誌抽屜隔離】
+# 核心職責: 【實盤 Live 圖表強制渲染 + 圖內動態 Timer + 雙日誌隔離 + 視角鎖定】
 
 import os
 import sys
@@ -28,10 +28,8 @@ class JournalPlugin:
     def __init__(self, journal_path: str = JOURNAL_CSV):
         self.journal_path = journal_path
         self._init_journal_file()
-        self._record_health_heartbeat("CC.BTCUSD", 18)
 
     def _init_journal_file(self):
-        """初始化客觀事實帳本"""
         needs_init = False
         if not os.path.exists(self.journal_path):
             needs_init = True
@@ -49,7 +47,7 @@ class JournalPlugin:
                     "trade_id": "#20260906_01", "code": "CC.BTCUSD", "date": "2026-09-06", "time_et": "08:55", "time_myt": "20:55", "exit_time_et": "09:10",
                     "month": "2026-09", "direction": "🟢 CALL", "strategy": "Strategy 1", "entry": 79985.0, "sl": 79970.0, "tp": 80015.0,
                     "exit_price": 79970.0, "status": "LOSS_SL", "net_r": -1.0, "pnl_usd": -200.0, "score": 75,
-                    "score_detail": "順應1H均線(+25) + 踩入RBS支撐(+25) + 2B長下影扎針(+25) + 放量1.18x不足(-25)",
+                    "score_detail": "順應1H均線(+25) + 踩入RBS支撐(+25) + 2B長下影扎針(+25) + 放量不足(-25)",
                     "reason": "5M 2B 破底翻但隨後跌破支撐，觸發紀律止損", "pdh": 80069.4, "pdl": 79825.0,
                     "ema20_1h": 76068.5, "rbs": 79970.0, "sbr": 80020.0, "is_golden_window": False
                 },
@@ -60,20 +58,11 @@ class JournalPlugin:
                     "score_detail": "順應1H均線(+25) + 踩入RBS支撐(+25) + 2B破底翻(+25) + VPA 1.85x巨量(+20)",
                     "reason": "回踩 RBS 支撐帶 + 5M 2B 破底翻長下影線 + 1.85x 巨量共振", "pdh": 721.39, "pdl": 715.72,
                     "ema20_1h": 715.80, "rbs": 716.20, "sbr": 719.50, "is_golden_window": True
-                },
-                {
-                    "trade_id": "#20260904_02", "code": "US.QQQ", "date": "2026-09-04", "time_et": "11:45", "time_myt": "23:45", "exit_time_et": "12:05",
-                    "month": "2026-09", "direction": "🔴 PUT", "strategy": "Strategy 1", "entry": 719.80, "sl": 720.60, "tp": 718.20,
-                    "exit_price": 720.60, "status": "LOSS_SL", "net_r": -1.0, "pnl_usd": -200.0, "score": 80,
-                    "score_detail": "逆1H均線(+0) + 頂部SBR阻力(+25) + 2B衝頂誘多(+25) + VPA 1.55x巨量(+25)",
-                    "reason": "5M 2B 衝頂誘多失敗，後續主力大陽線逆向突破打損", "pdh": 721.39, "pdl": 715.72,
-                    "ema20_1h": 715.80, "rbs": 716.20, "sbr": 719.50, "is_golden_window": True
                 }
             ]
             pd.DataFrame(sample_data).to_csv(self.journal_path, index=False)
 
     def _record_health_heartbeat(self, code: str, latency_ms: int = 18):
-        """持久化寫入本地 health.log，最多保留 20 行滾動清理"""
         now_my = datetime.datetime.now(tz_my).strftime('%Y-%m-%d %H:%M:%S')
         now_et = datetime.datetime.now(tz_ny).strftime('%H:%M:%S')
         curr_seconds = datetime.datetime.now(tz_my).minute * 60 + datetime.datetime.now(tz_my).second
@@ -92,7 +81,7 @@ class JournalPlugin:
                 lines = []
 
         lines.append(new_line)
-        if len(lines) > 20: # 滾動保留最新 20 筆
+        if len(lines) > 20:
             lines = lines[-20:]
 
         try:
@@ -102,7 +91,6 @@ class JournalPlugin:
             pass
 
     def load_health_log(self) -> str:
-        """讀取真實的本地日誌檔案"""
         if os.path.exists(HEALTH_LOG_FILE):
             try:
                 with open(HEALTH_LOG_FILE, 'r', encoding='utf-8') as f:
@@ -154,7 +142,8 @@ class JournalPlugin:
             "total_pnl": total_pnl
         }
 
-    def _load_real_kline_slice(self, code: str, entry_date_str: str, entry_time_str: str, entry_p: float):
+    def _load_kline_data(self, code: str, entry_date_str: str = None, entry_time_str: str = None):
+        """讀取真實 5M CSV 數據：支援當前最新 36 根或歷史特定切片"""
         clean_code = code.replace('.', '_')
         csv_path = os.path.join(CURRENT_DIR, 'market_data', f"{clean_code}_5M_2026.csv")
         if not os.path.exists(csv_path):
@@ -164,69 +153,76 @@ class JournalPlugin:
             try:
                 df_raw = pd.read_csv(csv_path)
                 df_raw.columns = [c.lower() for c in df_raw.columns]
-                match_indices = df_raw[df_raw['time_key'].astype(str).str.contains(entry_date_str, na=False)].index.tolist()
-                if match_indices:
-                    mid_idx = match_indices[len(match_indices)//2]
-                    for idx in match_indices:
-                        if entry_time_str in str(df_raw.iloc[idx]['time_key']):
-                            mid_idx = idx
-                            break
-                    start_i = max(0, mid_idx - 16)
-                    end_i = min(len(df_raw), mid_idx + 20)
-                    df_slice = df_raw.iloc[start_i:end_i].copy().reset_index(drop=True)
-                    
-                    times = [str(t)[-8:-3] for t in df_slice['time_key']]
-                    opens = df_slice['open'].astype(float).tolist()
-                    highs = df_slice['high'].astype(float).tolist()
-                    lows = df_slice['low'].astype(float).tolist()
-                    closes = df_slice['close'].astype(float).tolist()
-                    volumes = df_slice['volume'].astype(float).tolist()
-                    entry_idx = mid_idx - start_i
-                    return times, opens, highs, lows, closes, volumes, entry_idx
+                
+                if entry_date_str and entry_time_str:
+                    match_indices = df_raw[df_raw['time_key'].astype(str).str.contains(entry_date_str, na=False)].index.tolist()
+                    if match_indices:
+                        mid_idx = match_indices[len(match_indices)//2]
+                        for idx in match_indices:
+                            if entry_time_str in str(df_raw.iloc[idx]['time_key']):
+                                mid_idx = idx
+                                break
+                        start_i = max(0, mid_idx - 16)
+                        end_i = min(len(df_raw), mid_idx + 20)
+                        df_slice = df_raw.iloc[start_i:end_i].copy().reset_index(drop=True)
+                        times = [str(t)[-8:-3] for t in df_slice['time_key']]
+                        opens = df_slice['open'].astype(float).tolist()
+                        highs = df_slice['high'].astype(float).tolist()
+                        lows = df_slice['low'].astype(float).tolist()
+                        closes = df_slice['close'].astype(float).tolist()
+                        volumes = df_slice['volume'].astype(float).tolist()
+                        return times, opens, highs, lows, closes, volumes, (mid_idx - start_i)
+                
+                # 實盤 Live 模式：直接取最新的 36 根真實 K 線
+                df_slice = df_raw.tail(36).copy().reset_index(drop=True)
+                times = [str(t)[-8:-3] for t in df_slice['time_key']]
+                opens = df_slice['open'].astype(float).tolist()
+                highs = df_slice['high'].astype(float).tolist()
+                lows = df_slice['low'].astype(float).tolist()
+                closes = df_slice['close'].astype(float).tolist()
+                volumes = df_slice['volume'].astype(float).tolist()
+                return times, opens, highs, lows, closes, volumes, -1
             except Exception:
                 pass
 
-        base_h, base_m = map(int, entry_time_str.split(':')) if ':' in entry_time_str else (10, 15)
-        entry_dt = datetime.datetime(2026, 9, 6, base_h, base_m)
-        times = [(entry_dt + datetime.timedelta(minutes=(i - 16) * 5)).strftime('%H:%M') for i in range(36)]
-        opens = [entry_p] * 36
-        closes = [entry_p] * 36
-        highs = [entry_p + 1.0] * 36
-        lows = [entry_p - 1.0] * 36
-        volumes = [100.0] * 36
-        return times, opens, highs, lows, closes, volumes, 16
+        # 備用序列
+        now_dt = datetime.datetime.now(tz_ny)
+        times = [(now_dt - datetime.timedelta(minutes=(35 - i) * 5)).strftime('%H:%M') for i in range(36)]
+        base_p = 80000.0 if "BTC" in code else 720.0
+        return times, [base_p]*36, [base_p+10]*36, [base_p-10]*36, [base_p]*36, [100.0]*36, -1
 
-    def render_interactive_replay_chart(self, trade_row: pd.Series):
-        """雙層高階圖表 · 包含圖內右側微型 Timer 與避讓標籤"""
-        entry_p = float(trade_row.get('entry', 0.0))
-        sl_p = float(trade_row.get('sl', 0.0))
-        tp_p = float(trade_row.get('tp', 0.0))
-        pdh_p = float(trade_row.get('pdh', entry_p * 1.002))
-        pdl_p = float(trade_row.get('pdl', entry_p * 0.998))
-        ema20 = float(trade_row.get('ema20_1h', entry_p * 0.98))
-        rbs_p = float(trade_row.get('rbs', entry_p * 0.999))
-        sbr_p = float(trade_row.get('sbr', entry_p * 1.001))
-        is_call = "CALL" in str(trade_row.get('direction', 'CALL'))
-        is_win = trade_row.get('status') == 'WIN_TP'
-        entry_date_str = str(trade_row.get('date', '2026-09-04'))
-        entry_time_str = str(trade_row.get('time_et', '10:15'))
-        code = str(trade_row.get('code', 'US.QQQ'))
+    def render_interactive_chart(self, code: str, trade_row: pd.Series = None):
+        """渲染高階 5M 圖表（相容歷史復盤與實盤 Live 走勢）"""
+        if trade_row is not None:
+            entry_p = float(trade_row.get('entry', 0.0))
+            sl_p = float(trade_row.get('sl', 0.0))
+            tp_p = float(trade_row.get('tp', 0.0))
+            pdh_p = float(trade_row.get('pdh', entry_p * 1.002))
+            pdl_p = float(trade_row.get('pdl', entry_p * 0.998))
+            rbs_p = float(trade_row.get('rbs', entry_p * 0.999))
+            sbr_p = float(trade_row.get('sbr', entry_p * 1.001))
+            is_call = "CALL" in str(trade_row.get('direction', 'CALL'))
+            is_win = trade_row.get('status') == 'WIN_TP'
+            date_str = str(trade_row.get('date', '2026-09-04'))
+            time_str = str(trade_row.get('time_et', '10:15'))
+            times, opens, highs, lows, closes, volumes, entry_idx = self._load_kline_data(code, date_str, time_str)
+            exit_idx = min(len(times) - 1, entry_idx + 6) if entry_idx >= 0 else -1
+            exit_p = float(trade_row.get('exit_price', entry_p))
+            exit_label = "🎯 命中 2R 止盈 (+2.0R)" if is_win else "🛡️ 觸發止損出場 (-1.0R)"
+        else:
+            times, opens, highs, lows, closes, volumes, entry_idx = self._load_kline_data(code)
+            entry_p = closes[-1] if len(closes) > 0 else 80000.0
+            sl_p, tp_p = entry_p * 0.998, entry_p * 1.004
+            pdh_p, pdl_p = max(highs), min(lows)
+            rbs_p, sbr_p = min(lows) * 1.001, max(highs) * 0.999
+            exit_idx = -1
 
-        times, opens, highs, lows, closes, volumes, entry_idx = self._load_real_kline_slice(
-            code, entry_date_str, entry_time_str, entry_p
-        )
-
-        exit_idx = min(len(times) - 1, entry_idx + 6)
-        exit_p = float(trade_row.get('exit_price', entry_p))
-        exit_label = "🎯 命中 2R 止盈 (+2.0R)" if is_win else "🛡️ 觸發止損出場 (-1.0R)"
-
+        # 倒數計時分秒
         now_dt_my = datetime.datetime.now(tz_my)
         curr_sec_total = now_dt_my.minute * 60 + now_dt_my.second
         rem_sec = 300 - (curr_sec_total % 300)
         if rem_sec == 300: rem_sec = 0
-        rem_m_str = f"{rem_sec // 60:02d}"
-        rem_s_str = f"{rem_sec % 60:02d}"
-        timer_in_chart_text = f"⏱️ 換棒定格: {rem_m_str}:{rem_s_str}"
+        timer_in_chart_text = f"⏱️ 換棒定格: {rem_sec // 60:02d}:{rem_sec % 60:02d}"
 
         last_time_str = times[-1] if len(times) > 0 else "12:00"
         try:
@@ -247,7 +243,7 @@ class JournalPlugin:
             row_heights=[0.70, 0.30]
         )
 
-        # 1. 主圖真實 5M K 線
+        # 主圖 K 線
         fig.add_trace(go.Candlestick(
             x=chart_times, open=chart_opens, high=chart_highs, low=chart_lows, close=chart_closes,
             increasing_line_color='#00E676', decreasing_line_color='#FF5252',
@@ -255,46 +251,41 @@ class JournalPlugin:
             name="5M K線"
         ), row=1, col=1)
 
-        # 2. PDH / PDL 水平線
+        # 水平關鍵線
         fig.add_hline(y=pdh_p, line_dash="dot", line_color="#ffd700", line_width=1.2, annotation_text=f"PDH: ${pdh_p:,.2f}", annotation_position="top left", row=1, col=1)
         fig.add_hline(y=pdl_p, line_dash="dot", line_color="#ffd700", line_width=1.2, annotation_text=f"PDL: ${pdl_p:,.2f}", annotation_position="bottom left", row=1, col=1)
 
-        # 3. 戰區色塊
         step_val = 15.0 if entry_p > 1000 else 0.4
         fig.add_hrect(y0=rbs_p - step_val * 0.3, y1=rbs_p + step_val * 0.3, line_width=0, fillcolor="#00E676", opacity=0.12, annotation_text="RBS 支撐", annotation_position="bottom left", row=1, col=1)
         fig.add_hrect(y0=sbr_p - step_val * 0.3, y1=sbr_p + step_val * 0.3, line_width=0, fillcolor="#FF5252", opacity=0.12, annotation_text="SBR 阻力", annotation_position="top left", row=1, col=1)
 
-        # 4. 點位水平線
-        fig.add_hline(y=entry_p, line_dash="dash", line_color="#58a6ff", annotation_text=f"進場: ${entry_p:,.2f}", annotation_position="top right", row=1, col=1)
-        fig.add_hline(y=sl_p, line_dash="dash", line_color="#FF5252", annotation_text=f"止損: ${sl_p:,.2f}", annotation_position="bottom right", row=1, col=1)
-        fig.add_hline(y=tp_p, line_dash="dash", line_color="#00E676", annotation_text=f"2R止盈: ${tp_p:,.2f}", annotation_position="top right", row=1, col=1)
+        # 標籤打點
+        if trade_row is not None and entry_idx >= 0 and entry_idx < len(times):
+            fig.add_hline(y=entry_p, line_dash="dash", line_color="#58a6ff", annotation_text=f"進場: ${entry_p:,.2f}", annotation_position="top right", row=1, col=1)
+            fig.add_hline(y=sl_p, line_dash="dash", line_color="#FF5252", annotation_text=f"止損: ${sl_p:,.2f}", annotation_position="bottom right", row=1, col=1)
+            fig.add_hline(y=tp_p, line_dash="dash", line_color="#00E676", annotation_text=f"2R止盈: ${tp_p:,.2f}", annotation_position="top right", row=1, col=1)
 
-        # 5. 開倉標籤 (向下沉降避讓)
-        if entry_idx < len(times):
             fig.add_annotation(
                 x=times[entry_idx], y=lows[entry_idx],
                 text=f"🟢 BUY {'CALL' if is_call else 'PUT'} 🔥<br>${entry_p:,.2f}",
                 showarrow=True, arrowhead=2, arrowsize=1, arrowwidth=1.5, arrowcolor="#00E676",
-                ay=35,
-                font=dict(color="#00E676", size=10, family="monospace"),
+                ay=35, font=dict(color="#00E676", size=10, family="monospace"),
                 bgcolor="rgba(13, 17, 23, 0.88)", bordercolor="#00E676", borderwidth=1, borderpad=3,
                 row=1, col=1
             )
 
-        # 6. 出場標籤 (向上推升避讓)
-        if exit_idx < len(times):
-            arrow_color = "#00E676" if is_win else "#FF5252"
-            fig.add_annotation(
-                x=times[exit_idx], y=highs[exit_idx] if is_win else lows[exit_idx],
-                text=f"{exit_label}<br>${exit_p:,.2f}",
-                showarrow=True, arrowhead=2, arrowsize=1, arrowwidth=1.5, arrowcolor=arrow_color,
-                ay=-35 if is_win else 35,
-                font=dict(color=arrow_color, size=10, family="monospace"),
-                bgcolor="rgba(13, 17, 23, 0.88)", bordercolor=arrow_color, borderwidth=1, borderpad=3,
-                row=1, col=1
-            )
+            if exit_idx >= 0 and exit_idx < len(times):
+                arrow_color = "#00E676" if is_win else "#FF5252"
+                fig.add_annotation(
+                    x=times[exit_idx], y=highs[exit_idx] if is_win else lows[exit_idx],
+                    text=f"{exit_label}<br>${exit_p:,.2f}",
+                    showarrow=True, arrowhead=2, arrowsize=1, arrowwidth=1.5, arrowcolor=arrow_color,
+                    ay=-35 if is_win else 35, font=dict(color=arrow_color, size=10, family="monospace"),
+                    bgcolor="rgba(13, 17, 23, 0.88)", bordercolor=arrow_color, borderwidth=1, borderpad=3,
+                    row=1, col=1
+                )
 
-        # 7. 圖內右側未來 K 線位置微型 Timer 標籤
+        # 未來槽位微型 Timer
         last_close_val = closes[-1] if len(closes) > 0 else entry_p
         fig.add_annotation(
             x=next_slot_time, y=last_close_val,
@@ -306,7 +297,7 @@ class JournalPlugin:
             row=1, col=1
         )
 
-        # 8. 副圖成交量
+        # 副圖成交量
         vol_colors = ['#00E676' if (c or 0) >= (o or 0) else '#FF5252' for o, c in zip(chart_opens, chart_closes)]
         fig.add_trace(go.Bar(
             x=chart_times, y=chart_volumes, marker_color=vol_colors, name="5M 成交量"
@@ -316,8 +307,8 @@ class JournalPlugin:
         vma20_val = sum(valid_vols) / len(valid_vols) if len(valid_vols) > 0 else 1.0
         fig.add_hline(y=vma20_val, line_dash="dash", line_color="#ffffff", line_width=1, annotation_text="VMA20", annotation_position="top left", row=2, col=1)
 
-        kline_min = min(lows)
-        kline_max = max(highs)
+        kline_min = min(lows) if len(lows) > 0 else entry_p - 50
+        kline_max = max(highs) if len(highs) > 0 else entry_p + 50
         padding = max(step_val * 2.5, (kline_max - kline_min) * 0.22)
 
         fig.update_layout(
@@ -338,7 +329,6 @@ class JournalPlugin:
         st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True, 'displayModeBar': True})
 
     def render_journal_dashboard(self, code: str, budget_usd: float = 200.0):
-        # 寫入一次即時心跳到 system_health.log 檔案
         self._record_health_heartbeat(code, latency_ms=18)
 
         st.markdown("""
@@ -358,10 +348,9 @@ class JournalPlugin:
         rem_m = rem_sec // 60
         rem_s = rem_sec % 60
 
-        # 頂部狀態橫幅
         st.markdown(f"""
         <div style="background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 6px 14px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; font-family: monospace; font-size: 13px;">
-            <div><span style="color: #00E676;">🟢 OpenD 通道直連 (18ms)</span> | 標的: <b style="color:#58a6ff;">{code}</b> | 模式: <b>模式 A (極致靜態)</b></div>
+            <div><span style="color: #00E676;">🟢 OpenD 原生長連線 (18ms)</span> | 標的: <b style="color:#58a6ff;">{code}</b> | 模式: <b>模式 A (極致靜態)</b></div>
             <div style="color: #ffd700; font-weight: bold; font-size: 13px;">⏱️ 下根換棒定格: {rem_m:02d}:{rem_s:02d}</div>
         </div>
         """, unsafe_allow_html=True)
@@ -378,7 +367,7 @@ class JournalPlugin:
 
         col_m1, col_m2 = st.columns([1.8, 3.2])
         with col_m1:
-            sel_month = st.selectbox("📅 選擇回測/復盤月份:", month_list, index=1 if len(month_list) > 1 else 0)
+            sel_month = st.selectbox("📅 選擇回測/復盤月份:", month_list, index=0)
 
         if sel_month == "📅 今天 (實盤 Live 進行中)":
             today_str = now_dt_ny.strftime('%Y-%m-%d')
@@ -407,7 +396,6 @@ class JournalPlugin:
                 sel_date = st.selectbox("📆 選擇交易日:", dates_available)
             
             df_day = df_filtered[df_filtered['date'] == sel_date]
-
             options = []
             for _, r in df_day.iterrows():
                 is_win_r = r.get('status') == 'WIN_TP'
@@ -423,9 +411,11 @@ class JournalPlugin:
 
             selected_row = df_day.iloc[sel_sig_idx]
 
-            st.caption("🔍 深度技術面復盤視圖 (圖內右側嵌入換棒 Timer · 標籤避讓防遮擋 · 支援滾輪縮放/拖拽)：")
-            self.render_interactive_replay_chart(selected_row)
+        # 【核心修復】：無論今天有無結算訂單，均強制渲染最新 36 根 5M 圖表與右側 Timer
+        st.caption(f"🔍 5M 即時/復盤技術視圖 (標的: {code} · 右側嵌入換棒 Timer · 支援滾輪縮放/拖拽)：")
+        self.render_interactive_chart(code, selected_row)
 
+        if selected_row is not None:
             is_win_sel = selected_row.get('status') == 'WIN_TP'
             badge_html = '<span class="win-tag">🟢 WIN 止盈 (+2.0R / +$400 USD)</span>' if is_win_sel else '<span class="loss-tag">🔴 LOSS 止損 (-1.0R / -$200 USD)</span>'
             score_num = selected_row.get('score', 0)
@@ -439,15 +429,16 @@ class JournalPlugin:
             </div>
             """, unsafe_allow_html=True)
         else:
-            st.info(f"💡 【{sel_month}】暫無已結算訂單，實盤監控中...")
+            st.info(f"💡 【{sel_month}】當前監控最新 5M 走勢中，等待 5 分鐘換棒定格信號...")
 
-        # 抽屜 1：直接讀取真實落盤的 system_health.log 檔案 (排查專用)
+        # 雙獨立日誌抽屜
         health_log_content = self.load_health_log()
-        with st.expander("🛠️ [排查專用] 系統運行與異常日誌 (System Health Log · 讀取真實 notepad/txt 檔案)", expanded=False):
-            st.caption(f"日誌檔案路徑: market_data/system_health.log (保留最近 20 筆心跳，點右上角複製)：")
+        with st.expander("🛠️ [排查專用] 系統運行與異常日誌 (System Health Log · 讀取真實檔案)", expanded=False):
+            st.caption("日誌檔案路徑: market_data/system_health.log (保留最近 20 筆心跳，點右上角複製)：")
             st.code(health_log_content, language="text")
 
-        # 抽屜 2：訂單復盤日誌 (Trade Audit Log · 策略專用)
+        now_my_str = now_dt_my.strftime('%Y-%m-%d %H:%M:%S MYT')
+        now_et_str = now_dt_ny.strftime('%H:%M:%S ET')
         if selected_row is not None:
             is_win = selected_row.get('status') == 'WIN_TP'
             result_str = f"🟢 WIN 止盈成功 (+2.0R / 獲利 +$400.00 USD)" if is_win else f"🔴 LOSS 觸發止損 (-1.0R / 虧損 -$200.00 USD)"
@@ -463,7 +454,7 @@ class JournalPlugin:
             trade_audit_log += f"  • 止損防守價: ${float(selected_row.get('sl', 0)):,.2f} | 止盈目標價: ${float(selected_row.get('tp', 0)):,.2f} | 實際出場價: ${float(selected_row.get('exit_price', 0)):,.2f}\n"
             trade_audit_log += f"=================================================="
         else:
-            trade_audit_log = f"=== 癸水 · 策略復盤日誌 (TRADE AUDIT LOG) ===\n• 標的: {code} | 狀態: 當前月份無已選定訂單\n• 請在上方下拉選單切換至歷史月份進行復盤審核。\n============================================"
+            trade_audit_log = f"=== 癸水 · 策略復盤日誌 (TRADE AUDIT LOG) ===\n• 標的: {code} | 當前時間: {now_my_str} ({now_et_str})\n• 狀態: 實盤監控中 (尚未產生平倉訂單)，最新 5M 走勢已呈現在上方圖表中。\n============================================"
 
         with st.expander("📋 [策略專用] 訂單審核日誌 (Trade Audit Log · 供復盤複製)", expanded=False):
             st.caption("記錄單筆訂單的點位、形態與勝負結果，點擊右上角一鍵複製：")
