@@ -1,5 +1,5 @@
 # 文件名: journal_plugin.py
-# 核心職責: 【極致靜態 5M 看板 · 零閃爍 · 視角記憶鎖定 · 3小時走勢展示】
+# 核心職責: 【純前端零閃爍流暢 Timer + 5M 靜態鎖定 + 雙日誌隔離】
 
 import os
 import sys
@@ -9,6 +9,7 @@ import pytz
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
+import streamlit.components.v1 as components
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 if CURRENT_DIR not in sys.path:
@@ -49,6 +50,14 @@ class JournalPlugin:
                     "score_detail": "順應1H均線(+25) + 踩入RBS支撐(+25) + 2B長下影扎針(+25) + 放量不足(-25)",
                     "reason": "5M 2B 破底翻但隨後跌破支撐，觸發紀律止損", "pdh": 80069.4, "pdl": 79825.0,
                     "ema20_1h": 76068.5, "rbs": 79970.0, "sbr": 80020.0, "is_golden_window": False
+                },
+                {
+                    "trade_id": "#20260904_01", "code": "US.QQQ", "date": "2026-09-04", "time_et": "10:15", "time_myt": "22:15", "exit_time_et": "10:45",
+                    "month": "2026-09", "direction": "🟢 CALL", "strategy": "Strategy 1", "entry": 718.50, "sl": 717.30, "tp": 720.90,
+                    "exit_price": 720.90, "status": "WIN_TP", "net_r": 2.0, "pnl_usd": 400.0, "score": 95,
+                    "score_detail": "順應1H均線(+25) + 踩入RBS支撐(+25) + 2B破底翻(+25) + VPA 1.85x巨量(+20)",
+                    "reason": "回踩 RBS 支撐帶 + 5M 2B 破底翻長下影線 + 1.85x 巨量共振", "pdh": 721.39, "pdl": 715.72,
+                    "ema20_1h": 715.80, "rbs": 716.20, "sbr": 719.50, "is_golden_window": True
                 }
             ]
             pd.DataFrame(sample_data).to_csv(self.journal_path, index=False)
@@ -116,7 +125,6 @@ class JournalPlugin:
                 df_raw = pd.read_csv(csv_path)
                 df_raw.columns = [c.lower() for c in df_raw.columns]
                 
-                # 歷史切片
                 if entry_date_str and entry_time_str:
                     match_indices = df_raw[df_raw['time_key'].astype(str).str.contains(entry_date_str, na=False)].index.tolist()
                     if match_indices:
@@ -131,7 +139,6 @@ class JournalPlugin:
                         times = [str(t)[-8:-3] for t in df_slice['time_key']]
                         return times, df_slice['open'].astype(float).tolist(), df_slice['high'].astype(float).tolist(), df_slice['low'].astype(float).tolist(), df_slice['close'].astype(float).tolist(), df_slice['volume'].astype(float).tolist(), (mid_idx - start_i)
 
-                # 實盤展示最近 3 小時（36 根）
                 df_slice = df_raw.tail(36).copy().reset_index(drop=True)
                 times = [str(t)[-8:-3] for t in df_slice['time_key']]
                 return times, df_slice['open'].astype(float).tolist(), df_slice['high'].astype(float).tolist(), df_slice['low'].astype(float).tolist(), df_slice['close'].astype(float).tolist(), df_slice['volume'].astype(float).tolist(), -1
@@ -224,7 +231,7 @@ class JournalPlugin:
 
         fig.update_layout(
             height=460,
-            uirevision="static_viewport_lock",
+            uirevision="static_viewport_lock", # 鎖定視角，拖拽放大絕不跳動
             margin=dict(l=10, r=10, t=25, b=10),
             paper_bgcolor="#0d1117",
             plot_bgcolor="#0d1117",
@@ -249,15 +256,38 @@ class JournalPlugin:
         </style>
         """, unsafe_allow_html=True)
 
-        now_dt_my = datetime.datetime.now(tz_my)
-        now_dt_ny = datetime.datetime.now(tz_ny)
-
-        st.markdown(f"""
-        <div style="background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 6px 14px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; font-family: monospace; font-size: 13px;">
-            <div><span style="color: #00E676;">🟢 數據源: 富途 OpenD 官方原生 5M</span> | 標的: <b style="color:#58a6ff;">{code}</b></div>
-            <div style="color: #8b949e;">大馬: <b>{now_dt_my.strftime('%H:%M:%S')}</b> | 美東: <b>{now_dt_ny.strftime('%H:%M:%S')}</b></div>
+        # 【核心技術】：純前端獨立 HTML/JS 倒數計時容器（每秒流暢走動，0 網絡請求，0 畫面閃爍）
+        timer_component_html = f"""
+        <div style="background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 8px 14px; display: flex; justify-content: space-between; align-items: center; font-family: monospace; font-size: 13px; color: #c9d1d9;">
+            <div><span style="color: #00E676;">🟢 富途 OpenD 官方原生 5M</span> | 標的: <b style="color:#58a6ff;">{code}</b> | 模式: <b>模式 A (極致靜態)</b></div>
+            <div id="countdown_box" style="color: #ffd700; font-weight: bold; font-size: 14px;">⏱️ 下根換棒定格: 計算中...</div>
         </div>
-        """, unsafe_allow_html=True)
+        <script>
+        function updateCountdown() {{
+            var now = new Date();
+            var totalSec = now.getMinutes() * 60 + now.getSeconds();
+            var remSec = 300 - (totalSec % 300);
+            if (remSec === 300) remSec = 0;
+            var m = Math.floor(remSec / 60);
+            var s = remSec % 60;
+            var mStr = (m < 10 ? "0" : "") + m;
+            var sStr = (s < 10 ? "0" : "") + s;
+            var el = document.getElementById("countdown_box");
+            if (el) {{
+                el.innerHTML = "⏱️ 下根換棒定格: " + mStr + ":" + sStr;
+            }}
+            // 當倒數歸零時，精確觸發一次平滑推進
+            if (remSec === 0) {{
+                setTimeout(function() {{
+                    window.parent.location.reload();
+                }}, 1500);
+            }}
+        }}
+        setInterval(updateCountdown, 1000);
+        updateCountdown();
+        </script>
+        """
+        components.html(timer_component_html, height=48)
 
         df_all = self.load_journal()
         df = df_all[df_all['code'] == code] if (not df_all.empty and 'code' in df_all.columns) else df_all
@@ -273,6 +303,7 @@ class JournalPlugin:
         with col_m1:
             sel_month = st.selectbox("📅 選擇回測/復盤月份:", month_list, index=0)
 
+        now_dt_ny = datetime.datetime.now(tz_ny)
         if sel_month == "📅 今天 (實盤 Live 進行中)":
             today_str = now_dt_ny.strftime('%Y-%m-%d')
             df_filtered = df[df['date'] == today_str] if not df.empty and 'date' in df.columns else pd.DataFrame()
@@ -312,7 +343,7 @@ class JournalPlugin:
 
             selected_row = df_day.iloc[sel_sig_idx]
 
-        st.caption(f"🔍 5M 即時/復盤技術視圖 (標的: {code} · 最近 3 小時 36 根真實 K 線 · 支援滾輪縮放/拖拽)：")
+        st.caption(f"🔍 5M 走勢視圖 (標的: {code} · 最近 3 小時真實 K 線 · 支援滾輪縮放/拖拽)：")
         self.render_interactive_chart(code, selected_row)
 
         if selected_row is not None:
@@ -325,12 +356,12 @@ class JournalPlugin:
             </div>
             """, unsafe_allow_html=True)
         else:
-            st.info(f"💡 【{sel_month}】實盤監控中，後台每 5 分鐘自動寫入官方收盤 K 線。")
+            st.info(f"💡 【{sel_month}】實盤監控中，後台守護進程每 5 分鐘收盤自動寫入官方定格 K 線。")
 
         # 雙日誌抽屜
-        with st.expander("🛠️ [排查專用] 系統運行日誌 (System Health Log · 後台寫入記錄)", expanded=False):
+        with st.expander("🛠️ [排查專用] 系統運行日誌 (System Health Log)", expanded=False):
             st.code(self.load_health_log(), language="text")
 
-        trade_audit_log = f"=== 癸水 · 策略復盤日誌 (TRADE AUDIT LOG) ===\n• 標的: {code} | 狀態: 實盤監控中\n• 當前 3 小時真實 K 線已加載，後台守護進程運行中。\n============================================"
+        trade_audit_log = f"=== 癸水 · 策略復盤日誌 (TRADE AUDIT LOG) ===\n• 標的: {code} | 狀態: 實盤監控中\n• 當前最近 3 小時官方 5M K 線已對齊，後台守護進程每 5 分鐘自動寫入。\n============================================"
         with st.expander("📋 [策略專用] 訂單審核日誌 (Trade Audit Log)", expanded=False):
             st.code(trade_audit_log, language="text")
