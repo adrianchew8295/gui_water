@@ -1,5 +1,5 @@
 # 文件名: strategy_engine.py
-# 核心職責: 【獨立策略大腦】現代標準配色 (青色漲 / 紅色跌 / 灰色平) + VPA 經典形態分類
+# 核心職責: 【獨立策略大腦】非青即紅 (純粹 🟢 漲 / 🔴 跌 雙色標準，徹底剔除灰色)
 
 import numpy as np
 import pandas as pd
@@ -21,7 +21,7 @@ class StrategyEngine:
     @staticmethod
     def compute_td_setup(df: pd.DataFrame) -> list:
         """依據彭博 Bloomberg 標準計算德馬克 TD Setup (1~9 轉)"""
-        setup_type = ["⚪ 待機中"] * len(df)
+        setup_type = ["🟢 待機中"] * len(df)
         if len(df) < 5:
             return setup_type
 
@@ -41,32 +41,32 @@ class StrategyEngine:
             else:
                 buy_count = 0
                 sell_count = 0
-                setup_type[i] = "⚪ 待機中"
+                setup_type[i] = "🟢 待機中"
         return setup_type
 
     @staticmethod
     def classify_candle_shape(open_p: float, high_p: float, low_p: float, close_p: float) -> str:
         """
-        【現代標準配色 K 線形態解剖】
-        🟢 青色 (上漲 / Bullish) | 🔴 紅色 (下跌 / Bearish) | ⚪ 灰色 (平盤十字 / Neutral)
+        【純粹雙色 K 線形態解剖】
+        🟢 青色 (收盤 >= 開盤 / 多頭偏向) | 🔴 紅色 (收盤 < 開盤 / 空頭偏向)
         """
         total_range = high_p - low_p
+        is_up = close_p >= open_p  # 平盤或收陽一律歸為青色
+
         if total_range <= 0.0001:
-            return "⚪ 平盤十字 ⚖️"
+            return "🟢 十字漲 ⚖️" if is_up else "🔴 十字跌 ⚖️"
 
         body = abs(close_p - open_p)
         upper_wick = high_p - max(open_p, close_p)
         lower_wick = min(open_p, close_p) - low_p
-        is_up = close_p > open_p
-        is_dn = close_p < open_p
 
-        # 1. 實體極窄 (≤ 15% 振幅) -> 長腿十字星 (變盤節點)
+        # 1. 實體極窄 (≤ 15% 振幅) -> 長腿十字星 (依收盤歸為青十字或紅十字)
         if body <= total_range * 0.15:
-            return "⚪ 長腿十字 ⚖️"
+            return "🟢 十字漲 ⚖️" if is_up else "🔴 十字跌 ⚖️"
 
         # 2. 長上影線形態 (上影線 ≥ 2 倍實體)
         if upper_wick >= 2.0 * body and lower_wick <= 0.20 * total_range:
-            return "🔴 射星跌 🌠" if is_dn else "🟢 倒錘漲 🛸"
+            return "🟢 倒錘漲 🛸" if is_up else "🔴 射星跌 🌠"
 
         # 3. 長下影線形態 (下影線 ≥ 2 倍實體)
         if lower_wick >= 2.0 * body and upper_wick <= 0.20 * total_range:
@@ -77,18 +77,13 @@ class StrategyEngine:
             return "🟢 大陽衝鋒 🚀" if is_up else "🔴 大陰破位 💥"
 
         # 5. 常規常態 K 線
-        if is_up:
-            return "🟢 青陽漲"
-        elif is_dn:
-            return "🔴 紅陰跌"
-        else:
-            return "⚪ 平盤"
+        return "🟢 青陽漲" if is_up else "🔴 紅陰跌"
 
     @staticmethod
     def evaluate_trend_bias(df_day: pd.DataFrame, curr_price: float) -> tuple:
         """【模組：宏觀方向門禁】"""
-        trend_bias = 0
-        trend_text = "⚪ 0 (中立震盪)"
+        trend_bias = 1
+        trend_text = "🟢 +1 (多頭控盤 [日線>EMA20])"
         pdh_line = curr_price * 1.008
         pdl_line = curr_price * 0.992
 
@@ -98,7 +93,7 @@ class StrategyEngine:
             prev_d = df_day.iloc[-2]
             pdh_line = float(prev_d.get('high', curr_price * 1.008))
             pdl_line = float(prev_d.get('low', curr_price * 0.992))
-            if float(last_d['close']) > float(last_d['ema20']):
+            if float(last_d['close']) >= float(last_d['ema20']):
                 trend_bias = 1
                 trend_text = "🟢 +1 (多頭控盤 [日線>EMA20])"
             else:
@@ -119,17 +114,17 @@ class StrategyEngine:
         hhv5 = df['high'].rolling(5).max().shift(1).bfill()
 
         # 2B 假突破 (RAW 形態)
-        bull_2b_raw = ((df['low'] < llv5) | (df['low'] < pdl_line)) & (df['close'] > llv5) & (df['close'] > df['open'])
+        bull_2b_raw = ((df['low'] < llv5) | (df['low'] < pdl_line)) & (df['close'] > llv5) & (df['close'] >= df['open'])
         bear_2b_raw = ((df['high'] > hhv5) | (df['high'] > pdh_line)) & (df['close'] < hhv5) & (df['close'] < df['open'])
 
         c1, o1 = df['close'].shift(1), df['open'].shift(1)
         c2, o2 = df['close'].shift(2), df['open'].shift(2)
         h1, l1 = df['high'].shift(1), df['low'].shift(1)
 
-        bull_engulf = (df['close'] > df['open']) & (c1 < o1) & (df['close'] >= o1) & (df['open'] <= c1)
+        bull_engulf = (df['close'] >= df['open']) & (c1 < o1) & (df['close'] >= o1) & (df['open'] <= c1)
         bear_engulf = (df['close'] < df['open']) & (c1 > o1) & (df['close'] <= o1) & (df['open'] >= c1)
 
-        bull_star = (c2 < o2) & ((c1 - o1).abs() <= 0.35 * (h1 - l1)) & (df['close'] > df['open']) & (df['close'] >= (o2 + c2) / 2)
+        bull_star = (c2 < o2) & ((c1 - o1).abs() <= 0.35 * (h1 - l1)) & (df['close'] >= df['open']) & (df['close'] >= (o2 + c2) / 2)
         bear_star = (c2 > o2) & ((c1 - o1).abs() <= 0.35 * (h1 - l1)) & (df['close'] < df['open']) & (df['close'] <= (o2 + c2) / 2)
 
         raw_bull_pattern = bull_2b_raw | bull_engulf | bull_star
@@ -144,7 +139,7 @@ class StrategyEngine:
         est_option_price = 1.45
         total_cost = est_option_price * 100
 
-        opt_dir_str = "🟢 CALL 多單" if trigger_type == "CALL" else ("🔴 PUT 空單" if trigger_type == "PUT" else "⚪ 待機觀望")
+        opt_dir_str = "🟢 CALL 多單" if trigger_type != "PUT" else "🔴 PUT 空單"
         opt_sym_str = f"QQQ {strike_atm} {'CALL' if trigger_type != 'PUT' else 'PUT'}"
 
         return {
