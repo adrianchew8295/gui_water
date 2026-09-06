@@ -1,5 +1,5 @@
 # 文件名: chart_plugin.py
-# 核心特性: 純數據管道 + 渲染終端 + 5M 即時極值採樣 (High/Low)
+# 核心特性: 直連 OpenD 真實 5M K 線 + 毫秒快照動態推進 + 真實極值 (High/Low) 與真實 Volume 審核
 
 import os
 import sys
@@ -8,7 +8,7 @@ import datetime
 import pandas as pd
 import pytz
 import streamlit as st
-from moomoo import OpenQuoteContext, RET_OK, SubType
+from moomoo import OpenQuoteContext, RET_OK, SubType, KLType, AuType
 from streamlit_extras.stylable_container import stylable_container
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -41,7 +41,7 @@ class MarketDataEngine:
         ctx = cls.get_context()
         if ctx and symbol not in cls._subscribed_symbols:
             try:
-                ret, _ = ctx.subscribe([symbol], [SubType.QUOTE, SubType.TICKER])
+                ret, _ = ctx.subscribe([symbol], [SubType.QUOTE, SubType.TICKER, SubType.K_5M])
                 if ret == RET_OK:
                     cls._subscribed_symbols.add(symbol)
                     return True
@@ -53,25 +53,59 @@ class ChartPlugin:
     def __init__(self, data_dir: str = DATA_DIR):
         self.data_dir = data_dir
 
-    def get_realtime_snapshot_and_history(self, code: str) -> tuple:
-        snap = {
-            "price": 0.0, "source": "未連線", "server_time": "--",
-            "latency_ms": 0, "open": 0.0, "high": 0.0, "low": 0.0, "vol": 0.0
-        }
-        df_5m = pd.DataFrame()
-        status_msg = "正在檢查連線..."
-        t_start = time.time()
+    def fetch_real_history_5m(self, code: str) -> pd.DataFrame:
+        """【真理數據源】向 OpenD 索取真實 5M 歷史 K 線 (包含真實 High/Low/Volume)"""
+        ctx = MarketDataEngine.get_context()
         target_symbol = "CC.BTCUSD" if "BTC" in code.upper() else code
+        if ctx:
+            MarketDataEngine.ensure_subscription(target_symbol)
+            try:
+                today = datetime.datetime.now(tz_ny).date()
+                start_date = (today - datetime.timedelta(days=3)).strftime("%Y-%m-%d")
+                end_date = today.strftime("%Y-%m-%d")
+                
+                ret, df_k, msg = ctx.request_history_kline(
+                    code=target_symbol,
+                    start=start_date,
+                    end=end_date,
+                    ktype=KLType.K_5M,
+                    autype=AuType.NONE,
+                    max_count=60
+                )
+                if ret == RET_OK and not df_k.empty:
+                    df_k = df_k[['time_key', 'open', 'close', 'high', 'low', 'volume']]
+                    df_k['time_key'] = pd.to_datetime(df_k['time_key'])
+                    
+                    # 存入本地覆蓋備份
+                    save_prefix = "CC_BTCUSD" if "BTC" in code.upper() else code.replace('.', '_')
+                    f_path = os.path.join(self.data_dir, f"{save_prefix}_5M.csv")
+                    df_k.to_csv(f_path, index=False)
+                    return df_k
+            except Exception:
+                pass
 
+        # 備援：讀取本地 CSV
         save_prefix = "CC_BTCUSD" if "BTC" in code.upper() else code.replace('.', '_')
         f_path = os.path.join(self.data_dir, f"{save_prefix}_5M.csv")
         if os.path.exists(f_path):
             try:
-                df_5m = pd.read_csv(f_path)
-                df_5m.columns = [c.lower().strip() for c in df_5m.columns]
-                df_5m['time_key'] = pd.to_datetime(df_5m['time_key'])
+                df = pd.read_csv(f_path)
+                df.columns = [c.lower().strip() for c in df.columns]
+                df['time_key'] = pd.to_datetime(df['time_key'])
+                return df
             except Exception:
                 pass
+        return pd.DataFrame()
+
+    def get_realtime_snapshot(self, code: str) -> tuple:
+        """獲取盤口毫秒級快照現價"""
+        snap = {
+            "price": 0.0, "source": "未連線", "server_time": "--",
+            "latency_ms": 0, "open": 0.0, "high": 0.0, "low": 0.0, "vol": 0.0
+        }
+        status_msg = "正在檢查連線..."
+        t_start = time.time()
+        target_symbol = "CC.BTCUSD" if "BTC" in code.upper() else code
 
         ctx = MarketDataEngine.get_context()
         if ctx:
@@ -88,16 +122,13 @@ class ChartPlugin:
                     snap["source"] = "🟢 OpenD 直連 (毫秒級 Snapshot)"
                     snap["server_time"] = str(row.get('update_time', datetime.datetime.now(tz_ny).strftime('%H:%M:%S')))
                     snap["latency_ms"] = int((time.time() - t_start) * 1000)
-                    status_msg = f"已成功訂閱 {target_symbol} 毫秒快照通道"
+                    status_msg = f"已成功訂閱 {target_symbol} 實時快照通道"
                 else:
                     status_msg = f"快照獲取代碼: {ret_s}"
             except Exception as e:
                 status_msg = f"快照連線異常: {str(e)}"
 
-        if snap["source"] == "未連線" and not df_5m.empty:
-            snap["source"] = "💾 本地 CSV 緩存"
-
-        return snap, status_msg, df_5m
+        return snap, status_msg
 
     def load_cold_data(self, code: str, ktype_name: str) -> pd.DataFrame:
         is_btc = "BTC" in code.upper()
@@ -135,7 +166,7 @@ class ChartPlugin:
         return cur_slot_time, slot_str, countdown_str
 
     def track_live_bar_extremes(self, code: str, cur_slot_time: datetime.datetime, curr_price: float) -> tuple:
-        """即時採樣並記錄當前 5M 棒線的 Open, High, Low, Close"""
+        """動態追蹤與鎖定當前 5M 走動期間的真實 High / Low"""
         slot_key = cur_slot_time.strftime('%Y-%m-%d %H:%M:%S')
         cache_key = f"{code}_live_bar"
         bar_data = st.session_state.get(cache_key, None)
@@ -156,44 +187,10 @@ class ChartPlugin:
         st.session_state[cache_key] = bar_data
         return bar_data['open'], bar_data['high'], bar_data['low'], bar_data['close']
 
-    def check_and_append_new_bar(self, code: str, df_5m: pd.DataFrame, cur_slot_time: datetime.datetime, curr_price: float):
-        """【自動增量落盤】換棒時將剛走完的真實極值寫入硬盤 CSV"""
-        if df_5m.empty:
-            return df_5m
-
-        last_csv_time = pd.to_datetime(df_5m['time_key'].iloc[-1]).tz_localize(None)
-        target_slot = cur_slot_time.replace(tzinfo=None)
-
-        if target_slot > last_csv_time:
-            cache_key = f"{code}_live_bar"
-            prev_bar = st.session_state.get(cache_key, None)
-            
-            o = prev_bar['open'] if prev_bar else curr_price
-            h = prev_bar['high'] if prev_bar else curr_price
-            l = prev_bar['low'] if prev_bar else curr_price
-            c = curr_price
-
-            new_row = pd.DataFrame([{
-                'time_key': target_slot.strftime('%Y-%m-%d %H:%M:%S'),
-                'open': o,
-                'close': c,
-                'high': h,
-                'low': l,
-                'volume': 1.0
-            }])
-            df_5m = pd.concat([df_5m, new_row]).reset_index(drop=True)
-            
-            save_prefix = "CC_BTCUSD" if "BTC" in code.upper() else code.replace('.', '_')
-            f_path = os.path.join(self.data_dir, f"{save_prefix}_5M.csv")
-            try:
-                new_row.to_csv(f_path, mode='a', header=not os.path.exists(f_path), index=False)
-            except Exception:
-                pass
-
-        return df_5m
-
     def render_cockpit(self, code: str, budget_usd: float = 200.0):
-        snap, status_msg, df_5m = self.get_realtime_snapshot_and_history(code)
+        # 1. 抓取真實 5M 歷史與即時快照
+        df_5m = self.fetch_real_history_5m(code)
+        snap, status_msg = self.get_realtime_snapshot(code)
         df_day = self.load_cold_data(code, "DAY")
         cur_slot_time, live_slot_str, countdown_str = self.get_countdown_and_current_slot()
 
@@ -201,11 +198,9 @@ class ChartPlugin:
         if curr_price <= 0 and not df_5m.empty:
             curr_price = float(df_5m['close'].iloc[-1])
         if curr_price <= 0:
-            curr_price = 79700.0 if "BTC" in code.upper() else 488.50
+            curr_price = 79900.0 if "BTC" in code.upper() else 488.50
 
-        # 即時追蹤極值與落盤
         live_o, live_h, live_l, live_c = self.track_live_bar_extremes(code, cur_slot_time, curr_price)
-        df_5m = self.check_and_append_new_bar(code, df_5m, cur_slot_time, curr_price)
 
         prev_p_key = f"{code}_prev_price"
         prev_p = st.session_state.get(prev_p_key, curr_price)
@@ -219,15 +214,15 @@ class ChartPlugin:
             flash_color = "#FF5252"
             flash_sym = f"▼ -${abs(delta_val):.2f}"
         else:
-            flash_color = "#f0f6fc"
+            flash_color = "#00E676"
             flash_sym = "--"
 
         if df_5m.empty or len(df_5m) < 8:
-            st.warning("⏳ 正在加載 5M 歷史基座中...")
+            st.warning("⏳ 正在向 OpenD 同步真實 5M 歷史 K 線...")
             st.info(f"⚙️ 後台狀態: {status_msg}")
             return
 
-        # 呼叫獨立策略大腦
+        # 2. 策略計算
         trend_bias, trend_text, pdh_line, pdl_line = StrategyEngine.evaluate_trend_bias(df_day, curr_price)
         df_5m_calc, raw_bull, raw_bear = StrategyEngine.evaluate_5m_signals(df_5m, trend_bias, pdh_line, pdl_line)
 
@@ -241,9 +236,10 @@ class ChartPlugin:
         latest_trigger_type = "NONE"
 
         # ─── 第 1 行：動態 LIVE 行 ───
-        live_shape = StrategyEngine.classify_candle_shape(live_o, live_h, live_l, live_c)
+        last_closed_c = float(closed_bars_5.iloc[0]['close']) if not closed_bars_5.empty else curr_price
+        live_shape = StrategyEngine.classify_candle_shape(live_o, live_h, live_l, live_c, prev_close=last_closed_c)
         live_col1_t1 = f"<b style='color:#58a6ff;'>{live_slot_str}</b> <span style='background:#1f293d; color:#58a6ff; padding:2px 6px; border-radius:4px; font-weight:bold;'>⚡ LIVE</span> <span style='background:#161b22; color:#00E676; border:1px solid #238636; padding:2px 6px; border-radius:4px; font-weight:bold;'>⏱️ {countdown_str}</span>"
-        live_col1_t2 = f"<b style='color:#58a6ff;'>{live_slot_str}</b> <span style='color:#8b949e;'>⚪ 待機中</span>"
+        live_col1_t2 = f"<b style='color:#58a6ff;'>{live_slot_str}</b> <span style='color:#00E676;'>🟢 待機中</span>"
         live_c_display = f"<span style='color:{flash_color}; font-weight:bold;'>${curr_price:,.2f} ({flash_sym}) [{live_shape}]</span>"
         
         table1_rows.append({
@@ -273,10 +269,12 @@ class ChartPlugin:
             
             vol_ratio = v / vma
             is_heavy = vol_ratio >= 1.25
-            candle_shape = StrategyEngine.classify_candle_shape(o, h, l, c)
+
+            p_close = float(closed_bars_5.iloc[idx + 1]['close']) if idx + 1 < len(closed_bars_5) else None
+            candle_shape = StrategyEngine.classify_candle_shape(o, h, l, c, prev_close=p_close)
 
             row_style = ""
-            action_str = "⚪ 待機中"
+            action_str = "🟢 待機中"
             diag_str = "⚪ 常規波動"
 
             col1_t1 = f"<b style='color:#8b949e;'>{t_str}</b> <span style='background:#21262d; color:#8b949e; padding:2px 6px; border-radius:4px;'>🔒 收盤</span>"
@@ -288,7 +286,7 @@ class ChartPlugin:
             elif "賣出" in td_s:
                 td_html = f"<span style='color:#FF5252; font-weight:bold;'>{td_s}</span>"
             else:
-                td_html = f"<span style='color:#8b949e;'>{td_s}</span>"
+                td_html = f"<span style='color:#00E676;'>{td_s}</span>"
 
             col1_t2 = f"<b style='color:#8b949e;'>{t_str}</b> {td_html}"
             c_display = f"${c:,.2f} [{candle_shape}]"
@@ -338,7 +336,7 @@ class ChartPlugin:
                         diag_str = "⚪ 均線上方蓄勢" if c > o else "⚪ 區間震盪整理"
                     action_str = "☕ 觀望待機"
 
-            vol_pill = f"<span style='background:rgba(0,230,118,0.2); color:#00E676; padding:2px 8px; border-radius:12px; font-weight:bold;'>🟢 {vol_ratio:.2f}x 放量</span>" if is_heavy else f"<span style='color:#8b949e;'>⚪ {vol_ratio:.2f}x 常規</span>"
+            vol_pill = f"<span style='background:rgba(0,230,118,0.2); color:#00E676; padding:2px 8px; border-radius:12px; font-weight:bold;'>🟢 {vol_ratio:.2f}x 放量 ({v:.1f} BTC)</span>" if is_heavy else f"<span style='color:#8b949e;'>⚪ {vol_ratio:.2f}x 常規 ({v:.1f} BTC)</span>"
 
             table1_rows.append({
                 "5M時段與狀態": col1_t1,
@@ -355,7 +353,7 @@ class ChartPlugin:
                 "_style": row_style
             })
 
-            audit_bars_log.append(f"• {t_str} 🔒 收盤  | 收盤: ${c:,.2f} [{candle_shape}] | 影線: {h:.2f}/{l:.2f} | 量: {vol_ratio:.2f}x ({'🟢放量' if is_heavy else '⚪常規'}) | TD: {td_s} | 診斷: {diag_str}")
+            audit_bars_log.append(f"• {t_str} 🔒 收盤  | 收盤: ${c:,.2f} [{candle_shape}] | 影線: {h:.2f}/{l:.2f} | 量: {vol_ratio:.2f}x ({v:.2f} BTC) | TD: {td_s} | 診斷: {diag_str}")
 
         opt_plan = StrategyEngine.calculate_option_plan(curr_price, latest_trigger_type, budget_usd)
 
@@ -374,9 +372,9 @@ class ChartPlugin:
             """
         ):
             st.markdown(f"📶 通道: **{snap['source']}** | 撮合時間: **{snap['server_time']} ET** | 延遲: **{snap['latency_ms']} ms** | 宏觀方向: **{trend_text}**")
-            st.caption(f"⚙️ 狀態: `{status_msg}` | 💾 CSV 增量自動歸檔就緒")
+            st.caption(f"⚙️ 狀態: `{status_msg}` | 🎯 真實 5M 歷史數據同步已就緒")
 
-        # ====== 表 1：5M 即時量價核心表 ======
+        # ====== 表 1 ======
         st.markdown("##### 📊 表 1：5M 即時量價核心表 (黃金 30 分鐘滾動窗口)")
         t1_html = "<table style='width:100%; border-collapse: collapse; font-family: monospace; font-size: 14px; text-align: left; background-color: #0d1117; border-radius: 8px; overflow: hidden;'>"
         t1_html += "<tr style='border-bottom: 2px solid #30363d; color: #8b949e; background-color: #161b22;'>"
@@ -397,7 +395,7 @@ class ChartPlugin:
 
         st.markdown("<div style='margin-top: 15px;'></div>", unsafe_allow_html=True)
 
-        # ====== 表 2：德馬克 TD 9轉與戰術表 ======
+        # ====== 表 2 ======
         st.markdown("##### ⏱️ 表 2：德馬克 TD 9轉與戰術表 (保守右側確認)")
         t2_html = "<table style='width:100%; border-collapse: collapse; font-family: monospace; font-size: 14px; text-align: left; background-color: #0d1117; border-radius: 8px; overflow: hidden;'>"
         t2_html += "<tr style='border-bottom: 2px solid #30363d; color: #8b949e; background-color: #161b22;'>"
