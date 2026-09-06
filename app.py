@@ -1,5 +1,5 @@
 # 文件名: app.py
-# 核心功能: 癸水 · 0DTE 量化實戰座艙主入口 (緊湊專業 UI + 零空間浪費 + 1 秒心跳)
+# 核心功能: 癸水 · 0DTE 量化實戰座艙主入口 (常駐側邊欄 + 緊湊專業 UI + 1秒心跳)
 
 import streamlit as st
 from chart_plugin import ChartPlugin
@@ -10,14 +10,14 @@ st.set_page_config(
     page_title="癸水 · 0DTE座艙",
     page_icon="⚡",
     layout="wide",
-    initial_sidebar_state="collapsed"  # 預設收起側邊欄，釋放最大主視野
+    initial_sidebar_state="expanded"  # 保持常駐展開，隨時切換標的
 )
 
-# 全域緊湊樣式注入 (消滅大標題留白)
+# 全域緊湊樣式
 st.markdown("""
 <style>
     .block-container { padding-top: 0.8rem; padding-bottom: 0rem; max-width: 98%; }
-    header { visibility: hidden; } /* 隱藏 Streamlit 頂部預設空白條 */
+    header { visibility: hidden; }
     .stTabs [data-baseweb="tab-list"] { gap: 8px; }
     .stTabs [data-baseweb="tab"] { height: 36px; padding: 0 16px; font-size: 13px; font-weight: bold; }
 </style>
@@ -27,12 +27,13 @@ plugin = ChartPlugin()
 audit_plugin = AuditComparatorPlugin()
 journal_plugin = JournalPlugin()
 
+# 側邊欄：永遠可見，方便切換標的與預算
 sidebar = st.sidebar
 sidebar.header("🎛️ 控制中樞")
-target_code = sidebar.selectbox("選擇監控標的", ["CC.BTCUSD", "US.QQQ"], index=0)
+target_code = sidebar.selectbox("選擇監控標的", ["US.QQQ", "CC.BTCUSD"], index=0)
 budget_input = sidebar.number_input("💰 0DTE 單筆預算 (USD)", min_value=50.0, max_value=5000.0, value=200.0, step=50.0)
 
-# 頂部超緊湊標題列 (僅 15px 高度)
+# 頂部緊湊 HUD 狀態列
 st.markdown(f"""
 <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #21262d; padding-bottom: 6px; margin-bottom: 8px; font-family: monospace;">
     <span style="font-size: 15px; font-weight: bold; color: #58a6ff;">⚡ 癸水 · 0DTE 量化射控座艙 <span style="font-size: 12px; color: #8b949e;">({target_code})</span></span>
