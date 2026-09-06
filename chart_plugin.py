@@ -1,5 +1,5 @@
 # 文件名: chart_plugin.py
-# 核心特性: 嚴格 Candle Close 門禁 + 物理時間時序對齊 + 影線成交量精準輸出
+# 核心特性: 富途原生 K 線時間完全鏡像 + 實時快照動態刷新 + 影線/成交量精準輸出
 
 import os
 import sys
@@ -135,59 +135,30 @@ class ChartPlugin:
                 pass
         return pd.DataFrame()
 
-    def get_countdown_and_current_slot(self) -> tuple:
+    def get_countdown_str(self) -> str:
+        """計算距離下一個 5M 換棒的精準倒數秒數"""
         now = datetime.datetime.now(tz_ny)
         cur_min = now.minute
         cur_sec = now.second
-        
-        slot_min = (cur_min // 5) * 5
-        cur_slot_time = now.replace(minute=slot_min, second=0, microsecond=0)
-        slot_str = cur_slot_time.strftime('%H:%M')
-        
         rem_min = 4 - (cur_min % 5)
         rem_sec = 60 - cur_sec
         if rem_sec == 60:
             rem_min += 1
             rem_sec = 0
-            
-        countdown_str = f"{rem_min:02d}:{rem_sec:02d}"
-        return cur_slot_time, slot_str, countdown_str
-
-    def track_live_bar_extremes(self, code: str, cur_slot_time: datetime.datetime, curr_price: float) -> tuple:
-        slot_key = cur_slot_time.strftime('%Y-%m-%d %H:%M:%S')
-        cache_key = f"{code}_live_bar"
-        bar_data = st.session_state.get(cache_key, None)
-
-        if bar_data is None or bar_data.get('slot') != slot_key:
-            bar_data = {
-                'slot': slot_key,
-                'open': curr_price,
-                'high': curr_price,
-                'low': curr_price,
-                'close': curr_price
-            }
-        else:
-            bar_data['high'] = max(bar_data['high'], curr_price)
-            bar_data['low'] = min(bar_data['low'], curr_price)
-            bar_data['close'] = curr_price
-
-        st.session_state[cache_key] = bar_data
-        return bar_data['open'], bar_data['high'], bar_data['low'], bar_data['close']
+        return f"{rem_min:02d}:{rem_sec:02d}"
 
     def render_cockpit(self, code: str, budget_usd: float = 200.0):
-        # 1. 獲取數據
+        # 1. 抓取數據
         df_5m_all = self.fetch_real_cur_5m(code)
         snap, status_msg = self.get_realtime_snapshot(code)
         df_day = self.load_cold_data(code, "DAY")
-        cur_slot_time, live_slot_str, countdown_str = self.get_countdown_and_current_slot()
+        countdown_str = self.get_countdown_str()
 
         curr_price = snap["price"]
         if curr_price <= 0 and not df_5m_all.empty:
             curr_price = float(df_5m_all['close'].iloc[-1])
         if curr_price <= 0:
             curr_price = 79900.0 if "BTC" in code.upper() else 488.50
-
-        live_o, live_h, live_l, live_c = self.track_live_bar_extremes(code, cur_slot_time, curr_price)
 
         prev_p_key = f"{code}_prev_price"
         prev_p = st.session_state.get(prev_p_key, curr_price)
@@ -213,10 +184,19 @@ class ChartPlugin:
         trend_bias, trend_text, pdh_line, pdl_line = StrategyEngine.evaluate_trend_bias(df_day, curr_price)
         df_5m_calc, raw_bull, raw_bear = StrategyEngine.evaluate_5m_signals(df_5m_all, trend_bias, pdh_line, pdl_line)
 
-        # 物理時間門禁：剔除未閉合的動態柱
-        naive_cur_slot = cur_slot_time.replace(tzinfo=None)
-        closed_df = df_5m_calc[pd.to_datetime(df_5m_calc['time_key']) < naive_cur_slot].copy()
-        closed_bars_5 = closed_df.tail(5).iloc[::-1].copy().reset_index(drop=True)
+        # ─── 核心時序鏡像對齊 ───
+        # 富途最後一行 (iloc[-1]) 就是盤面當前正在走動的 LIVE 棒
+        live_raw = df_5m_calc.iloc[-1]
+        live_slot_str = pd.to_datetime(live_raw['time_key']).strftime('%H:%M')
+        
+        # 動態即時極值（結合快照最新價）
+        live_o = float(live_raw['open'])
+        live_h = max(float(live_raw['high']), curr_price)
+        live_l = min(float(live_raw['low']), curr_price)
+        live_c = curr_price
+
+        # 富途倒數第 2 至第 6 行就是剛剛定格的 5 根收盤柱 (100% 鏡像對齊圖表刻度)
+        closed_bars_5 = df_5m_calc.iloc[-6:-1].iloc[::-1].copy().reset_index(drop=True)
 
         table1_rows = []
         table2_rows = []
@@ -293,10 +273,7 @@ class ChartPlugin:
                 else:
                     has_prev_bull, has_prev_bear = False, False
 
-                # 1. 看多右側確認：前一根探底 2B，當根收盤放量衝破前一根高點，且日線為多頭偏向
                 is_bull_confirmed = has_prev_bull and (c > p_h) and (c > o) and (is_heavy or p_heavy) and (trend_bias >= 0)
-                
-                # 2. 看空右側確認：前一根衝高 2B 誘多，當根收盤放量跌破前一根低點，且日線為空頭偏向或高位受阻
                 is_bear_confirmed = has_prev_bear and (c < p_l) and (c < o) and (is_heavy or p_heavy)
 
                 if is_bull_confirmed:
@@ -363,7 +340,7 @@ class ChartPlugin:
             """
         ):
             st.markdown(f"📶 通道: **{snap['source']}** | 撮合時間: **{snap['server_time']} ET** | 延遲: **{snap['latency_ms']} ms** | 宏觀方向: **{trend_text}**")
-            st.caption(f"⚙️ 狀態: `{status_msg}` | 🎯 Candle Close 門禁已鎖定，無未來數據干擾")
+            st.caption(f"⚙️ 狀態: `{status_msg}` | 🎯 富途原生 K 線時間 100% 鏡像對齊")
 
         # ====== 表 1 ======
         st.markdown("##### 📊 表 1：5M 即時量價核心表 (黃金 30 分鐘滾動窗口)")
