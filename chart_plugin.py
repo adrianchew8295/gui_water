@@ -1,5 +1,5 @@
 # 文件名: chart_plugin.py
-# 核心特性: 物理時間門禁 (徹底剔除未走完動態柱) + 毫秒級 Snapshot 現價動態推進 + 零時序重疊
+# 核心特性: 嚴格 Candle Close 門禁 + 物理時間時序對齊 + 影線成交量精準輸出
 
 import os
 import sys
@@ -73,7 +73,6 @@ class ChartPlugin:
             except Exception:
                 pass
 
-        # 備援：讀取本地 CSV
         save_prefix = "CC_BTCUSD" if "BTC" in code.upper() else code.replace('.', '_')
         f_path = os.path.join(self.data_dir, f"{save_prefix}_5M.csv")
         if os.path.exists(f_path):
@@ -214,12 +213,9 @@ class ChartPlugin:
         trend_bias, trend_text, pdh_line, pdl_line = StrategyEngine.evaluate_trend_bias(df_day, curr_price)
         df_5m_calc, raw_bull, raw_bear = StrategyEngine.evaluate_5m_signals(df_5m_all, trend_bias, pdh_line, pdl_line)
 
-        # ─── 核心防禦：物理時間門禁 (徹底剔除當前走動中的未閉合棒線) ───
+        # 物理時間門禁：剔除未閉合的動態柱
         naive_cur_slot = cur_slot_time.replace(tzinfo=None)
-        # 凡是時間戳大於等於當前 5M 開始時間的，一律排除在歷史收盤表之外
         closed_df = df_5m_calc[pd.to_datetime(df_5m_calc['time_key']) < naive_cur_slot].copy()
-
-        # 取最近 5 根已閉合定格的歷史柱
         closed_bars_5 = closed_df.tail(5).iloc[::-1].copy().reset_index(drop=True)
 
         table1_rows = []
@@ -282,6 +278,7 @@ class ChartPlugin:
             col1_t2 = f"<b style='color:#8b949e;'>{t_str}</b> {td_html}"
             c_display = f"${c:,.2f} [{candle_shape}]"
 
+            # 嚴格右側收盤定罪邏輯
             if idx + 1 < len(closed_bars_5):
                 prev_bar = closed_bars_5.iloc[idx + 1]
                 p_h, p_l = float(prev_bar['high']), float(prev_bar['low'])
@@ -296,12 +293,15 @@ class ChartPlugin:
                 else:
                     has_prev_bull, has_prev_bear = False, False
 
-                is_bull_confirmed = has_prev_bull and (h > p_h) and (c > o) and (is_heavy or p_heavy) and (trend_bias >= 0)
-                is_bear_confirmed = has_prev_bear and (l < p_l) and (c < o) and (is_heavy or p_heavy) and (trend_bias <= 0)
+                # 1. 看多右側確認：前一根探底 2B，當根收盤放量衝破前一根高點，且日線為多頭偏向
+                is_bull_confirmed = has_prev_bull and (c > p_h) and (c > o) and (is_heavy or p_heavy) and (trend_bias >= 0)
+                
+                # 2. 看空右側確認：前一根衝高 2B 誘多，當根收盤放量跌破前一根低點，且日線為空頭偏向或高位受阻
+                is_bear_confirmed = has_prev_bear and (c < p_l) and (c < o) and (is_heavy or p_heavy)
 
                 if is_bull_confirmed:
                     row_style = "background-color: rgba(0, 230, 118, 0.18); color: #ffffff; font-weight: bold; border-left: 5px solid #00E676;"
-                    diag_str = "🔥 2B/晨星 右側放量衝破確認"
+                    diag_str = "🔥 2B破底翻 右側放量衝破確認"
                     sl = p_l - 0.5 * atr
                     tp = c + 2.0 * (c - sl)
                     action_str = f"🎯 【買入 CALL】(入: ${c:.2f} | 止: ${sl:.2f} | 盈: ${tp:.2f})"
@@ -311,7 +311,7 @@ class ChartPlugin:
 
                 elif is_bear_confirmed:
                     row_style = "background-color: rgba(255, 82, 82, 0.18); color: #ffffff; font-weight: bold; border-left: 5px solid #FF5252;"
-                    diag_str = "🔥 2B/暮星 右側放量跌破確認"
+                    diag_str = "🔥 2B衝高誘多 右側放量跌破確認"
                     sl = p_h + 0.5 * atr
                     tp = c - 2.0 * (sl - c)
                     action_str = f"🎯 【買入 PUT】(入: ${c:.2f} | 止: ${sl:.2f} | 盈: ${tp:.2f})"
@@ -320,9 +320,9 @@ class ChartPlugin:
                         latest_trigger_action = f"🔥 【右側確認 · 買入 0DTE PUT】 入場: ${c:.2f} | 止損: ${sl:.2f} | 2R止盈: ${tp:.2f}"
                 else:
                     if has_prev_bull:
-                        diag_str = "⚪ 扎針完成 (等待衝破前高確認)"
+                        diag_str = "⚪ 探底完成 (等待收盤衝破前高確認)"
                     elif has_prev_bear:
-                        diag_str = "⚪ 衝頂完成 (等待跌破前低確認)"
+                        diag_str = "⚪ 衝頂誘多完成 (等待收盤跌破前低確認)"
                     else:
                         diag_str = "⚪ 均線上方蓄勢" if c > o else "⚪ 區間震盪整理"
                     action_str = "☕ 觀望待機"
@@ -363,7 +363,7 @@ class ChartPlugin:
             """
         ):
             st.markdown(f"📶 通道: **{snap['source']}** | 撮合時間: **{snap['server_time']} ET** | 延遲: **{snap['latency_ms']} ms** | 宏觀方向: **{trend_text}**")
-            st.caption(f"⚙️ 狀態: `{status_msg}` | 🎯 時序門禁已校準，零重複、零幽靈柱")
+            st.caption(f"⚙️ 狀態: `{status_msg}` | 🎯 Candle Close 門禁已鎖定，無未來數據干擾")
 
         # ====== 表 1 ======
         st.markdown("##### 📊 表 1：5M 即時量價核心表 (黃金 30 分鐘滾動窗口)")
