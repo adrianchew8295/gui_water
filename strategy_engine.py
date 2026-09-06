@@ -1,11 +1,11 @@
 # 文件名: strategy_engine.py
-# 核心职责: 【独立策略大脑】VPA多空对称形态分类、Trend Bias门禁、2B假突破、TD 9转、0DTE期权换算
+# 核心職責: 【獨立策略大腦】現代標準配色 (青色漲 / 紅色跌 / 灰色平) + VPA 經典形態分類
 
 import numpy as np
 import pandas as pd
 
 class StrategyEngine:
-    """量化策略计算中枢"""
+    """量化策略計算中樞"""
 
     @staticmethod
     def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
@@ -47,12 +47,12 @@ class StrategyEngine:
     @staticmethod
     def classify_candle_shape(open_p: float, high_p: float, low_p: float, close_p: float) -> str:
         """
-        【VPA 核心經典形態 · 多空對稱分類】
-        依據安娜·庫林 (Anna Coulling) 量價幾何學判定 K 線解剖形態
+        【現代標準配色 K 線形態解剖】
+        🟢 青色 (上漲 / Bullish) | 🔴 紅色 (下跌 / Bearish) | ⚪ 灰色 (平盤十字 / Neutral)
         """
         total_range = high_p - low_p
         if total_range <= 0.0001:
-            return "⚪ 十字 ⚖️"
+            return "⚪ 平盤十字 ⚖️"
 
         body = abs(close_p - open_p)
         upper_wick = high_p - max(open_p, close_p)
@@ -62,27 +62,27 @@ class StrategyEngine:
 
         # 1. 實體極窄 (≤ 15% 振幅) -> 長腿十字星 (變盤節點)
         if body <= total_range * 0.15:
-            return "⚪ 十字 ⚖️"
+            return "⚪ 長腿十字 ⚖️"
 
         # 2. 長上影線形態 (上影線 ≥ 2 倍實體)
         if upper_wick >= 2.0 * body and lower_wick <= 0.20 * total_range:
-            return "🔴 陰 🌠 射星" if is_dn else "🟢 陽 🛸 倒錘"
+            return "🔴 射星跌 🌠" if is_dn else "🟢 倒錘漲 🛸"
 
         # 3. 長下影線形態 (下影線 ≥ 2 倍實體)
         if lower_wick >= 2.0 * body and upper_wick <= 0.20 * total_range:
-            return "🟢 陽 🔨 鐵錘" if is_up else "🔴 陰 🪓 吊頸"
+            return "🟢 鐵錘漲 🔨" if is_up else "🔴 吊頸跌 🪓"
 
         # 4. 實體大陽 / 大陰 (實體佔比 ≥ 75%)
         if body >= 0.75 * total_range:
-            return "🟢 大陽 🚀 衝鋒" if is_up else "🔴 大陰 💥 破位"
+            return "🟢 大陽衝鋒 🚀" if is_up else "🔴 大陰破位 💥"
 
         # 5. 常規常態 K 線
         if is_up:
-            return "🟢 陽"
+            return "🟢 青陽漲"
         elif is_dn:
-            return "🔴 陰"
+            return "🔴 紅陰跌"
         else:
-            return "⚪ 平"
+            return "⚪ 平盤"
 
     @staticmethod
     def evaluate_trend_bias(df_day: pd.DataFrame, curr_price: float) -> tuple:
