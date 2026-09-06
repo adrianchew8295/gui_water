@@ -1,5 +1,5 @@
 # 文件名: chart_plugin.py
-# 核心特性: 原版雙表對稱佈局 + 1H EMA20 門禁 + 5M 2B 當根定罪 + 0DTE 智能換算 + 審核日誌
+# 核心特性: 原生標準佈局 (無 Grid Layout 依賴) + 1H EMA20 門禁 + 5M 2B 當根定罪 + 0DTE 極簡風控
 
 import os
 import sys
@@ -232,26 +232,22 @@ class ChartPlugin:
             audit_bars_log.append(audit_log_line)
 
         # ==========================================
-        # 🌟 原版雙表對稱佈局
+        # 🌟 原生標準佈局 (st.columns，無任何 grid layout 報錯)
         # ==========================================
 
         # 【頂部狀態 4 欄】
-        g1_col1, g1_col2, g1_col3, g1_col4 = st.columns(4)
-        with g1_col1:
-            st.metric("📶 連線通道", snap['source'], f"{snap['latency_ms']} ms")
-        with g1_col2:
-            st.metric("🕒 美東撮合時間", f"{snap['server_time']} ET")
-        with g1_col3:
-            st.metric("🚦 1H EMA20 門禁", trend_text)
-        with g1_col4:
-            st.metric("⏱️ 5M 換棒倒數", countdown_str)
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("📶 連線通道", snap['source'], f"{snap['latency_ms']} ms")
+        c2.metric("🕒 美東撮合時間", f"{snap['server_time']} ET")
+        c3.metric("🚦 1H EMA20 門禁", trend_text)
+        c4.metric("⏱️ 5M 換棒倒數", countdown_str)
 
         st.markdown("<div style='margin-top: 15px;'></div>", unsafe_allow_html=True)
 
         # 【中部雙表對稱並排 (1.1 : 1.0)】
-        g2_col1, g2_col2 = st.columns([1.1, 1.0])
+        col_t1, col_t2 = st.columns([1.1, 1.0])
 
-        with g2_col1:
+        with col_t1:
             with stylable_container(
                 key="t1_box",
                 css_styles="{background-color: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;}"
@@ -265,7 +261,7 @@ class ChartPlugin:
                 t1_html += "</table>"
                 st.markdown(t1_html, unsafe_allow_html=True)
 
-        with g2_col2:
+        with col_t2:
             with stylable_container(
                 key="t2_box",
                 css_styles="{background-color: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;}"
