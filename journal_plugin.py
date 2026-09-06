@@ -1,5 +1,5 @@
 # 文件名: journal_plugin.py
-# 核心職責: 【策略記帳與高級可視化復盤插件】支援滑鼠滾輪縮放/拖拽 + 按需單圖渲染 (防卡死) + 緊湊UI
+# 核心職責: 【策略記帳與高級可視化復盤插件】修復 KeyError + 支援滾輪縮放 + 按需單圖渲染
 
 import os
 import sys
@@ -12,8 +12,6 @@ import streamlit as st
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 if CURRENT_DIR not in sys.path:
     sys.path.insert(0, CURRENT_DIR)
-
-from strategy_engine import StrategyEngine
 
 tz_ny = pytz.timezone("America/New_York")
 tz_my = pytz.timezone("Asia/Kuala_Lumpur")
@@ -45,16 +43,25 @@ class JournalPlugin:
         return pd.DataFrame()
 
     def evaluate_metrics(self, df: pd.DataFrame) -> dict:
-        if df.empty:
-            return {"total": 0, "win_rate": 0.0, "rr": 0.0, "exp": 0.0, "verdict": "⚪ 樣本累積中", "color": "#8b949e"}
+        """判定策略統計數據與期望值 (保證永遠返回所有必需鍵)"""
+        default_res = {
+            "total": 0, "win_rate": 0.0, "rr": 0.0, "exp": 0.0,
+            "verdict": "⚪ 樣本累積中", "color": "#8b949e",
+            "wins": 0, "losses": 0
+        }
+        
+        if df.empty or 'net_r' not in df.columns:
+            return default_res
         
         wins = len(df[df['net_r'] > 0])
         total = len(df)
+        losses = total - wins
         win_rate = (wins / total) * 100 if total > 0 else 0.0
+        
         avg_w = df[df['net_r'] > 0]['net_r'].mean() if wins > 0 else 2.0
-        avg_l = abs(df[df['net_r'] <= 0]['net_r'].mean()) if (total - wins) > 0 else 1.0
+        avg_l = abs(df[df['net_r'] <= 0]['net_r'].mean()) if losses > 0 else 1.0
         rr = avg_w / avg_l if avg_l > 0 else 2.0
-        p_w, p_l = win_rate / 100.0, (100 - win_rate) / 100.0
+        p_w, p_l = win_rate / 100.0, (100.0 - win_rate) / 100.0
         exp = (p_w * avg_w) - (p_l * avg_l)
 
         if exp >= 0.35 and win_rate >= 50.0:
@@ -64,16 +71,18 @@ class JournalPlugin:
         else:
             verdict, color = "🔴 NON-WORKABLE (淘汰)", "#FF5252"
 
-        return {"total": total, "win_rate": win_rate, "rr": rr, "exp": exp, "verdict": verdict, "color": color, "wins": wins, "losses": total - wins}
+        return {
+            "total": total, "win_rate": win_rate, "rr": rr, "exp": exp,
+            "verdict": verdict, "color": color, "wins": wins, "losses": losses
+        }
 
     def render_interactive_replay_chart(self, trade_row: pd.Series):
         """高級 Plotly 互動圖表 · 支援滑鼠滾輪縮放與拖拽"""
-        entry_p = float(trade_row['entry'])
-        sl_p = float(trade_row['sl'])
-        tp_p = float(trade_row['tp'])
-        is_call = "CALL" in str(trade_row['direction'])
+        entry_p = float(trade_row.get('entry', 0.0))
+        sl_p = float(trade_row.get('sl', 0.0))
+        tp_p = float(trade_row.get('tp', 0.0))
+        is_call = "CALL" in str(trade_row.get('direction', 'CALL'))
 
-        # 構造還原序列 (前後 10 根)
         times = [f"T-{i}" for i in range(5, 0, -1)] + ["ENTRY (觸發)"] + [f"T+{i}" for i in range(1, 6)]
         base_prices = [entry_p - (i * 5 if is_call else -i * 5) for i in range(5, 0, -1)] + [entry_p] + [entry_p + (i * 6 if is_call else -i * 6) for i in range(1, 6)]
         
@@ -84,7 +93,6 @@ class JournalPlugin:
 
         fig = go.Figure()
 
-        # 1. K 線圖
         fig.add_trace(go.Candlestick(
             x=times, open=opens, high=highs, low=lows, close=closes,
             increasing_line_color='#00E676', decreasing_line_color='#FF5252',
@@ -92,7 +100,6 @@ class JournalPlugin:
             name="5M K線"
         ))
 
-        # 2. 進場 / 止損 / 止盈線
         fig.add_hline(y=entry_p, line_dash="dash", line_color="#58a6ff", annotation_text=f"進場: ${entry_p:,.2f}", annotation_position="top right")
         fig.add_hline(y=sl_p, line_dash="dash", line_color="#FF5252", annotation_text=f"止損: ${sl_p:,.2f}", annotation_position="bottom right")
         fig.add_hline(y=tp_p, line_dash="dash", line_color="#00E676", annotation_text=f"2R止盈: ${tp_p:,.2f}", annotation_position="top right")
@@ -106,13 +113,12 @@ class JournalPlugin:
             xaxis=dict(gridcolor="#161b22", showgrid=True, rangeslider=dict(visible=False)),
             yaxis=dict(gridcolor="#161b22", showgrid=True),
             hovermode="x unified",
-            dragmode="pan"  # 預設滑鼠左鍵可拖拽平移
+            dragmode="pan"
         )
 
         st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True, 'displayModeBar': True})
 
     def render_journal_dashboard(self, code: str, budget_usd: float = 200.0):
-        # 局部 CSS 壓縮版面
         st.markdown("""
         <style>
         .block-container { padding-top: 1rem; padding-bottom: 0rem; }
@@ -124,7 +130,6 @@ class JournalPlugin:
         m = self.evaluate_metrics(df)
         is_btc = "BTC" in code.upper()
 
-        # 頂部緊湊體檢條 (極小留白)
         st.markdown(f"""
         <div class="metric-banner">
             <div style="display: flex; justify-content: space-between; align-items: center;">
@@ -138,24 +143,23 @@ class JournalPlugin:
             st.info("💡 暫無歷史訂單，待實盤信號觸發後自動記錄。")
             return
 
-        # 訊號穿透選單 (按需展開，防 Overload)
-        options = [f"{r['trade_id']} | {r['time_et']} ET | {r['direction']} | 結果: {r['status']} ({r['net_r']:+.1f}R) | 評分: {r['score']}分" for _, r in df.iterrows()]
+        options = [
+            f"{r.get('trade_id', '#--')} | {r.get('time_et', '--')} ET | {r.get('direction', '--')} | 結果: {r.get('status', '--')} ({float(r.get('net_r', 0)):+.1f}R) | 評分: {r.get('score', 0)}分" 
+            for _, r in df.iterrows()
+        ]
         sel_idx = st.selectbox("🎯 選擇要深度復盤的訂單 (點擊即時生成可縮放圖表):", range(len(options)), format_func=lambda x: options[x])
 
         selected_row = df.iloc[sel_idx]
 
-        # 展開唯一互動畫布 (支援滑鼠滾輪縮放)
         st.caption("🔍 復盤畫布 (支援滑鼠滾輪縮放 / 左鍵拖拽 / 十字光標吸附)：")
         self.render_interactive_replay_chart(selected_row)
 
-        # 復盤原因鏈條
         st.markdown(f"""
         <div style="background: #161b22; border-left: 4px solid #58a6ff; padding: 6px 10px; border-radius: 4px; font-size: 12px; font-family: monospace; color: #c9d1d9; margin-bottom: 8px;">
-            💡 <b>決策鏈條</b>: {selected_row['reason']} | 開倉價: <b>${selected_row['entry']:,.2f}</b> | 止損: <b>${selected_row['sl']:,.2f}</b> | 2R止盈: <b>${selected_row['tp']:,.2f}</b> | 期權: <b>{'N/A (BTC無期權)' if is_btc else '0DTE ATM'}</b>
+            💡 <b>決策鏈條</b>: {selected_row.get('reason', '無備註')} | 開倉價: <b>${float(selected_row.get('entry', 0)):,.2f}</b> | 止損: <b>${float(selected_row.get('sl', 0)):,.2f}</b> | 2R止盈: <b>${float(selected_row.get('tp', 0)):,.2f}</b> | 期權: <b>{'N/A (BTC無期權)' if is_btc else '0DTE ATM'}</b>
         </div>
         """, unsafe_allow_html=True)
 
-        # 底部標準文字日誌 (一鍵複製)
         now_my = datetime.datetime.now(tz_my).strftime('%Y-%m-%d %H:%M:%S MYT')
-        log_text = f"=== 癸水 · 策略可行性評估日誌 ===\n• 時間: {now_my} | 標的: {code}\n• 裁定: {m['verdict']} | 勝率: {m['win_rate']:.1f}% | 盈虧比: 1:{m['rr']:.2f} | 期望值: {m['exp']:+.2f}R\n• 當前選中訂單: {selected_row['trade_id']} ({selected_row['direction']}) -> 淨收益: {selected_row['net_r']:+.1f}R\n==============================="
+        log_text = f"=== 癸水 · 策略可行性評估日誌 ===\n• 時間: {now_my} | 標的: {code}\n• 裁定: {m['verdict']} | 勝率: {m['win_rate']:.1f}% | 盈虧比: 1:{m['rr']:.2f} | 期望值: {m['exp']:+.2f}R\n• 當前選中訂單: {selected_row.get('trade_id', '--')} ({selected_row.get('direction', '--')}) -> 淨收益: {float(selected_row.get('net_r', 0)):+.1f}R\n==============================="
         st.code(log_text, language="text")
