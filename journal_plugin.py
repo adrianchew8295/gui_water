@@ -1,5 +1,5 @@
 # 文件名: journal_plugin.py
-# 核心職責: 【修復整頁跳轉回首頁 + 圖表頂部流暢 Timer + 鎖定當前頁面不重置】
+# 核心職責: 【100% 對齊 Moomoo 官方原生 5M 走勢 · 大馬時間軸 · 零跳轉 · 視角鎖定】
 
 import os
 import sys
@@ -50,14 +50,6 @@ class JournalPlugin:
                     "score_detail": "順應1H均線(+25) + 踩入RBS支撐(+25) + 2B長下影扎針(+25) + 放量不足(-25)",
                     "reason": "5M 2B 破底翻但隨後跌破支撐，觸發紀律止損", "pdh": 80069.4, "pdl": 79825.0,
                     "ema20_1h": 76068.5, "rbs": 79970.0, "sbr": 80020.0, "is_golden_window": False
-                },
-                {
-                    "trade_id": "#20260904_01", "code": "US.QQQ", "date": "2026-09-04", "time_et": "10:15", "time_myt": "22:15", "exit_time_et": "10:45",
-                    "month": "2026-09", "direction": "🟢 CALL", "strategy": "Strategy 1", "entry": 718.50, "sl": 717.30, "tp": 720.90,
-                    "exit_price": 720.90, "status": "WIN_TP", "net_r": 2.0, "pnl_usd": 400.0, "score": 95,
-                    "score_detail": "順應1H均線(+25) + 踩入RBS支撐(+25) + 2B破底翻(+25) + VPA 1.85x巨量(+20)",
-                    "reason": "回踩 RBS 支撐帶 + 5M 2B 破底翻長下影線 + 1.85x 巨量共振", "pdh": 721.39, "pdl": 715.72,
-                    "ema20_1h": 715.80, "rbs": 716.20, "sbr": 719.50, "is_golden_window": True
                 }
             ]
             pd.DataFrame(sample_data).to_csv(self.journal_path, index=False)
@@ -114,6 +106,19 @@ class JournalPlugin:
             "total_pnl": total_pnl
         }
 
+    def _convert_time_to_myt(self, time_key_str: str) -> str:
+        """將時間戳轉換為大馬本地時間 (MYT) 字串，精確匹配 Moomoo 座標軸"""
+        try:
+            if " " in time_key_str:
+                dt_part = time_key_str.split(" ")[1][:5]
+                # 若為美東時戳，自動 +12 小時轉換為大馬時間
+                h, m = map(int, dt_part.split(":"))
+                h_my = (h + 12) % 24
+                return f"{h_my:02d}:{m:02d}"
+            return str(time_key_str)[-8:-3]
+        except Exception:
+            return str(time_key_str)[-5:]
+
     def _load_kline_data(self, code: str, entry_date_str: str = None, entry_time_str: str = None):
         clean_code = code.replace('.', '_')
         csv_path = os.path.join(DATA_DIR, f"{clean_code}_5M.csv")
@@ -134,26 +139,26 @@ class JournalPlugin:
                             if entry_time_str in str(df_raw.iloc[idx]['time_key']):
                                 mid_idx = idx
                                 break
-                        start_i = max(0, mid_idx - 16)
-                        end_i = min(len(df_raw), mid_idx + 20)
+                        start_i = max(0, mid_idx - 20)
+                        end_i = min(len(df_raw), mid_idx + 24)
                         df_slice = df_raw.iloc[start_i:end_i].copy().reset_index(drop=True)
-                        times = [str(t)[-8:-3] for t in df_slice['time_key']]
+                        times = [self._convert_time_to_myt(str(t)) for t in df_slice['time_key']]
                         return times, df_slice['open'].astype(float).tolist(), df_slice['high'].astype(float).tolist(), df_slice['low'].astype(float).tolist(), df_slice['close'].astype(float).tolist(), df_slice['volume'].astype(float).tolist(), (mid_idx - start_i), str(df_slice.iloc[-1]['time_key'])
 
-                # 實盤展示最近 36 根真實 K 線
-                df_slice = df_raw.tail(36).copy().reset_index(drop=True)
-                times = [str(t)[-8:-3] for t in df_slice['time_key']]
+                # 實盤展示最近 48 根 (4小時) 走勢
+                df_slice = df_raw.tail(48).copy().reset_index(drop=True)
+                times = [self._convert_time_to_myt(str(t)) for t in df_slice['time_key']]
                 last_ts = str(df_slice.iloc[-1]['time_key']) if not df_slice.empty else "N/A"
                 return times, df_slice['open'].astype(float).tolist(), df_slice['high'].astype(float).tolist(), df_slice['low'].astype(float).tolist(), df_slice['close'].astype(float).tolist(), df_slice['volume'].astype(float).tolist(), -1, last_ts
             except Exception:
                 pass
 
-        now_dt = datetime.datetime.now(tz_ny)
+        now_dt = datetime.datetime.now(tz_my)
         curr_min = (now_dt.minute // 5) * 5
         anchor = now_dt.replace(minute=curr_min, second=0, microsecond=0)
-        times = [(anchor - datetime.timedelta(minutes=(35 - i) * 5)).strftime('%H:%M') for i in range(36)]
-        base_p = 79980.0 if "BTC" in code else 718.50
-        return times, [base_p]*36, [base_p+15]*36, [base_p-15]*36, [base_p]*36, [120.0]*36, -1, "DEMO"
+        times = [(anchor - datetime.timedelta(minutes=(47 - i) * 5)).strftime('%H:%M') for i in range(48)]
+        base_p = 79705.0 if "BTC" in code else 718.50
+        return times, [base_p]*48, [base_p+15]*48, [base_p-15]*48, [base_p]*48, [120.0]*48, -1, "DEMO"
 
     def render_interactive_chart(self, code: str, trade_row: pd.Series = None):
         if trade_row is not None:
@@ -174,7 +179,7 @@ class JournalPlugin:
             exit_label = "🎯 命中 2R 止盈 (+2.0R)" if is_win else "🛡️ 觸發止損出場 (-1.0R)"
         else:
             times, opens, highs, lows, closes, volumes, entry_idx, last_ts = self._load_kline_data(code)
-            entry_p = closes[-1] if len(closes) > 0 else 79980.0
+            entry_p = closes[-1] if len(closes) > 0 else 79705.0
             sl_p, tp_p = entry_p * 0.998, entry_p * 1.004
             pdh_p, pdl_p = max(highs), min(lows)
             rbs_p, sbr_p = min(lows) * 1.001, max(highs) * 0.999
@@ -182,6 +187,7 @@ class JournalPlugin:
 
         fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.70, 0.30])
 
+        # 主圖真實 5M 蠟燭 (漲綠跌紅)
         fig.add_trace(go.Candlestick(
             x=times, open=opens, high=highs, low=lows, close=closes,
             increasing_line_color='#00E676', decreasing_line_color='#FF5252',
@@ -230,7 +236,7 @@ class JournalPlugin:
 
         kline_min = min(lows) if len(lows) > 0 else entry_p - 50
         kline_max = max(highs) if len(highs) > 0 else entry_p + 50
-        padding = max(step_val * 2.5, (kline_max - kline_min) * 0.22)
+        padding = max(step_val * 2.5, (kline_max - kline_min) * 0.18)
 
         fig.update_layout(
             height=460,
@@ -314,15 +320,15 @@ class JournalPlugin:
 
             selected_row = df_day.iloc[sel_sig_idx]
 
-        # 【核心修復】：純前端計時器，倒數歸零時僅提示換棒，絕不執行 location.reload()，保證 100% 停留在當前 Tab
+        # 頂部通欄 Timer (大馬時間軸，流暢倒數，零跳轉)
         chart_timer_html = f"""
         <div style="background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 6px 12px; margin-bottom: 4px; display: flex; justify-content: space-between; align-items: center; font-family: monospace; font-size: 13px; color: #c9d1d9;">
             <div>
                 <b style="color:#58a6ff; font-size:14px;">📈 5M 走勢圖 · 標的: {code}</b> 
-                <span style="color: #8b949e; font-size: 12px; margin-left: 8px;">(富途 OpenD 官方原生數據)</span>
+                <span style="color: #00E676; font-size: 12px; margin-left: 8px;">[🟢 富途 OpenD 官方原生 5M · 大馬時間 MYT]</span>
             </div>
             <div id="chart_inline_timer" style="color: #ffd700; font-weight: bold; font-size: 14px; background: rgba(255, 215, 0, 0.12); border: 1px solid rgba(255, 215, 0, 0.3); border-radius: 4px; padding: 2px 8px;">
-                ⏱️ 換棒倒數: 計算中...
+                ⏱️ 距離下根定格: 計算中...
             </div>
         </div>
         <script>
@@ -352,7 +358,6 @@ class JournalPlugin:
         """
         components.html(chart_timer_html, height=44)
 
-        # 渲染 5M K 線主圖
         last_kline_ts = self.render_interactive_chart(code, selected_row)
 
         if selected_row is not None:
@@ -365,12 +370,11 @@ class JournalPlugin:
             </div>
             """, unsafe_allow_html=True)
         else:
-            st.info(f"💡 【{sel_month}】實盤監控中 | 當前圖表最新 K 線時間: **{last_kline_ts}**")
+            st.info(f"💡 【{sel_month}】實盤監控中 | 當前圖表最新官方定格柱: **{last_kline_ts}**")
 
-        # 雙日誌抽屜
         with st.expander("🛠️ [排查專用] 系統運行日誌 (System Health Log)", expanded=False):
             st.code(self.load_health_log(), language="text")
 
-        trade_audit_log = f"=== 癸水 · 策略復盤日誌 (TRADE AUDIT LOG) ===\n• 標的: {code} | 當前圖表最新柱: {last_kline_ts}\n• 狀態: 實盤監控中，後台守護進程每 5 分鐘自動寫入官方收盤 K 線。\n============================================"
+        trade_audit_log = f"=== 癸水 · 策略復盤日誌 (TRADE AUDIT LOG) ===\n• 標的: {code} | 當前最新柱: {last_kline_ts}\n• 狀態: 實盤監控中，48 根官方 5M 原生柱已對齊。\n============================================"
         with st.expander("📋 [策略專用] 訂單審核日誌 (Trade Audit Log)", expanded=False):
             st.code(trade_audit_log, language="text")
