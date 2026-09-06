@@ -1,5 +1,5 @@
 # 文件名: chart_plugin.py
-# 核心特性: 直連 OpenD 真實 5M K 線 + 毫秒快照動態推進 + 真實極值 (High/Low) 與真實 Volume 審核
+# 核心特性: 最新 5M 真實歷史對齊 (end=now) + 毫秒 Snapshot 現價動態推進 + 影線/成交量/顏色完全同步
 
 import os
 import sys
@@ -54,20 +54,19 @@ class ChartPlugin:
         self.data_dir = data_dir
 
     def fetch_real_history_5m(self, code: str) -> pd.DataFrame:
-        """【真理數據源】向 OpenD 索取真實 5M 歷史 K 線 (包含真實 High/Low/Volume)"""
+        """【真理數據源】索取截至當前美東時刻最近的 60 根真實 5M 歷史 K 線"""
         ctx = MarketDataEngine.get_context()
         target_symbol = "CC.BTCUSD" if "BTC" in code.upper() else code
         if ctx:
             MarketDataEngine.ensure_subscription(target_symbol)
             try:
-                today = datetime.datetime.now(tz_ny).date()
-                start_date = (today - datetime.timedelta(days=3)).strftime("%Y-%m-%d")
-                end_date = today.strftime("%Y-%m-%d")
+                # 以美東當前時刻作為 end，不設 start，OpenD 會自動倒推最新的 60 根
+                now_str = datetime.datetime.now(tz_ny).strftime("%Y-%m-%d %H:%M:%S")
                 
                 ret, df_k, msg = ctx.request_history_kline(
                     code=target_symbol,
-                    start=start_date,
-                    end=end_date,
+                    start='',
+                    end=now_str,
                     ktype=KLType.K_5M,
                     autype=AuType.NONE,
                     max_count=60
@@ -76,7 +75,9 @@ class ChartPlugin:
                     df_k = df_k[['time_key', 'open', 'close', 'high', 'low', 'volume']]
                     df_k['time_key'] = pd.to_datetime(df_k['time_key'])
                     
-                    # 存入本地覆蓋備份
+                    # 依時間升序排序，確保最後一行為最近收盤柱
+                    df_k = df_k.sort_values('time_key').reset_index(drop=True)
+                    
                     save_prefix = "CC_BTCUSD" if "BTC" in code.upper() else code.replace('.', '_')
                     f_path = os.path.join(self.data_dir, f"{save_prefix}_5M.csv")
                     df_k.to_csv(f_path, index=False)
@@ -92,7 +93,7 @@ class ChartPlugin:
                 df = pd.read_csv(f_path)
                 df.columns = [c.lower().strip() for c in df.columns]
                 df['time_key'] = pd.to_datetime(df['time_key'])
-                return df
+                return df.sort_values('time_key').reset_index(drop=True)
             except Exception:
                 pass
         return pd.DataFrame()
@@ -166,7 +167,7 @@ class ChartPlugin:
         return cur_slot_time, slot_str, countdown_str
 
     def track_live_bar_extremes(self, code: str, cur_slot_time: datetime.datetime, curr_price: float) -> tuple:
-        """動態追蹤與鎖定當前 5M 走動期間的真實 High / Low"""
+        """動態追蹤當前 5M 走動期間的真實 High / Low"""
         slot_key = cur_slot_time.strftime('%Y-%m-%d %H:%M:%S')
         cache_key = f"{code}_live_bar"
         bar_data = st.session_state.get(cache_key, None)
@@ -188,7 +189,7 @@ class ChartPlugin:
         return bar_data['open'], bar_data['high'], bar_data['low'], bar_data['close']
 
     def render_cockpit(self, code: str, budget_usd: float = 200.0):
-        # 1. 抓取真實 5M 歷史與即時快照
+        # 1. 抓取真實最近 60 根 5M 與即時快照
         df_5m = self.fetch_real_history_5m(code)
         snap, status_msg = self.get_realtime_snapshot(code)
         df_day = self.load_cold_data(code, "DAY")
@@ -218,14 +219,15 @@ class ChartPlugin:
             flash_sym = "--"
 
         if df_5m.empty or len(df_5m) < 8:
-            st.warning("⏳ 正在向 OpenD 同步真實 5M 歷史 K 線...")
+            st.warning("⏳ 正在向 OpenD 同步最近真實 5M 歷史 K 線...")
             st.info(f"⚙️ 後台狀態: {status_msg}")
             return
 
-        # 2. 策略計算
+        # 2. 策略大腦計算
         trend_bias, trend_text, pdh_line, pdl_line = StrategyEngine.evaluate_trend_bias(df_day, curr_price)
         df_5m_calc, raw_bull, raw_bear = StrategyEngine.evaluate_5m_signals(df_5m, trend_bias, pdh_line, pdl_line)
 
+        # 倒序取最近 5 根收盤柱
         closed_bars_5 = df_5m_calc.tail(5).iloc[::-1].copy().reset_index(drop=True)
 
         table1_rows = []
@@ -372,7 +374,7 @@ class ChartPlugin:
             """
         ):
             st.markdown(f"📶 通道: **{snap['source']}** | 撮合時間: **{snap['server_time']} ET** | 延遲: **{snap['latency_ms']} ms** | 宏觀方向: **{trend_text}**")
-            st.caption(f"⚙️ 狀態: `{status_msg}` | 🎯 真實 5M 歷史數據同步已就緒")
+            st.caption(f"⚙️ 狀態: `{status_msg}` | 🎯 最新 60 根真實 5M 時序已無縫對齊")
 
         # ====== 表 1 ======
         st.markdown("##### 📊 表 1：5M 即時量價核心表 (黃金 30 分鐘滾動窗口)")
