@@ -1,5 +1,5 @@
 # 文件名: chart_plugin.py
-# 核心特性: 表格瘦身合併 + Timer 歸位 LIVE 行 + 審核日誌 Audit Logs + 保守右側確認
+# 核心特性: 自動訂閱修復 + 表格瘦身合併 + Timer 歸位 LIVE 行 + 審核日誌 Audit Logs
 
 import os
 import time
@@ -9,7 +9,6 @@ import pandas as pd
 import pytz
 import streamlit as st
 from moomoo import OpenQuoteContext, RET_OK, KLType, SubType, AuType
-
 from streamlit_extras.stylable_container import stylable_container
 
 tz_ny = pytz.timezone("America/New_York")
@@ -20,7 +19,7 @@ DATA_DIR = os.path.join(BASE_DIR, 'market_data')
 os.makedirs(DATA_DIR, exist_ok=True)
 
 class MarketDataEngine:
-    """單例常駐連線引擎，確保訂閱通道長駐"""
+    """單例常駐連線引擎，確保訂閱通道長駐且自動重連"""
     _quote_ctx = None
     _subscribed_symbols = set()
 
@@ -100,6 +99,7 @@ class ChartPlugin:
         if ctx:
             MarketDataEngine.ensure_subscription(target_symbol)
             try:
+                # 1. 毫秒級快照
                 ret_s, df_snap = ctx.get_market_snapshot([target_symbol])
                 if ret_s == RET_OK and not df_snap.empty:
                     row = df_snap.iloc[0]
@@ -113,12 +113,14 @@ class ChartPlugin:
                     snap["latency_ms"] = int((time.time() - t_start) * 1000)
                     status_msg = f"已成功訂閱 {target_symbol} 實時通道"
 
+                # 2. 實時 5M K 線
                 ret_k, df_k = ctx.get_cur_kline(target_symbol, 40, KLType.K_5M, AuType.NONE)
                 if ret_k == RET_OK and not df_k.empty:
                     df_5m = df_k[['time_key', 'open', 'close', 'high', 'low', 'volume']].copy()
                     df_5m.columns = [c.lower().strip() for c in df_5m.columns]
                     df_5m['time_key'] = pd.to_datetime(df_5m['time_key'])
                     df_5m = df_5m.sort_values('time_key').reset_index(drop=True)
+                    # 落盤備份
                     save_prefix = "CC_BTCUSD" if "BTC" in code.upper() else code.replace('.', '_')
                     df_5m.to_csv(os.path.join(self.data_dir, f"{save_prefix}_5M.csv"), index=False)
             except Exception as e:
@@ -268,7 +270,7 @@ class ChartPlugin:
             diag_str = "⚪ 常規波動"
 
             if idx == 0:
-                # 表 1 合併第 1 欄：時段 + LIVE + 倒數計時 Timer 同字體
+                # 表 1 合併第 1 欄：時段 + LIVE + 倒數計時 Timer (同字體大小)
                 col1_t1 = f"<b style='color:#58a6ff;'>{t_str}</b> <span style='background:#1f293d; color:#58a6ff; padding:2px 6px; border-radius:4px; font-weight:bold;'>⚡ LIVE</span> <span style='background:#161b22; color:#00E676; border:1px solid #238636; padding:2px 6px; border-radius:4px; font-weight:bold;'>⏱️ {countdown_str}</span>"
                 # 表 2 合併第 1 欄：時段 + TD
                 col1_t2 = f"<b style='color:#58a6ff;'>{t_str}</b> <span style='color:#8b949e;'>{td_s}</span>"
@@ -364,7 +366,7 @@ class ChartPlugin:
 
             audit_bars_log.append(audit_log_line)
 
-        # ====== 頂部精準 HUD ======
+        # ====== 頂部 HUD ======
         with stylable_container(
             key="hud_container",
             css_styles="""
@@ -441,7 +443,7 @@ class ChartPlugin:
         </div>
         """, unsafe_allow_html=True)
 
-        # ====== 模組 7: 完整 Audit Logs 審核日誌 (原生無亂碼代碼塊) ======
+        # ====== 模組 7: 完整 Audit Logs 審核日誌 (原生代碼塊，自帶官方右上角複製按鈕) ======
         now_my_str = datetime.datetime.now(tz_my).strftime('%Y-%m-%d %H:%M:%S MYT')
         now_ny_str = datetime.datetime.now(tz_ny).strftime('%Y-%m-%d %H:%M:%S ET')
 
@@ -461,6 +463,5 @@ class ChartPlugin:
         audit_text += f"===========================================\n"
 
         st.markdown("<div style='margin-top: 20px;'></div>", unsafe_allow_html=True)
-        st.markdown("##### 📋 審核日誌 (Audit Logs) —— 複製框 (原生代碼塊，右上角自帶複製按鈕)：")
-        # 使用 Streamlit 原生代碼塊，自帶官方「一鍵複製」小圖標，且 100% 絕無 HTML 亂碼
+        st.markdown("##### 📋 審核日誌 (Audit Logs) —— 複製框 (右上角自帶複製按鈕)：")
         st.code(audit_text, language="text")
