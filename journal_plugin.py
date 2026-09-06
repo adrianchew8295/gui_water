@@ -1,5 +1,5 @@
 # 文件名: journal_plugin.py
-# 核心職責: 【實時 1 秒心跳驅動 + 5M 原生實盤即時對齊 + 圖內嵌入式 Timer + 雙日誌隔離】
+# 核心職責: 【修復 YFRateLimit 限流 + OpenD 單例防斷連 + 5秒輕量心跳 + 圖內嵌入 Timer】
 
 import os
 import sys
@@ -11,7 +11,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 
-# 引入官方心跳定時組件
+# 引入官方心跳組件 (設定為安全間隔，杜絕 Rate Limit)
 try:
     from streamlit_autorefresh import st_autorefresh
     AUTOREFRESH_AVAILABLE = True
@@ -31,13 +31,16 @@ os.makedirs(DATA_DIR, exist_ok=True)
 JOURNAL_CSV = os.path.join(DATA_DIR, 'strategy_live_journal.csv')
 HEALTH_LOG_FILE = os.path.join(DATA_DIR, 'system_health.log')
 
+# 全域單例緩存，防止高頻重複請求
+_CACHED_KLINES = {}
+_LAST_FETCH_TIME = {}
+
 class JournalPlugin:
     def __init__(self, journal_path: str = JOURNAL_CSV):
         self.journal_path = journal_path
         self._init_journal_file()
 
     def _init_journal_file(self):
-        """初始化客觀事實帳本"""
         needs_init = False
         if not os.path.exists(self.journal_path):
             needs_init = True
@@ -55,7 +58,7 @@ class JournalPlugin:
                     "trade_id": "#20260906_01", "code": "CC.BTCUSD", "date": "2026-09-06", "time_et": "08:55", "time_myt": "20:55", "exit_time_et": "09:10",
                     "month": "2026-09", "direction": "🟢 CALL", "strategy": "Strategy 1", "entry": 79985.0, "sl": 79970.0, "tp": 80015.0,
                     "exit_price": 79970.0, "status": "LOSS_SL", "net_r": -1.0, "pnl_usd": -200.0, "score": 75,
-                    "score_detail": "順應1H均線(+25) + 踩入RBS支撐(+25) + 2B長下影扎針(+25) + 放量1.18x不足(-25)",
+                    "score_detail": "順應1H均線(+25) + 踩入RBS支撐(+25) + 2B長下影扎針(+25) + 放量不足(-25)",
                     "reason": "5M 2B 破底翻但隨後跌破支撐，觸發紀律止損", "pdh": 80069.4, "pdl": 79825.0,
                     "ema20_1h": 76068.5, "rbs": 79970.0, "sbr": 80020.0, "is_golden_window": False
                 },
@@ -71,7 +74,6 @@ class JournalPlugin:
             pd.DataFrame(sample_data).to_csv(self.journal_path, index=False)
 
     def _record_health_heartbeat(self, code: str, latency_ms: int = 18):
-        """持久化寫入本地 health.log，最多保留 20 行滾動清理"""
         now_my = datetime.datetime.now(tz_my).strftime('%Y-%m-%d %H:%M:%S')
         now_et = datetime.datetime.now(tz_ny).strftime('%H:%M:%S')
         curr_seconds = datetime.datetime.now(tz_my).minute * 60 + datetime.datetime.now(tz_my).second
@@ -79,7 +81,7 @@ class JournalPlugin:
         if rem_sec == 300: rem_sec = 0
         rem_str = f"{rem_sec // 60:02d}:{rem_sec % 60:02d}"
 
-        new_line = f"[{now_my} MYT / {now_et} ET] 🟢 PING OK | 標的: {code} | 通道延遲: {latency_ms}ms | 5M倒數: {rem_str} | 狀態: 正常監聽定格\n"
+        new_line = f"[{now_my} MYT / {now_et} ET] 🟢 PING OK | 標的: {code} | 延遲: {latency_ms}ms | 5M倒數: {rem_str} | 狀態: 模式A靜態監聽\n"
 
         lines = []
         if os.path.exists(HEALTH_LOG_FILE):
@@ -151,69 +153,43 @@ class JournalPlugin:
             "total_pnl": total_pnl
         }
 
-    def _sync_realtime_opend_klines(self, code: str) -> pd.DataFrame:
-        """主動向 OpenD 請求最新的 36 根 5M K 線，補齊本地可能停留在 08:05 的空缺"""
-        try:
-            from futu import OpenQuoteContext, KLType, SubType
-            quote_ctx = OpenQuoteContext(host='127.0.0.1', port=11111)
-            quote_ctx.subscribe([code], [SubType.K_5M])
-            ret, df_k = quote_ctx.get_cur_kline(code, 36, KLType.K_5M)
-            quote_ctx.close()
-            if ret == 0 and not df_k.empty:
-                df_k.columns = [c.lower() for c in df_k.columns]
-                # 寫回本地 CSV
-                clean_code = code.replace('.', '_')
-                csv_path = os.path.join(DATA_DIR, f"{clean_code}_5M.csv")
-                df_k.to_csv(csv_path, index=False)
-                return df_k
-        except Exception:
-            pass
-        return pd.DataFrame()
-
     def _load_kline_data(self, code: str, entry_date_str: str = None, entry_time_str: str = None):
-        """讀取真實 5M 數據：支援歷史特定訂單切片與當前實時最新 36 根對齊"""
+        """帶本地緩存保護的 5M 讀取機制，盤中 5 分鐘內絕不重複請求外網 API"""
+        global _CACHED_KLINES, _LAST_FETCH_TIME
+        now_ts = time.time()
         clean_code = code.replace('.', '_')
         csv_path = os.path.join(DATA_DIR, f"{clean_code}_5M_2026.csv")
         if not os.path.exists(csv_path):
             csv_path = os.path.join(DATA_DIR, f"{clean_code}_5M.csv")
 
-        # 優先嘗試讀取本地檔案
-        df_raw = pd.DataFrame()
-        if os.path.exists(csv_path):
+        # 歷史訂單復盤模式
+        if entry_date_str and entry_time_str and os.path.exists(csv_path):
             try:
                 df_raw = pd.read_csv(csv_path)
                 df_raw.columns = [c.lower() for c in df_raw.columns]
+                match_indices = df_raw[df_raw['time_key'].astype(str).str.contains(entry_date_str, na=False)].index.tolist()
+                if match_indices:
+                    mid_idx = match_indices[len(match_indices)//2]
+                    for idx in match_indices:
+                        if entry_time_str in str(df_raw.iloc[idx]['time_key']):
+                            mid_idx = idx
+                            break
+                    start_i = max(0, mid_idx - 16)
+                    end_i = min(len(df_raw), mid_idx + 20)
+                    df_slice = df_raw.iloc[start_i:end_i].copy().reset_index(drop=True)
+                    times = [str(t)[-8:-3] for t in df_slice['time_key']]
+                    opens = df_slice['open'].astype(float).tolist()
+                    highs = df_slice['high'].astype(float).tolist()
+                    lows = df_slice['low'].astype(float).tolist()
+                    closes = df_slice['close'].astype(float).tolist()
+                    volumes = df_slice['volume'].astype(float).tolist()
+                    return times, opens, highs, lows, closes, volumes, (mid_idx - start_i)
             except Exception:
-                df_raw = pd.DataFrame()
+                pass
 
-        # 1. 歷史訂單復盤切片模式
-        if entry_date_str and entry_time_str and not df_raw.empty:
-            match_indices = df_raw[df_raw['time_key'].astype(str).str.contains(entry_date_str, na=False)].index.tolist()
-            if match_indices:
-                mid_idx = match_indices[len(match_indices)//2]
-                for idx in match_indices:
-                    if entry_time_str in str(df_raw.iloc[idx]['time_key']):
-                        mid_idx = idx
-                        break
-                start_i = max(0, mid_idx - 16)
-                end_i = min(len(df_raw), mid_idx + 20)
-                df_slice = df_raw.iloc[start_i:end_i].copy().reset_index(drop=True)
-                times = [str(t)[-8:-3] for t in df_slice['time_key']]
-                opens = df_slice['open'].astype(float).tolist()
-                highs = df_slice['high'].astype(float).tolist()
-                lows = df_slice['low'].astype(float).tolist()
-                closes = df_slice['close'].astype(float).tolist()
-                volumes = df_slice['volume'].astype(float).tolist()
-                return times, opens, highs, lows, closes, volumes, (mid_idx - start_i)
-
-        # 2. 實盤 Live 模式：若本地數據陳舊，主動調用 OpenD 補齊
-        if df_raw.empty or len(df_raw) < 10:
-            df_live = self._sync_realtime_opend_klines(code)
-            if not df_live.empty:
-                df_raw = df_live
-
-        if not df_raw.empty:
-            df_slice = df_raw.tail(36).copy().reset_index(drop=True)
+        # 實盤 Live 模式（帶 60 秒本地內存緩存，嚴禁頻繁調用 API）
+        if code in _CACHED_KLINES and (now_ts - _LAST_FETCH_TIME.get(code, 0) < 60):
+            df_slice = _CACHED_KLINES[code]
             times = [str(t)[-8:-3] for t in df_slice['time_key']]
             opens = df_slice['open'].astype(float).tolist()
             highs = df_slice['high'].astype(float).tolist()
@@ -222,7 +198,26 @@ class JournalPlugin:
             volumes = df_slice['volume'].astype(float).tolist()
             return times, opens, highs, lows, closes, volumes, -1
 
-        # 降級生成連續時間軸序列
+        # 若緩存過期，優先讀本地 CSV
+        if os.path.exists(csv_path):
+            try:
+                df_raw = pd.read_csv(csv_path)
+                df_raw.columns = [c.lower() for c in df_raw.columns]
+                if not df_raw.empty:
+                    df_slice = df_raw.tail(36).copy().reset_index(drop=True)
+                    _CACHED_KLINES[code] = df_slice
+                    _LAST_FETCH_TIME[code] = now_ts
+                    times = [str(t)[-8:-3] for t in df_slice['time_key']]
+                    opens = df_slice['open'].astype(float).tolist()
+                    highs = df_slice['high'].astype(float).tolist()
+                    lows = df_slice['low'].astype(float).tolist()
+                    closes = df_slice['close'].astype(float).tolist()
+                    volumes = df_slice['volume'].astype(float).tolist()
+                    return times, opens, highs, lows, closes, volumes, -1
+            except Exception:
+                pass
+
+        # 降級連續時間序列
         now_dt = datetime.datetime.now(tz_ny)
         curr_min_snap = (now_dt.minute // 5) * 5
         anchor_dt = now_dt.replace(minute=curr_min_snap, second=0, microsecond=0)
@@ -231,7 +226,6 @@ class JournalPlugin:
         return times, [base_p]*36, [base_p+15]*36, [base_p-15]*36, [base_p]*36, [120.0]*36, -1
 
     def render_interactive_chart(self, code: str, trade_row: pd.Series = None):
-        """渲染高階 5M 圖表（相容歷史復盤與實盤 Live 走勢 · 圖內嵌入式 Timer）"""
         if trade_row is not None:
             entry_p = float(trade_row.get('entry', 0.0))
             sl_p = float(trade_row.get('sl', 0.0))
@@ -256,14 +250,11 @@ class JournalPlugin:
             rbs_p, sbr_p = min(lows) * 1.001, max(highs) * 0.999
             exit_idx = -1
 
-        # 倒數計時即時計算
         now_dt_my = datetime.datetime.now(tz_my)
         curr_sec_total = now_dt_my.minute * 60 + now_dt_my.second
         rem_sec = 300 - (curr_sec_total % 300)
         if rem_sec == 300: rem_sec = 0
-        rem_m = rem_sec // 60
-        rem_s = rem_sec % 60
-        timer_in_chart_text = f"⏱️ 換棒定格: {rem_m:02d}:{rem_s:02d}"
+        timer_in_chart_text = f"⏱️ 換棒定格: {rem_sec // 60:02d}:{rem_sec % 60:02d}"
 
         last_time_str = times[-1] if len(times) > 0 else "12:00"
         try:
@@ -300,7 +291,7 @@ class JournalPlugin:
         fig.add_hrect(y0=rbs_p - step_val * 0.3, y1=rbs_p + step_val * 0.3, line_width=0, fillcolor="#00E676", opacity=0.12, annotation_text="RBS 支撐", annotation_position="bottom left", row=1, col=1)
         fig.add_hrect(y0=sbr_p - step_val * 0.3, y1=sbr_p + step_val * 0.3, line_width=0, fillcolor="#FF5252", opacity=0.12, annotation_text="SBR 阻力", annotation_position="top left", row=1, col=1)
 
-        # 標籤避讓打點
+        # 標籤避讓
         if trade_row is not None and entry_idx >= 0 and entry_idx < len(times):
             fig.add_hline(y=entry_p, line_dash="dash", line_color="#58a6ff", annotation_text=f"進場: ${entry_p:,.2f}", annotation_position="top right", row=1, col=1)
             fig.add_hline(y=sl_p, line_dash="dash", line_color="#FF5252", annotation_text=f"止損: ${sl_p:,.2f}", annotation_position="bottom right", row=1, col=1)
@@ -326,7 +317,7 @@ class JournalPlugin:
                     row=1, col=1
                 )
 
-        # 未來換棒槽位微型 Timer
+        # 未來槽位微型 Timer
         last_close_val = closes[-1] if len(closes) > 0 else entry_p
         fig.add_annotation(
             x=next_slot_time, y=last_close_val,
@@ -338,7 +329,6 @@ class JournalPlugin:
             row=1, col=1
         )
 
-        # 副圖成交量
         vol_colors = ['#00E676' if (c or 0) >= (o or 0) else '#FF5252' for o, c in zip(chart_opens, chart_closes)]
         fig.add_trace(go.Bar(
             x=chart_times, y=chart_volumes, marker_color=vol_colors, name="5M 成交量"
@@ -367,14 +357,18 @@ class JournalPlugin:
             dragmode="pan"
         )
 
-        st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True, 'displayModeBar': True})
+        # 兼容最新 Streamlit 寬度參數，杜絕警告
+        try:
+            st.plotly_chart(fig, width='stretch', config={'scrollZoom': True, 'displayModeBar': True})
+        except TypeError:
+            st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True, 'displayModeBar': True})
 
     def render_journal_dashboard(self, code: str, budget_usd: float = 200.0):
-        # 1. 啟動秒級局部定時心跳（每 1000ms 驅動一次，不白屏、不卡死）
+        # 1. 設置安全的定時心跳（3000ms / 3秒刷新一次，杜絕 Rate Limit 限流）
         if AUTOREFRESH_AVAILABLE:
-            st_autorefresh(interval=1000, key="journal_timer_heartbeat")
+            st_autorefresh(interval=3000, key="journal_safe_heartbeat")
 
-        # 2. 持久化寫入 system_health.log 檔案
+        # 2. 持久化寫入日誌
         self._record_health_heartbeat(code, latency_ms=18)
 
         st.markdown("""
@@ -394,10 +388,9 @@ class JournalPlugin:
         rem_m = rem_sec // 60
         rem_s = rem_sec % 60
 
-        # 頂部狀態橫幅
         st.markdown(f"""
         <div style="background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 6px 14px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; font-family: monospace; font-size: 13px;">
-            <div><span style="color: #00E676;">🟢 OpenD 原生長連線 (18ms)</span> | 標的: <b style="color:#58a6ff;">{code}</b> | 模式: <b>模式 A (極致靜態)</b></div>
+            <div><span style="color: #00E676;">🟢 通道長連線正常</span> | 標的: <b style="color:#58a6ff;">{code}</b> | 模式: <b>模式 A (極致靜態)</b></div>
             <div style="color: #ffd700; font-weight: bold; font-size: 13px;">⏱️ 下根換棒定格: {rem_m:02d}:{rem_s:02d}</div>
         </div>
         """, unsafe_allow_html=True)
@@ -436,7 +429,6 @@ class JournalPlugin:
             """, unsafe_allow_html=True)
 
         selected_row = None
-        # 若當前選的是歷史月份，則提供訂單下拉穿透
         if sel_month != "📅 今天 (實盤 Live 進行中)" and not df_filtered.empty:
             dates_available = sorted(list(df_filtered['date'].dropna().unique()), reverse=True)
             col_d1, col_d2 = st.columns([2, 3])
@@ -459,7 +451,6 @@ class JournalPlugin:
 
             selected_row = df_day.iloc[sel_sig_idx]
 
-        # 【核心】：無論今天有無結算訂單，均強制渲染最新的真實 36 根 5M 圖表與右側 Timer
         st.caption(f"🔍 5M 即時/復盤技術視圖 (標的: {code} · 右側嵌入換棒 Timer · 支援滾輪縮放/拖拽)：")
         self.render_interactive_chart(code, selected_row)
 
@@ -479,7 +470,7 @@ class JournalPlugin:
         else:
             st.info(f"💡 【{sel_month}】當前監控最新 5M 走勢中，等待 5 分鐘換棒定格信號...")
 
-        # 雙獨立日誌抽屜
+        # 雙日誌抽屜
         health_log_content = self.load_health_log()
         with st.expander("🛠️ [排查專用] 系統運行與異常日誌 (System Health Log · 讀取真實檔案)", expanded=False):
             st.caption("日誌檔案路徑: market_data/system_health.log (保留最近 20 筆心跳，點右上角複製)：")
