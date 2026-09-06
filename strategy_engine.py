@@ -1,11 +1,11 @@
 # 文件名: strategy_engine.py
-# 核心職責: 【獨立策略大腦】Trend Bias、2B假突破、TD 9轉、保守右側確認、0DTE期權點位
+# 核心职责: 【独立策略大脑】VPA多空对称形态分类、Trend Bias门禁、2B假突破、TD 9转、0DTE期权换算
 
 import numpy as np
 import pandas as pd
 
 class StrategyEngine:
-    """量化策略計算中樞"""
+    """量化策略计算中枢"""
 
     @staticmethod
     def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
@@ -45,11 +45,48 @@ class StrategyEngine:
         return setup_type
 
     @staticmethod
+    def classify_candle_shape(open_p: float, high_p: float, low_p: float, close_p: float) -> str:
+        """
+        【VPA 核心經典形態 · 多空對稱分類】
+        依據安娜·庫林 (Anna Coulling) 量價幾何學判定 K 線解剖形態
+        """
+        total_range = high_p - low_p
+        if total_range <= 0.0001:
+            return "⚪ 十字 ⚖️"
+
+        body = abs(close_p - open_p)
+        upper_wick = high_p - max(open_p, close_p)
+        lower_wick = min(open_p, close_p) - low_p
+        is_up = close_p > open_p
+        is_dn = close_p < open_p
+
+        # 1. 實體極窄 (≤ 15% 振幅) -> 長腿十字星 (變盤節點)
+        if body <= total_range * 0.15:
+            return "⚪ 十字 ⚖️"
+
+        # 2. 長上影線形態 (上影線 ≥ 2 倍實體)
+        if upper_wick >= 2.0 * body and lower_wick <= 0.20 * total_range:
+            return "🔴 陰 🌠 射星" if is_dn else "🟢 陽 🛸 倒錘"
+
+        # 3. 長下影線形態 (下影線 ≥ 2 倍實體)
+        if lower_wick >= 2.0 * body and upper_wick <= 0.20 * total_range:
+            return "🟢 陽 🔨 鐵錘" if is_up else "🔴 陰 🪓 吊頸"
+
+        # 4. 實體大陽 / 大陰 (實體佔比 ≥ 75%)
+        if body >= 0.75 * total_range:
+            return "🟢 大陽 🚀 衝鋒" if is_up else "🔴 大陰 💥 破位"
+
+        # 5. 常規常態 K 線
+        if is_up:
+            return "🟢 陽"
+        elif is_dn:
+            return "🔴 陰"
+        else:
+            return "⚪ 平"
+
+    @staticmethod
     def evaluate_trend_bias(df_day: pd.DataFrame, curr_price: float) -> tuple:
-        """
-        【模組：宏觀方向門禁】
-        修改此處即可更換趨勢判定理念 (如 EMA、MACD、VIX 等)
-        """
+        """【模組：宏觀方向門禁】"""
         trend_bias = 0
         trend_text = "⚪ 0 (中立震盪)"
         pdh_line = curr_price * 1.008
@@ -72,10 +109,7 @@ class StrategyEngine:
 
     @staticmethod
     def evaluate_5m_signals(df_5m: pd.DataFrame, trend_bias: int, pdh_line: float, pdl_line: float) -> tuple:
-        """
-        【模組：5M 戰術信號與形態診斷】
-        修改此處即可增減或替換形態 (如 2B、吞沒、晨星等)
-        """
+        """【模組：5M 戰術信號與 2B 形態診斷】"""
         df = df_5m.copy()
         df['vma20'] = df['volume'].rolling(20).mean().bfill()
         df['atr14'] = StrategyEngine.calculate_atr(df, 14)
@@ -88,7 +122,6 @@ class StrategyEngine:
         bull_2b_raw = ((df['low'] < llv5) | (df['low'] < pdl_line)) & (df['close'] > llv5) & (df['close'] > df['open'])
         bear_2b_raw = ((df['high'] > hhv5) | (df['high'] > pdh_line)) & (df['close'] < hhv5) & (df['close'] < df['open'])
 
-        # 吞沒與晨星
         c1, o1 = df['close'].shift(1), df['open'].shift(1)
         c2, o2 = df['close'].shift(2), df['open'].shift(2)
         h1, l1 = df['high'].shift(1), df['low'].shift(1)
@@ -106,9 +139,7 @@ class StrategyEngine:
 
     @staticmethod
     def calculate_option_plan(curr_price: float, trigger_type: str, budget_usd: float = 200.0) -> dict:
-        """
-        【模組：0DTE 期權智能換算】
-        """
+        """【模組：0DTE 期權智能換算】"""
         strike_atm = round(curr_price)
         est_option_price = 1.45
         total_cost = est_option_price * 100
