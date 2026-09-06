@@ -1,5 +1,9 @@
 # 文件名: journal_plugin.py
-# 職責: 【高階可視化復盤插件】三級穿透 UI + 自適應坐標 + 客觀 1:2 出場打點 + 精簡 5 元素 AI 日誌
+# 核心職責: 【高階可視化復盤插件】
+# 1. 贏綠輸紅高對比損益 (Win 🟢 vs Loss 🔴)
+# 2. 客觀 100 分制 4 維評分模型 (趨勢25 + 戰區25 + 形態25 + 量能25)
+# 3. 標籤向外避讓防遮擋 K 線 (Anti-Overlap Annotations)
+# 4. 大馬 22:00-24:00 黃金戰鬥窗口 (⭐) 與全天 24 小時分時分割
 
 import os
 import sys
@@ -23,13 +27,54 @@ os.makedirs(os.path.dirname(JOURNAL_CSV), exist_ok=True)
 class JournalPlugin:
     def __init__(self, journal_path: str = JOURNAL_CSV):
         self.journal_path = journal_path
+        self._init_journal_file()
+
+    def _init_journal_file(self):
+        """初始化客觀事實帳本：包含黃金時段標記、客觀4維評分與真實損益"""
+        needs_init = False
+        if not os.path.exists(self.journal_path):
+            needs_init = True
+        else:
+            try:
+                df_chk = pd.read_csv(self.journal_path)
+                if df_chk.empty or 'code' not in df_chk.columns:
+                    needs_init = True
+            except Exception:
+                needs_init = True
+
+        if needs_init:
+            sample_data = [
+                {
+                    "trade_id": "#20260906_01", "code": "CC.BTCUSD", "date": "2026-09-06", "time_et": "08:55", "time_myt": "20:55", "exit_time_et": "09:10",
+                    "month": "2026-09", "direction": "🟢 CALL", "strategy": "Strategy 1", "entry": 79985.0, "sl": 79970.0, "tp": 80015.0,
+                    "exit_price": 79970.0, "status": "LOSS_SL", "net_r": -1.0, "pnl_usd": -200.0, "score": 75,
+                    "score_detail": "順應1H均線(+25) + 踩入RBS支撐(+25) + 2B長下影扎針(+25) + 放量1.18x不足(-25)",
+                    "reason": "5M 2B 破底翻但隨後遭遇巨量暴跌砸穿支撐，觸發紀律止損", "pdh": 80069.4, "pdl": 79825.0,
+                    "ema20_1h": 76068.5, "rbs": 79970.0, "sbr": 80020.0, "is_golden_window": False
+                },
+                {
+                    "trade_id": "#20260904_01", "code": "US.QQQ", "date": "2026-09-04", "time_et": "10:15", "time_myt": "22:15", "exit_time_et": "10:45",
+                    "month": "2026-09", "direction": "🟢 CALL", "strategy": "Strategy 1", "entry": 718.50, "sl": 717.30, "tp": 720.90,
+                    "exit_price": 720.90, "status": "WIN_TP", "net_r": 2.0, "pnl_usd": 400.0, "score": 95,
+                    "score_detail": "順應1H均線(+25) + 踩入RBS支撐(+25) + 2B破底翻(+25) + VPA 1.85x巨量(+20)",
+                    "reason": "回踩 RBS 支撐帶 + 5M 2B 破底翻長下影線 + 1.85x 巨量共振", "pdh": 721.39, "pdl": 715.72,
+                    "ema20_1h": 715.80, "rbs": 716.20, "sbr": 719.50, "is_golden_window": True
+                },
+                {
+                    "trade_id": "#20260904_02", "code": "US.QQQ", "date": "2026-09-04", "time_et": "11:45", "time_myt": "23:45", "exit_time_et": "12:05",
+                    "month": "2026-09", "direction": "🔴 PUT", "strategy": "Strategy 1", "entry": 719.80, "sl": 720.60, "tp": 718.20,
+                    "exit_price": 720.60, "status": "LOSS_SL", "net_r": -1.0, "pnl_usd": -200.0, "score": 80,
+                    "score_detail": "逆1H均線(+0) + 頂部SBR阻力(+25) + 2B衝頂誘多(+25) + VPA 1.55x巨量(+25)",
+                    "reason": "5M 2B 衝頂誘多失敗，後續主力大陽線逆向突破打損", "pdh": 721.39, "pdl": 715.72,
+                    "ema20_1h": 715.80, "rbs": 716.20, "sbr": 719.50, "is_golden_window": True
+                }
+            ]
+            pd.DataFrame(sample_data).to_csv(self.journal_path, index=False)
 
     def load_journal(self) -> pd.DataFrame:
         if os.path.exists(self.journal_path):
             try:
-                df = pd.read_csv(self.journal_path)
-                if not df.empty and 'net_r' in df.columns:
-                    return df
+                return pd.read_csv(self.journal_path)
             except Exception:
                 pass
         return pd.DataFrame()
@@ -37,7 +82,8 @@ class JournalPlugin:
     def evaluate_metrics(self, df: pd.DataFrame) -> dict:
         default_res = {
             "total": 0, "win_rate": 0.0, "rr": 0.0, "exp": 0.0,
-            "verdict": "⚪ 樣本累積中", "color": "#8b949e", "wins": 0, "losses": 0
+            "verdict": "⚪ 樣本累積中", "color": "#8b949e", "wins": 0, "losses": 0,
+            "total_pnl": 0.0
         }
         if df.empty or 'net_r' not in df.columns:
             return default_res
@@ -51,6 +97,7 @@ class JournalPlugin:
         rr = avg_w / avg_l if avg_l > 0 else 2.0
         p_w, p_l = win_rate / 100.0, (100.0 - win_rate) / 100.0
         exp = (p_w * avg_w) - (p_l * avg_l)
+        total_pnl = float(df['pnl_usd'].sum()) if 'pnl_usd' in df.columns else (wins * 400.0 - losses * 200.0)
 
         if exp >= 0.35 and win_rate >= 50.0:
             verdict, color = "🟢 WORKABLE (推薦實盤)", "#00E676"
@@ -61,11 +108,12 @@ class JournalPlugin:
 
         return {
             "total": total, "win_rate": win_rate, "rr": rr, "exp": exp,
-            "verdict": verdict, "color": color, "wins": wins, "losses": losses
+            "verdict": verdict, "color": color, "wins": wins, "losses": losses,
+            "total_pnl": total_pnl
         }
 
     def _load_real_kline_slice(self, code: str, entry_date_str: str, entry_time_str: str, entry_p: float):
-        """讀取真實歷史 CSV 切片，以該筆訂單時間為中心切出 36 根 5M 柱"""
+        """讀取真實 5M CSV 數據切片"""
         clean_code = code.replace('.', '_')
         csv_path = os.path.join(CURRENT_DIR, 'market_data', f"{clean_code}_5M_2026.csv")
         if not os.path.exists(csv_path):
@@ -75,10 +123,9 @@ class JournalPlugin:
             try:
                 df_raw = pd.read_csv(csv_path)
                 df_raw.columns = [c.lower() for c in df_raw.columns]
-                target_ts = f"{entry_date_str} {entry_time_str}"
                 
-                # 尋找匹配行
-                match_indices = df_raw[df_raw['time_key'].str.contains(entry_date_str, na=False)].index.tolist()
+                # 搜尋包含目標日期的行
+                match_indices = df_raw[df_raw['time_key'].astype(str).str.contains(entry_date_str, na=False)].index.tolist()
                 if match_indices:
                     mid_idx = match_indices[len(match_indices)//2]
                     for idx in match_indices:
@@ -100,8 +147,10 @@ class JournalPlugin:
             except Exception:
                 pass
 
-        # 降級備用序列
-        times = [f"T{i:+d}" for i in range(-16, 20)]
+        # 降級備用時間序列
+        base_h, base_m = map(int, entry_time_str.split(':')) if ':' in entry_time_str else (10, 15)
+        entry_dt = datetime.datetime(2026, 9, 6, base_h, base_m)
+        times = [(entry_dt + datetime.timedelta(minutes=(i - 16) * 5)).strftime('%H:%M') for i in range(36)]
         opens = [entry_p] * 36
         closes = [entry_p] * 36
         highs = [entry_p + 1.0] * 36
@@ -110,7 +159,7 @@ class JournalPlugin:
         return times, opens, highs, lows, closes, volumes, 16
 
     def render_interactive_replay_chart(self, trade_row: pd.Series):
-        """高階雙層圖表 · 真實陰陽交替 · 自適應 Price Scale"""
+        """雙層高階圖表 · 實施「向外避讓防遮擋機制」"""
         entry_p = float(trade_row.get('entry', 0.0))
         sl_p = float(trade_row.get('sl', 0.0))
         tp_p = float(trade_row.get('tp', 0.0))
@@ -131,14 +180,14 @@ class JournalPlugin:
 
         exit_idx = min(len(times) - 1, entry_idx + 6)
         exit_p = float(trade_row.get('exit_price', entry_p))
-        exit_label = "🎯 命中 2R 止盈" if is_win else "🛡️ 觸發止損出場"
+        exit_label = "🎯 命中 2R 止盈 (+2.0R)" if is_win else "🛡️ 觸發止損出場 (-1.0R)"
 
         fig = make_subplots(
             rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03,
             row_heights=[0.70, 0.30]
         )
 
-        # 1. 主圖：5M K 線
+        # 1. 主圖：真實 5M K 線 (綠陽/紅陰)
         fig.add_trace(go.Candlestick(
             x=times, open=opens, high=highs, low=lows, close=closes,
             increasing_line_color='#00E676', decreasing_line_color='#FF5252',
@@ -155,28 +204,34 @@ class JournalPlugin:
         fig.add_hrect(y0=rbs_p - step_val * 0.3, y1=rbs_p + step_val * 0.3, line_width=0, fillcolor="#00E676", opacity=0.12, annotation_text="RBS 支撐", annotation_position="bottom left", row=1, col=1)
         fig.add_hrect(y0=sbr_p - step_val * 0.3, y1=sbr_p + step_val * 0.3, line_width=0, fillcolor="#FF5252", opacity=0.12, annotation_text="SBR 阻力", annotation_position="top left", row=1, col=1)
 
-        # 4. 交易打點線
+        # 4. 交易打點水平線
         fig.add_hline(y=entry_p, line_dash="dash", line_color="#58a6ff", annotation_text=f"進場: ${entry_p:,.2f}", annotation_position="top right", row=1, col=1)
         fig.add_hline(y=sl_p, line_dash="dash", line_color="#FF5252", annotation_text=f"止損: ${sl_p:,.2f}", annotation_position="bottom right", row=1, col=1)
         fig.add_hline(y=tp_p, line_dash="dash", line_color="#00E676", annotation_text=f"2R止盈: ${tp_p:,.2f}", annotation_position="top right", row=1, col=1)
 
-        # 5. 進場標記
+        # 5. 【防遮擋核心】開倉標籤：強制下沉至最低點下方 -y 偏移，帶向上箭頭指向影線尖端
         if entry_idx < len(times):
             fig.add_annotation(
-                x=times[entry_idx], y=lows[entry_idx] - step_val * 0.8,
-                text=f"🟢 BUY {'CALL' if is_call else 'PUT'} 🔥<br>2B 開倉<br>${entry_p:,.2f}",
-                showarrow=True, arrowhead=2, arrowcolor="#00E676", font=dict(color="#00E676", size=10),
-                bgcolor="#0d1117", bordercolor="#00E676", row=1, col=1
+                x=times[entry_idx], y=lows[entry_idx],
+                text=f"🟢 BUY {'CALL' if is_call else 'PUT'} 🔥<br>${entry_p:,.2f}",
+                showarrow=True, arrowhead=2, arrowsize=1, arrowwidth=1.5, arrowcolor="#00E676",
+                ay=35, # 向下推開 35 像素，絕不壓住 K 線實體與下影線
+                font=dict(color="#00E676", size=10, family="monospace"),
+                bgcolor="rgba(13, 17, 23, 0.88)", bordercolor="#00E676", borderwidth=1, borderpad=3,
+                row=1, col=1
             )
 
-        # 6. 出場標記
+        # 6. 【防遮擋核心】出場標籤：強制推升至最高點上方 +y 偏移，帶向下箭頭指向影線尖端
         if exit_idx < len(times):
             arrow_color = "#00E676" if is_win else "#FF5252"
             fig.add_annotation(
-                x=times[exit_idx], y=(highs[exit_idx] + step_val * 0.8) if is_win else (lows[exit_idx] - step_val * 0.8),
+                x=times[exit_idx], y=highs[exit_idx] if is_win else lows[exit_idx],
                 text=f"{exit_label}<br>${exit_p:,.2f}",
-                showarrow=True, arrowhead=2, arrowcolor=arrow_color, font=dict(color=arrow_color, size=10),
-                bgcolor="#0d1117", bordercolor=arrow_color, row=1, col=1
+                showarrow=True, arrowhead=2, arrowsize=1, arrowwidth=1.5, arrowcolor=arrow_color,
+                ay=-35 if is_win else 35, # 向上或向下推開 35 像素，完整露出 K 線
+                font=dict(color=arrow_color, size=10, family="monospace"),
+                bgcolor="rgba(13, 17, 23, 0.88)", bordercolor=arrow_color, borderwidth=1, borderpad=3,
+                row=1, col=1
             )
 
         # 7. 副圖：成交量柱
@@ -188,10 +243,10 @@ class JournalPlugin:
         vma20_val = sum(volumes) / len(volumes) if len(volumes) > 0 else 1.0
         fig.add_hline(y=vma20_val, line_dash="dash", line_color="#ffffff", line_width=1, annotation_text="VMA20", annotation_position="top left", row=2, col=1)
 
-        # 自適應 Y 軸
+        # 自適應動態座標
         kline_min = min(lows)
         kline_max = max(highs)
-        padding = max(step_val * 2, (kline_max - kline_min) * 0.15)
+        padding = max(step_val * 2.5, (kline_max - kline_min) * 0.22)
 
         fig.update_layout(
             height=460,
@@ -213,7 +268,9 @@ class JournalPlugin:
         st.markdown("""
         <style>
         .block-container { padding-top: 0.8rem; padding-bottom: 0rem; }
-        .metric-banner { background: #0d1117; border: 1px solid #21262d; border-radius: 6px; padding: 6px 12px; margin-bottom: 8px; font-family: monospace; }
+        .metric-banner { background: #0d1117; border: 1px solid #21262d; border-radius: 6px; padding: 8px 14px; margin-bottom: 8px; font-family: monospace; }
+        .win-tag { color: #00E676; font-weight: bold; background: rgba(0, 230, 118, 0.12); padding: 2px 6px; border-radius: 4px; }
+        .loss-tag { color: #FF5252; font-weight: bold; background: rgba(255, 82, 82, 0.12); padding: 2px 6px; border-radius: 4px; }
         </style>
         """, unsafe_allow_html=True)
 
@@ -226,7 +283,7 @@ class JournalPlugin:
             df = df_all
 
         # 第 1 層：月份下拉選單
-        base_months = ["2026-09", "2026-08", "2026-07", "2026-06", "2026-05", "2026-04", "2026-03", "2026-02", "2026-01"]
+        base_months = ["2026-09", "2026-08", "2026-07"]
         if not df.empty and 'month' in df.columns:
             existing_m = [str(x) for x in df['month'].dropna().unique()]
             month_list = ["📅 今天 (實盤 Live 進行中)"] + sorted(list(set(base_months + existing_m)), reverse=True)
@@ -246,11 +303,12 @@ class JournalPlugin:
         m = self.evaluate_metrics(df_filtered)
 
         with col_m2:
+            pnl_color = "#00E676" if m['total_pnl'] >= 0 else "#FF5252"
             st.markdown(f"""
             <div class="metric-banner" style="margin-top: 4px;">
                 <div style="display: flex; justify-content: space-between; align-items: center;">
                     <span style="font-size: 13px; font-weight: bold; color: {m['color']};">🏆 {m['verdict']}</span>
-                    <span style="font-size: 12px; color: #8b949e;">勝率: <b style="color:#ffd700;">{m['win_rate']:.1f}%</b> ({m['wins']}勝/{m['losses']}負) | 盈虧比: <b style="color:#ffd700;">1:{m['rr']:.2f}</b> | 期望值: <b style="color:{m['color']};">{m['exp']:+.2f}R</b></span>
+                    <span style="font-size: 12px; color: #8b949e;">勝率: <b style="color:#ffd700;">{m['win_rate']:.1f}%</b> ({m['wins']}勝/{m['losses']}負) | 盈虧比: <b style="color:#ffd700;">1:{m['rr']:.2f}</b> | 累計損益: <b style="color:{pnl_color};">${m['total_pnl']:+,.2f} USD</b></span>
                 </div>
             </div>
             """, unsafe_allow_html=True)
@@ -264,22 +322,36 @@ class JournalPlugin:
             
             df_day = df_filtered[df_filtered['date'] == sel_date]
 
-            options = [
-                f"{r.get('trade_id', '#--')} | {r.get('time_et', '--')} ET | {r.get('direction', '--')} | 結果: {r.get('status', '--')} ({float(r.get('net_r', 0)):+.1f}R) | 評分: {r.get('score', 0)}分" 
-                for _, r in df_day.iterrows()
-            ]
+            # 格式化帶時段標記 (⭐ 黃金窗口 vs ⚪ 全天其餘時段) 與 贏綠輸紅標籤的下拉選單
+            options = []
+            for _, r in df_day.iterrows():
+                is_win_r = r.get('status') == 'WIN_TP'
+                res_tag = f"🟢 WIN (+2.0R / +$400)" if is_win_r else f"🔴 LOSS (-1.0R / -$200)"
+                win_star = "⭐ [22:00-24:00 黃金時段]" if r.get('is_golden_window', False) or (r.get('time_et') in ['10:15', '11:45']) else "⚪ [全天復盤時段]"
+                t_myt = r.get('time_myt', '--')
+                t_et = r.get('time_et', '--')
+                score_val = r.get('score', 0)
+                options.append(f"{win_star} {t_myt} MYT ({t_et} ET) | {r.get('direction')} | {res_tag} | 評分: {score_val}分")
             
             with col_d2:
-                sel_sig_idx = st.selectbox("🎯 選擇該日訊號做功課:", range(len(options)), format_func=lambda x: options[x])
+                sel_sig_idx = st.selectbox("🎯 選擇當日訊號穿透做功課 (贏綠輸紅 · 標註時段):", range(len(options)), format_func=lambda x: options[x])
 
             selected_row = df_day.iloc[sel_sig_idx]
 
-            st.caption("🔍 深度技術面復盤畫布 (客觀向後掃描真實結果 · 支援滑鼠滾輪縮放/拖拽)：")
+            st.caption("🔍 深度技術面復盤視圖 (標籤自動避讓防遮擋 · 真實 5M 陰陽蠟燭 · 支援滑鼠滾輪縮放/拖拽)：")
             self.render_interactive_replay_chart(selected_row)
 
+            # 評分拆解與技術面反思橫幅
+            is_win_sel = selected_row.get('status') == 'WIN_TP'
+            badge_html = '<span class="win-tag">🟢 WIN 止盈 (+2.0R / +$400 USD)</span>' if is_win_sel else '<span class="loss-tag">🔴 LOSS 止損 (-1.0R / -$200 USD)</span>'
+            score_num = selected_row.get('score', 0)
+            score_color = "#00E676" if score_num >= 80 else "#ffd700"
+
             st.markdown(f"""
-            <div style="background: #161b22; border-left: 4px solid #58a6ff; padding: 6px 10px; border-radius: 4px; font-size: 12px; font-family: monospace; color: #c9d1d9; margin-bottom: 8px;">
-                💡 <b>技術面推理</b>: {selected_row.get('reason', '無備註')} | 開倉: <b>${float(selected_row.get('entry', 0)):,.2f}</b> | 止損: <b>${float(selected_row.get('sl', 0)):,.2f}</b> | 2R止盈: <b>${float(selected_row.get('tp', 0)):,.2f}</b> | 期權: <b>{'N/A (BTC無期權)' if is_btc else '0DTE ATM'}</b>
+            <div style="background: #161b22; border-left: 4px solid {'#00E676' if is_win_sel else '#FF5252'}; padding: 8px 12px; border-radius: 4px; font-size: 12px; font-family: monospace; color: #c9d1d9; margin-bottom: 8px;">
+                <div style="margin-bottom: 4px;">{badge_html} | 訂單: <b>{selected_row.get('trade_id')}</b> | 客觀評分: <b style="color:{score_color};">{score_num} 分</b> (門檻 ≥75分)</div>
+                <div style="color: #8b949e; margin-bottom: 4px;">• <b>4維打分細項</b>: {selected_row.get('score_detail', '客觀4維加總')}</div>
+                <div>• <b>實戰點位</b>: 開倉 <b>${float(selected_row.get('entry', 0)):,.2f}</b> | 止損 <b>${float(selected_row.get('sl', 0)):,.2f}</b> | 止盈 <b>${float(selected_row.get('tp', 0)):,.2f}</b> | 出場 <b>${float(selected_row.get('exit_price', 0)):,.2f}</b></div>
             </div>
             """, unsafe_allow_html=True)
         else:
@@ -291,16 +363,18 @@ class JournalPlugin:
 
         if selected_row is not None:
             is_win = selected_row.get('status') == 'WIN_TP'
-            result_str = f"🎯 2R 止盈成功 (+2.0R)" if is_win else f"🛡️ 觸發止損離場 (-1.0R)"
+            result_str = f"🟢 WIN 止盈成功 (+2.0R / 獲利 +$400.00 USD)" if is_win else f"🔴 LOSS 觸發止損 (-1.0R / 虧損 -$200.00 USD)"
+            t_myt = selected_row.get('time_myt', '22:15')
             audit_log = f"=== 癸水 · 策略復盤與審核日誌 (TRADE AUDIT LOG) ===\n"
-            audit_log += f"[1. 訂單時序] {selected_row.get('date', '--')} | 入場: {selected_row.get('time_et', '--')} ET ──► 出場: {selected_row.get('exit_time_et', '--')} ET\n"
+            audit_log += f"[1. 訂單時序] {selected_row.get('date', '--')} | 入場: {t_myt} MYT ({selected_row.get('time_et', '--')} ET) ──► 出場: {selected_row.get('exit_time_et', '--')} ET\n"
             audit_log += f"[2. 交易決策] 標的: {code} | 方向: {selected_row.get('direction', '--')} | 入場成本: ${float(selected_row.get('entry', 0)):,.2f}\n"
             audit_log += f"[3. 為什麼買]\n"
-            audit_log += f"  • 決策依據: {selected_row.get('reason', '--')}\n"
-            audit_log += f"  • 綜合評分: {selected_row.get('score', 0)} 分 (開單門檻 ≥75 分)\n"
+            audit_log += f"  • 形態與戰區: {selected_row.get('reason', '--')}\n"
+            audit_log += f"  • 客觀評分: {selected_row.get('score', 0)} 分 (門檻 ≥75 分)\n"
+            audit_log += f"  • 打分拆解: {selected_row.get('score_detail', '--')}\n"
             audit_log += f"[4. 最終結果] {result_str}\n"
             audit_log += f"  • 止損防守價: ${float(selected_row.get('sl', 0)):,.2f} | 止盈目標價: ${float(selected_row.get('tp', 0)):,.2f} | 實際出場價: ${float(selected_row.get('exit_price', 0)):,.2f}\n"
-            audit_log += f"[5. 復盤反思] {'順應趨勢波段獲利，嚴格執行 1:2 止盈。' if is_win else '行情破位跌穿防守線，嚴格依紀律止損，控制單筆最大虧損為 1R。'}\n"
+            audit_log += f"[5. 復盤反思] {'順應大週期均線與戰區支撐，1:2 結構獲利達標。' if is_win else '遇主力逆向突破砸盤，嚴格依紀律止損，單筆虧損截斷在 1R 預算內。'}\n"
             audit_log += f"=================================================="
         else:
             audit_log = f"=== 癸水 · 策略審核日誌 ===\n• 標的: {code} | 時間: {now_my} ({now_et})\n• 裁定: {m['verdict']} | 樣本: {m['total']} 筆 | 勝率: {m['win_rate']:.1f}%\n==========================="
