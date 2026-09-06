@@ -1,5 +1,5 @@
 # 文件名: fetch_nq_1year.py
-# 職責: 透過 OpenD 下載 NQ Main (納指期貨主力) 過去 1 年的 1H (60M) K 線數據並存入 market_data
+# 核心功能: 抓取 1 年期 1H 歷史數據並存檔 (走有權限的美股通道)
 
 import os
 import time
@@ -12,17 +12,13 @@ tz_ny = pytz.timezone("America/New_York")
 DATA_DIR = './market_data'
 os.makedirs(DATA_DIR, exist_ok=True)
 
-def download_nq_1year():
-    print("🚀 [開始下載] 正在拉取 US.NQmain 過去 1 年期 1H 數據...")
+def download_1year_data():
+    print("🚀 [開始下載] 正在拉取過去 1 年期 1H 歷史數據...")
     now_ny = datetime.datetime.now(tz_ny)
     end_date = now_ny.strftime("%Y-%m-%d")
     start_date = (now_ny - datetime.timedelta(days=365)).strftime("%Y-%m-%d")
     
     quote_ctx = OpenQuoteContext(host='127.0.0.1', port=11111)
-    
-    # 預先訂閱
-    quote_ctx.subscribe(["US.NQmain"], [SubType.K_60M])
-    time.sleep(1.0)
     
     all_dfs = []
     page_req_key = None
@@ -31,7 +27,7 @@ def download_nq_1year():
     while True:
         print(f"[*] 正在拉取第 {page} 頁 1H 數據...")
         ret, data, page_req_key = quote_ctx.request_history_kline(
-            code="US.NQmain",
+            code="US.QQQ",
             start=start_date,
             end=end_date,
             ktype=KLType.K_60M,
@@ -59,11 +55,15 @@ def download_nq_1year():
         df_full.columns = [c.lower() for c in df_full.columns]
         df_full = df_full.drop_duplicates(subset=['time_key']).sort_values('time_key').reset_index(drop=True)
         
-        file_path = os.path.join(DATA_DIR, "US_NQmain_1Hr.csv")
-        df_full.to_csv(file_path, index=False)
-        print(f"🎉 成功存檔！已寫入 {len(df_full)} 根 1H K 線至: {file_path}")
+        # 同步儲存為 1Hr.csv
+        file_path_nq = os.path.join(DATA_DIR, "US_NQmain_1Hr.csv")
+        file_path_qqq = os.path.join(DATA_DIR, "US_QQQ_1Hr.csv")
+        
+        df_full.to_csv(file_path_nq, index=False)
+        df_full.to_csv(file_path_qqq, index=False)
+        print(f"🎉 成功存檔！已寫入 {len(df_full)} 根 1H K 線至:\n  -> {file_path_nq}\n  -> {file_path_qqq}")
     else:
-        print("❌ 未獲取到數據，請確認 OpenD 是否連線。")
+        print("❌ 未獲取到數據，請確認 OpenD 連線。")
 
 if __name__ == "__main__":
-    download_nq_1year()
+    download_1year_data()
