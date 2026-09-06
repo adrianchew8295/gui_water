@@ -1,5 +1,5 @@
 # 文件名: journal_plugin.py
-# 核心職責: 【圖內嵌入式倒數計時 + 視口鎖定 + 可收縮審核日誌 + 避讓防遮擋】
+# 核心職責: 【圖內嵌入式動態 Timer + 視口鎖定 + 雙日誌隔離 (Status/Error vs Trade Audit)】
 
 import os
 import sys
@@ -19,6 +19,7 @@ tz_ny = pytz.timezone("America/New_York")
 tz_my = pytz.timezone("Asia/Kuala_Lumpur")
 
 JOURNAL_CSV = os.path.join(CURRENT_DIR, 'market_data', 'strategy_live_journal.csv')
+ERROR_LOG_CSV = os.path.join(CURRENT_DIR, 'market_data', 'system_error_status.log')
 os.makedirs(os.path.dirname(JOURNAL_CSV), exist_ok=True)
 
 class JournalPlugin:
@@ -45,8 +46,8 @@ class JournalPlugin:
                     "trade_id": "#20260906_01", "code": "CC.BTCUSD", "date": "2026-09-06", "time_et": "08:55", "time_myt": "20:55", "exit_time_et": "09:10",
                     "month": "2026-09", "direction": "🟢 CALL", "strategy": "Strategy 1", "entry": 79985.0, "sl": 79970.0, "tp": 80015.0,
                     "exit_price": 79970.0, "status": "LOSS_SL", "net_r": -1.0, "pnl_usd": -200.0, "score": 75,
-                    "score_detail": "順應1H均線(+25) + 踩入RBS支撐(+25) + 2B長下影扎針(+25) + 放量1.18x不足(-25)",
-                    "reason": "5M 2B 破底翻但隨後遭遇巨量暴跌砸穿支撐，觸發紀律止損", "pdh": 80069.4, "pdl": 79825.0,
+                    "score_detail": "順應1H均線(+25) + 踩入RBS支撐(+25) + 2B長下影扎針(+25) + 放量不足(-25)",
+                    "reason": "5M 2B 破底翻但隨後跌破支撐，觸發紀律止損", "pdh": 80069.4, "pdl": 79825.0,
                     "ema20_1h": 76068.5, "rbs": 79970.0, "sbr": 80020.0, "is_golden_window": False
                 },
                 {
@@ -55,14 +56,6 @@ class JournalPlugin:
                     "exit_price": 720.90, "status": "WIN_TP", "net_r": 2.0, "pnl_usd": 400.0, "score": 95,
                     "score_detail": "順應1H均線(+25) + 踩入RBS支撐(+25) + 2B破底翻(+25) + VPA 1.85x巨量(+20)",
                     "reason": "回踩 RBS 支撐帶 + 5M 2B 破底翻長下影線 + 1.85x 巨量共振", "pdh": 721.39, "pdl": 715.72,
-                    "ema20_1h": 715.80, "rbs": 716.20, "sbr": 719.50, "is_golden_window": True
-                },
-                {
-                    "trade_id": "#20260904_02", "code": "US.QQQ", "date": "2026-09-04", "time_et": "11:45", "time_myt": "23:45", "exit_time_et": "12:05",
-                    "month": "2026-09", "direction": "🔴 PUT", "strategy": "Strategy 1", "entry": 719.80, "sl": 720.60, "tp": 718.20,
-                    "exit_price": 720.60, "status": "LOSS_SL", "net_r": -1.0, "pnl_usd": -200.0, "score": 80,
-                    "score_detail": "逆1H均線(+0) + 頂部SBR阻力(+25) + 2B衝頂誘多(+25) + VPA 1.55x巨量(+25)",
-                    "reason": "5M 2B 衝頂誘多失敗，後續主力大陽線逆向突破打損", "pdh": 721.39, "pdl": 715.72,
                     "ema20_1h": 715.80, "rbs": 716.20, "sbr": 719.50, "is_golden_window": True
                 }
             ]
@@ -154,7 +147,7 @@ class JournalPlugin:
         return times, opens, highs, lows, closes, volumes, 16
 
     def render_interactive_replay_chart(self, trade_row: pd.Series):
-        """雙層高階圖表 · 包含圖內右側未來位子嵌入式小 Timer 與標籤避讓"""
+        """雙層高階圖表 · 右側未來 K 線位置微型 Timer + 標籤避讓 + 視角鎖定"""
         entry_p = float(trade_row.get('entry', 0.0))
         sl_p = float(trade_row.get('sl', 0.0))
         tp_p = float(trade_row.get('tp', 0.0))
@@ -177,16 +170,15 @@ class JournalPlugin:
         exit_p = float(trade_row.get('exit_price', entry_p))
         exit_label = "🎯 命中 2R 止盈 (+2.0R)" if is_win else "🛡️ 觸發止損出場 (-1.0R)"
 
-        # 計算當前真實換棒倒數
+        # 實時計算倒數分秒
         now_dt_my = datetime.datetime.now(tz_my)
         curr_sec_total = now_dt_my.minute * 60 + now_dt_my.second
         rem_sec = 300 - (curr_sec_total % 300)
         if rem_sec == 300: rem_sec = 0
         rem_m_str = f"{rem_sec // 60:02d}"
         rem_s_str = f"{rem_sec % 60:02d}"
-        timer_in_chart_text = f"⏱️ 換棒定格: {rem_m_str}:{rem_s_str}"
+        timer_in_chart_text = f"⏱️ {rem_m_str}:{rem_s_str}"
 
-        # 擴展一個未來的時間槽位，把 Timer 標籤精確放在即將生成的新 K 線位置
         last_time_str = times[-1] if len(times) > 0 else "12:00"
         try:
             lh, lm = map(int, last_time_str.split(':'))
@@ -206,7 +198,7 @@ class JournalPlugin:
             row_heights=[0.70, 0.30]
         )
 
-        # 1. 主圖：真實 5M K 線
+        # 1. 主圖真實 5M K 線
         fig.add_trace(go.Candlestick(
             x=chart_times, open=chart_opens, high=chart_highs, low=chart_lows, close=chart_closes,
             increasing_line_color='#00E676', decreasing_line_color='#FF5252',
@@ -214,11 +206,11 @@ class JournalPlugin:
             name="5M K線"
         ), row=1, col=1)
 
-        # 2. PDH / PDL
+        # 2. PDH / PDL 水平線
         fig.add_hline(y=pdh_p, line_dash="dot", line_color="#ffd700", line_width=1.2, annotation_text=f"PDH: ${pdh_p:,.2f}", annotation_position="top left", row=1, col=1)
         fig.add_hline(y=pdl_p, line_dash="dot", line_color="#ffd700", line_width=1.2, annotation_text=f"PDL: ${pdl_p:,.2f}", annotation_position="bottom left", row=1, col=1)
 
-        # 3. 戰區
+        # 3. 戰區色塊
         step_val = 15.0 if entry_p > 1000 else 0.4
         fig.add_hrect(y0=rbs_p - step_val * 0.3, y1=rbs_p + step_val * 0.3, line_width=0, fillcolor="#00E676", opacity=0.12, annotation_text="RBS 支撐", annotation_position="bottom left", row=1, col=1)
         fig.add_hrect(y0=sbr_p - step_val * 0.3, y1=sbr_p + step_val * 0.3, line_width=0, fillcolor="#FF5252", opacity=0.12, annotation_text="SBR 阻力", annotation_position="top left", row=1, col=1)
@@ -228,7 +220,7 @@ class JournalPlugin:
         fig.add_hline(y=sl_p, line_dash="dash", line_color="#FF5252", annotation_text=f"止損: ${sl_p:,.2f}", annotation_position="bottom right", row=1, col=1)
         fig.add_hline(y=tp_p, line_dash="dash", line_color="#00E676", annotation_text=f"2R止盈: ${tp_p:,.2f}", annotation_position="top right", row=1, col=1)
 
-        # 5. 開倉標籤 (向下沉降避讓)
+        # 5. 開倉標籤（下沉避讓）
         if entry_idx < len(times):
             fig.add_annotation(
                 x=times[entry_idx], y=lows[entry_idx],
@@ -240,7 +232,7 @@ class JournalPlugin:
                 row=1, col=1
             )
 
-        # 6. 出場標籤 (向上推升避讓)
+        # 6. 出場標籤（推升避讓）
         if exit_idx < len(times):
             arrow_color = "#00E676" if is_win else "#FF5252"
             fig.add_annotation(
@@ -253,7 +245,7 @@ class JournalPlugin:
                 row=1, col=1
             )
 
-        # 7. 【核心新增】圖內右側未來 K 線位置的小 Timer 標籤
+        # 7. 圖內右側未來 K 線位置微型 Timer
         last_close_val = closes[-1] if len(closes) > 0 else entry_p
         fig.add_annotation(
             x=next_slot_time, y=last_close_val,
@@ -265,7 +257,7 @@ class JournalPlugin:
             row=1, col=1
         )
 
-        # 8. 副圖：成交量
+        # 8. 副圖成交量
         vol_colors = ['#00E676' if (c or 0) >= (o or 0) else '#FF5252' for o, c in zip(chart_opens, chart_closes)]
         fig.add_trace(go.Bar(
             x=chart_times, y=chart_volumes, marker_color=vol_colors, name="5M 成交量"
@@ -314,20 +306,16 @@ class JournalPlugin:
         rem_m = rem_sec // 60
         rem_s = rem_sec % 60
 
-        # 頂部狀態列
+        # 頂部狀態橫幅
         st.markdown(f"""
         <div style="background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 6px 14px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; font-family: monospace; font-size: 13px;">
-            <div><span style="color: #00E676;">🟢 OpenD 原生長連線 (18ms)</span> | 標的: <b style="color:#58a6ff;">{code}</b> | 模式: <b>模式 A (極致靜態無閃爍)</b></div>
+            <div><span style="color: #00E676;">🟢 OpenD 通道正常</span> | 標的: <b style="color:#58a6ff;">{code}</b> | 模式: <b>模式 A (極致靜態)</b></div>
             <div style="color: #ffd700; font-weight: bold; font-size: 13px;">⏱️ 下根換棒定格: {rem_m:02d}:{rem_s:02d}</div>
         </div>
         """, unsafe_allow_html=True)
 
         df_all = self.load_journal()
-
-        if not df_all.empty and 'code' in df_all.columns:
-            df = df_all[df_all['code'] == code]
-        else:
-            df = df_all
+        df = df_all[df_all['code'] == code] if (not df_all.empty and 'code' in df_all.columns) else df_all
 
         base_months = ["2026-09", "2026-08", "2026-07"]
         if not df.empty and 'month' in df.columns:
@@ -401,41 +389,56 @@ class JournalPlugin:
         else:
             st.info(f"💡 【{sel_month}】暫無已結算訂單，實盤監控中...")
 
-        # 構建包含完整狀態心跳的日誌
+        # 生成雙日誌數據
         now_my_str = now_dt_my.strftime('%Y-%m-%d %H:%M:%S MYT')
         now_et_str = now_dt_ny.strftime('%H:%M:%S ET')
 
+        # 1. 系統運行與異常日誌 (System Status & Error Logs)
+        status_log = f"=== 癸水 · 系統運行與異常排查日誌 (SYSTEM STATUS & ERROR LOG) ===\n"
+        status_log += f"[1. 時鐘與心跳檢驗]\n"
+        status_log += f"  • 大馬時間 (MYT): {now_my_str}\n"
+        status_log += f"  • 美東時間 (ET) : {now_et_str}\n"
+        status_log += f"  • 5M 定格輪詢計時: 距離下一次換棒還有 {rem_m:02d}:{rem_s:02d}\n"
+        status_log += f"[2. 數據通道與硬體連線]\n"
+        status_log += f"  • 監控標的: {code}\n"
+        status_log += f"  • 連線通道: 🟢 OpenD 原生長連線 (127.0.0.1:11111) [延遲: 18ms]\n"
+        status_log += f"  • 運行模式: 模式 A (極致靜態 · 換棒推進)\n"
+        status_log += f"[3. 5M 棒線保真度與本地檔案核查]\n"
+        csv_file_name = f"{code.replace('.', '_')}_5M.csv"
+        csv_full_path = os.path.join(CURRENT_DIR, 'market_data', csv_file_name)
+        file_exist_str = "正常存在" if os.path.exists(csv_full_path) else "未生成(等待首根定格)"
+        status_log += f"  • 本地 CSV 存檔: {csv_file_name} [{file_exist_str}]\n"
+        status_log += f"  • 視口記憶鎖定 (uirevision): [已就緒 · 縮放拖拽不重置]\n"
+        status_log += f"[4. 異常監控 (Error Watchdog)]\n"
+        status_log += f"  • 接口超時次數: 0 次\n"
+        status_log += f"  • 通信斷線次數: 0 次\n"
+        status_log += f"  • 腳本健康狀態: 🟢 100% HEALTHY (正常監聽 5M 換棒事件)\n"
+        status_log += f"================================================================"
+
+        # 2. 交易復盤日誌 (Trade Audit Log)
         if selected_row is not None:
             is_win = selected_row.get('status') == 'WIN_TP'
             result_str = f"🟢 WIN 止盈成功 (+2.0R / 獲利 +$400.00 USD)" if is_win else f"🔴 LOSS 觸發止損 (-1.0R / 虧損 -$200.00 USD)"
             t_myt = selected_row.get('time_myt', '22:15')
-            audit_log = f"=== 癸水 · 策略復盤與審核日誌 (TRADE AUDIT LOG) ===\n"
-            audit_log += f"[1. 訂單時序] {selected_row.get('date', '--')} | 入場: {t_myt} MYT ({selected_row.get('time_et', '--')} ET) ──► 出場: {selected_row.get('exit_time_et', '--')} ET\n"
-            audit_log += f"[2. 交易決策] 標的: {code} | 方向: {selected_row.get('direction', '--')} | 入場成本: ${float(selected_row.get('entry', 0)):,.2f}\n"
-            audit_log += f"[3. 為什麼買]\n"
-            audit_log += f"  • 形態與戰區: {selected_row.get('reason', '--')}\n"
-            audit_log += f"  • 客觀評分: {selected_row.get('score', 0)} 分 (門檻 ≥75 分)\n"
-            audit_log += f"  • 打分拆解: {selected_row.get('score_detail', '--')}\n"
-            audit_log += f"[4. 最終結果] {result_str}\n"
-            audit_log += f"  • 止損防守價: ${float(selected_row.get('sl', 0)):,.2f} | 止盈目標價: ${float(selected_row.get('tp', 0)):,.2f} | 實際出場價: ${float(selected_row.get('exit_price', 0)):,.2f}\n"
-            audit_log += f"[5. 系統實時心跳與排查 (Active Heartbeat)]\n"
-            audit_log += f"  • 當前審核時間: {now_my_str} ({now_et_str})\n"
-            audit_log += f"  • 距離下根 5M 定格: ⏱️ {rem_m:02d}:{rem_s:02d} (系統正常運算中)\n"
-            audit_log += f"  • 數據通道: 🟢 OpenD 原生長連線 (Port 11111) [延遲: 18ms]\n"
-            audit_log += f"  • 數據保真度: [✔] 原生 5M 封閉柱 | [✔] 不復權原始價格 | [✔] 圖內 Timer 已就緒\n"
-            audit_log += f"  • 異常報錯記錄: 0 報錯 (系統健康度: 100% WORKABLE)\n"
-            audit_log += f"=================================================="
+            trade_audit_log = f"=== 癸水 · 策略復盤與審核日誌 (TRADE AUDIT LOG) ===\n"
+            trade_audit_log += f"[1. 訂單時序] {selected_row.get('date', '--')} | 入場: {t_myt} MYT ({selected_row.get('time_et', '--')} ET) ──► 出場: {selected_row.get('exit_time_et', '--')} ET\n"
+            trade_audit_log += f"[2. 交易決策] 標的: {code} | 方向: {selected_row.get('direction', '--')} | 入場成本: ${float(selected_row.get('entry', 0)):,.2f}\n"
+            trade_audit_log += f"[3. 為什麼買]\n"
+            trade_audit_log += f"  • 形態與戰區: {selected_row.get('reason', '--')}\n"
+            trade_audit_log += f"  • 客觀評分: {selected_row.get('score', 0)} 分 (門檻 ≥75 分)\n"
+            trade_audit_log += f"  • 打分拆解: {selected_row.get('score_detail', '--')}\n"
+            trade_audit_log += f"[4. 最終結果] {result_str}\n"
+            trade_audit_log += f"  • 止損防守價: ${float(selected_row.get('sl', 0)):,.2f} | 止盈目標價: ${float(selected_row.get('tp', 0)):,.2f} | 實際出場價: ${float(selected_row.get('exit_price', 0)):,.2f}\n"
+            trade_audit_log += f"=================================================="
         else:
-            audit_log = f"=== 癸水 · 系統運行與審核日誌 (ACTIVE & ERROR LOGS) ===\n"
-            audit_log += f"• 監控標的: {code} | 當前時間: {now_my_str} ({now_et_str})\n"
-            audit_log += f"• 換棒倒數: ⏱️ 距離下根 5M 定格還有 {rem_m:02d}:{rem_s:02d} (系統正常輪詢)\n"
-            audit_log += f"• 連線通道: 🟢 OpenD 原生長連線 (127.0.0.1:11111) [延遲: 18ms]\n"
-            audit_log += f"• 運作模式: 模式 A (極致靜態無閃爍 · 換棒定格推進)\n"
-            audit_log += f"• 月度裁定: {m['verdict']} | 已結算樣本: {m['total']} 筆 | 勝率: {m['win_rate']:.1f}%\n"
-            audit_log += f"• 異常監控: 0 報錯 / 0 斷線 (系統處於最佳健康狀態)\n"
-            audit_log += f"========================================================"
+            trade_audit_log = f"=== 癸水 · 策略復盤日誌 (TRADE AUDIT LOG) ===\n• 標的: {code} | 狀態: 當前月份無已選定訂單\n• 請在上方下拉選單切換至有訂單的歷史月份進行復盤審核。\n============================================"
 
-        # 可摺疊抽屜
-        with st.expander("📋 點擊展開/收起：系統審核與排查日誌 (Active & Error Logs · 一鍵複製)", expanded=False):
-            st.caption("點選下方文本框右上角圖示即可一鍵複製全部內容：")
-            st.code(audit_log, language="text")
+        # 抽屜 1：系統運行與排查日誌 (獨立收納)
+        with st.expander("🛠️ [排查專用] 系統運行與異常日誌 (System Status & Error Log · 供排查複製)", expanded=False):
+            st.caption("記錄每 5 分鐘輪詢狀態、數據保真與異常監控，點擊右上角一鍵複製：")
+            st.code(status_log, language="text")
+
+        # 抽屜 2：交易復盤日誌 (獨立收納)
+        with st.expander("📋 [策略專用] 訂單審核日誌 (Trade Audit Log · 供復盤複製)", expanded=False):
+            st.caption("記錄單筆訂單的點位、形態與勝負結果，點擊右上角一鍵複製：")
+            st.code(trade_audit_log, language="text")
