@@ -1,5 +1,5 @@
 # 文件名: journal_plugin.py
-# 核心職責: 【純前端零閃爍流暢 Timer + 5M 靜態鎖定 + 雙日誌隔離】
+# 核心職責: 【圖表專屬通欄流暢 Timer · 5M 靜態鎖定 · 雙日誌隔離 · 零閃爍】
 
 import os
 import sys
@@ -231,8 +231,8 @@ class JournalPlugin:
 
         fig.update_layout(
             height=460,
-            uirevision="static_viewport_lock", # 鎖定視角，拖拽放大絕不跳動
-            margin=dict(l=10, r=10, t=25, b=10),
+            uirevision="static_viewport_lock",
+            margin=dict(l=10, r=10, t=20, b=10),
             paper_bgcolor="#0d1117",
             plot_bgcolor="#0d1117",
             font=dict(color="#c9d1d9", family="monospace", size=11),
@@ -249,45 +249,12 @@ class JournalPlugin:
     def render_journal_dashboard(self, code: str, budget_usd: float = 200.0):
         st.markdown("""
         <style>
-        .block-container { padding-top: 0.8rem; padding-bottom: 0rem; }
+        .block-container { padding-top: 0.6rem; padding-bottom: 0rem; }
         .metric-banner { background: #0d1117; border: 1px solid #21262d; border-radius: 6px; padding: 8px 14px; margin-bottom: 8px; font-family: monospace; }
         .win-tag { color: #00E676; font-weight: bold; background: rgba(0, 230, 118, 0.12); padding: 2px 6px; border-radius: 4px; }
         .loss-tag { color: #FF5252; font-weight: bold; background: rgba(255, 82, 82, 0.12); padding: 2px 6px; border-radius: 4px; }
         </style>
         """, unsafe_allow_html=True)
-
-        # 【核心技術】：純前端獨立 HTML/JS 倒數計時容器（每秒流暢走動，0 網絡請求，0 畫面閃爍）
-        timer_component_html = f"""
-        <div style="background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 8px 14px; display: flex; justify-content: space-between; align-items: center; font-family: monospace; font-size: 13px; color: #c9d1d9;">
-            <div><span style="color: #00E676;">🟢 富途 OpenD 官方原生 5M</span> | 標的: <b style="color:#58a6ff;">{code}</b> | 模式: <b>模式 A (極致靜態)</b></div>
-            <div id="countdown_box" style="color: #ffd700; font-weight: bold; font-size: 14px;">⏱️ 下根換棒定格: 計算中...</div>
-        </div>
-        <script>
-        function updateCountdown() {{
-            var now = new Date();
-            var totalSec = now.getMinutes() * 60 + now.getSeconds();
-            var remSec = 300 - (totalSec % 300);
-            if (remSec === 300) remSec = 0;
-            var m = Math.floor(remSec / 60);
-            var s = remSec % 60;
-            var mStr = (m < 10 ? "0" : "") + m;
-            var sStr = (s < 10 ? "0" : "") + s;
-            var el = document.getElementById("countdown_box");
-            if (el) {{
-                el.innerHTML = "⏱️ 下根換棒定格: " + mStr + ":" + sStr;
-            }}
-            // 當倒數歸零時，精確觸發一次平滑推進
-            if (remSec === 0) {{
-                setTimeout(function() {{
-                    window.parent.location.reload();
-                }}, 1500);
-            }}
-        }}
-        setInterval(updateCountdown, 1000);
-        updateCountdown();
-        </script>
-        """
-        components.html(timer_component_html, height=48)
 
         df_all = self.load_journal()
         df = df_all[df_all['code'] == code] if (not df_all.empty and 'code' in df_all.columns) else df_all
@@ -343,7 +310,45 @@ class JournalPlugin:
 
             selected_row = df_day.iloc[sel_sig_idx]
 
-        st.caption(f"🔍 5M 走勢視圖 (標的: {code} · 最近 3 小時真實 K 線 · 支援滾輪縮放/拖拽)：")
+        # 【核心位置】：將 Timer 與走勢圖標題融為一體，直接置於 5M K 線圖頂部通欄
+        chart_timer_html = f"""
+        <div style="background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 6px 12px; margin-bottom: 4px; display: flex; justify-content: space-between; align-items: center; font-family: monospace; font-size: 13px; color: #c9d1d9;">
+            <div>
+                <b style="color:#58a6ff; font-size:14px;">📈 5M 走勢圖 · 標的: {code}</b> 
+                <span style="color: #8b949e; font-size: 12px; margin-left: 8px;">(富途 OpenD 官方 5M 原生柱 · 最近 3 小時)</span>
+            </div>
+            <div id="chart_inline_timer" style="color: #ffd700; font-weight: bold; font-size: 14px; background: rgba(255, 215, 0, 0.12); border: 1px solid rgba(255, 215, 0, 0.3); border-radius: 4px; padding: 2px 8px;">
+                ⏱️ 距離下根定格: 計算中...
+            </div>
+        </div>
+        <script>
+        function updateInlineTimer() {{
+            var now = new Date();
+            var totalSec = now.getMinutes() * 60 + now.getSeconds();
+            var remSec = 300 - (totalSec % 300);
+            if (remSec === 300) remSec = 0;
+            var m = Math.floor(remSec / 60);
+            var s = remSec % 60;
+            var mStr = (m < 10 ? "0" : "") + m;
+            var sStr = (s < 10 ? "0" : "") + s;
+            var el = document.getElementById("chart_inline_timer");
+            if (el) {{
+                el.innerHTML = "⏱️ 距離下根定格: " + mStr + ":" + sStr;
+            }}
+            // 換棒歸零時觸發精準推進
+            if (remSec === 0) {{
+                setTimeout(function() {{
+                    window.parent.location.reload();
+                }}, 1500);
+            }}
+        }}
+        setInterval(updateInlineTimer, 1000);
+        updateInlineTimer();
+        </script>
+        """
+        components.html(chart_timer_html, height=44)
+
+        # 渲染 5M K 線主圖
         self.render_interactive_chart(code, selected_row)
 
         if selected_row is not None:
