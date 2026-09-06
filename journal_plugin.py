@@ -1,5 +1,5 @@
 # 文件名: journal_plugin.py
-# 核心職責: 【策略記帳與高級可視化復盤插件】三級鑽取架構 + 支援滾輪縮放 + 技術面幾何還原 + AI Logs
+# 核心職責: 【策略記帳與高級可視化復盤插件】完整月度/日期 Dropdown + 滾輪縮放 + 幾何指標還原
 
 import os
 import sys
@@ -25,8 +25,19 @@ class JournalPlugin:
         self._init_journal_file()
 
     def _init_journal_file(self):
-        """初始化帳本 (注入涵蓋不同月/日/時段的標準回測樣本)"""
+        """如果文件不存在或為空，注入標準月度回測樣本數據"""
+        needs_init = False
         if not os.path.exists(self.journal_path):
+            needs_init = True
+        else:
+            try:
+                df_chk = pd.read_csv(self.journal_path)
+                if df_chk.empty:
+                    needs_init = True
+            except Exception:
+                needs_init = True
+
+        if needs_init:
             sample_data = [
                 {
                     "trade_id": "#20260906_01", "date": "2026-09-06", "time_et": "06:25", "month": "2026-09",
@@ -51,6 +62,12 @@ class JournalPlugin:
                     "direction": "🟢 CALL", "strategy": "Strategy 1", "entry": 482.00, "sl": 481.20, "tp": 483.60,
                     "exit_price": 483.60, "status": "WIN_TP", "net_r": 2.0, "score": 85,
                     "reason": "回踩日線 EMA20 支撐企穩", "ema20_1h": 480.50, "rbs": 481.20, "sbr": 484.00
+                },
+                {
+                    "trade_id": "#20260715_01", "date": "2026-07-15", "time_et": "10:45", "month": "2026-07",
+                    "direction": "🟢 CALL", "strategy": "Strategy 1", "entry": 475.00, "sl": 474.20, "tp": 476.60,
+                    "exit_price": 476.60, "status": "WIN_TP", "net_r": 2.0, "score": 88,
+                    "reason": "突破昨日最高點 PDH 回踩確認", "ema20_1h": 473.80, "rbs": 474.50, "sbr": 477.00
                 }
             ]
             pd.DataFrame(sample_data).to_csv(self.journal_path, index=False)
@@ -96,7 +113,7 @@ class JournalPlugin:
         }
 
     def render_interactive_replay_chart(self, trade_row: pd.Series):
-        """唯一高階 Plotly 互動圖表 · 支援滾輪縮放/拖拽 + 技術面指標疊加"""
+        """Plotly 互動圖表 · 支援滾輪縮放/拖拽"""
         entry_p = float(trade_row.get('entry', 0.0))
         sl_p = float(trade_row.get('sl', 0.0))
         tp_p = float(trade_row.get('tp', 0.0))
@@ -115,7 +132,7 @@ class JournalPlugin:
 
         fig = go.Figure()
 
-        # 1. 5M K 線
+        # 1. 5M K線
         fig.add_trace(go.Candlestick(
             x=times, open=opens, high=highs, low=lows, close=closes,
             increasing_line_color='#00E676', decreasing_line_color='#FF5252',
@@ -134,7 +151,7 @@ class JournalPlugin:
         fig.add_hrect(y0=rbs_p - 0.3, y1=rbs_p + 0.3, line_width=0, fillcolor="#00E676", opacity=0.12, annotation_text="RBS 支撐戰區", annotation_position="bottom left")
         fig.add_hrect(y0=sbr_p - 0.3, y1=sbr_p + 0.3, line_width=0, fillcolor="#FF5252", opacity=0.12, annotation_text="SBR 阻力戰區", annotation_position="top left")
 
-        # 4. 進場 / 止損 / 止盈線
+        # 4. 交易線
         fig.add_hline(y=entry_p, line_dash="dash", line_color="#58a6ff", annotation_text=f"進場: ${entry_p:,.2f}", annotation_position="top right")
         fig.add_hline(y=sl_p, line_dash="dash", line_color="#FF5252", annotation_text=f"止損: ${sl_p:,.2f}", annotation_position="bottom right")
         fig.add_hline(y=tp_p, line_dash="dash", line_color="#00E676", annotation_text=f"2R止盈: ${tp_p:,.2f}", annotation_position="top right")
@@ -164,14 +181,17 @@ class JournalPlugin:
         df = self.load_journal()
         is_btc = "BTC" in code.upper()
 
-        # ====== 第 1 層：月份選擇與宏觀裁定 ======
-        month_list = ["📅 今天 (實盤 Live 進行中)"]
+        # ====== 第 1 層：月份下拉選單 (保證永遠有選項) ======
+        base_months = ["2026-09", "2026-08", "2026-07"]
         if not df.empty and 'month' in df.columns:
-            month_list += sorted(list(df['month'].dropna().unique()), reverse=True)
+            existing_m = [str(x) for x in df['month'].dropna().unique()]
+            month_list = ["📅 今天 (實盤 Live 進行中)"] + sorted(list(set(base_months + existing_m)), reverse=True)
+        else:
+            month_list = ["📅 今天 (實盤 Live 進行中)"] + base_months
 
-        col_m1, col_m2 = st.columns([1.5, 3.5])
+        col_m1, col_m2 = st.columns([1.8, 3.2])
         with col_m1:
-            sel_month = st.selectbox("📅 選擇回測/復盤月份:", month_list, index=0)
+            sel_month = st.selectbox("📅 選擇回測/復盤月份:", month_list, index=1)
 
         # 依選定月份過濾
         if sel_month == "📅 今天 (實盤 Live 進行中)":
@@ -205,14 +225,13 @@ class JournalPlugin:
         
         df_day = df_filtered[df_filtered['date'] == sel_date]
 
-        # 訊號穿透清單
         options = [
             f"{r.get('trade_id', '#--')} | {r.get('time_et', '--')} ET | {r.get('direction', '--')} | 結果: {r.get('status', '--')} ({float(r.get('net_r', 0)):+.1f}R) | 評分: {r.get('score', 0)}分" 
             for _, r in df_day.iterrows()
         ]
         
         with col_d2:
-            sel_sig_idx = st.selectbox("🎯 選擇該日訊號進行技術面做功課:", range(len(options)), format_func=lambda x: options[x])
+            sel_sig_idx = st.selectbox("🎯 選擇該日訊號做功課:", range(len(options)), format_func=lambda x: options[x])
 
         selected_row = df_day.iloc[sel_sig_idx]
 
