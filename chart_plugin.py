@@ -1,5 +1,5 @@
 # 文件名: chart_plugin.py
-# 核心特性: Snapshot 毫秒快照驅動 + 雙表瘦身合併 + Timer 緊貼 LIVE + Audit Logs 審核日誌
+# 核心特性: Snapshot 毫秒快照驅動 + 動態時鐘對齊 + 5M 換棒增量自動落盤 + 瘦身雙表 + 完整 Audit Logs
 
 import os
 import time
@@ -86,7 +86,7 @@ class ChartPlugin:
         return setup_type
 
     def get_realtime_snapshot_and_history(self, code: str) -> tuple:
-        """【快照驅動引擎】毫秒級 Snapshot 獲取最新現價 + 本地 5M 歷史基座"""
+        """【快照驅動 + 自動增量落盤引擎】"""
         snap = {
             "price": 0.0, "source": "未連線", "server_time": "--",
             "latency_ms": 0, "open": 0.0, "high": 0.0, "low": 0.0, "vol": 0.0
@@ -152,23 +152,60 @@ class ChartPlugin:
                 pass
         return pd.DataFrame()
 
-    def get_countdown_to_next_5m(self) -> str:
-        """計算距離下一次 5 分鐘換棒的倒數時間 (MM:SS)"""
+    def get_countdown_and_current_slot(self) -> tuple:
+        """計算當前 5M 時段標籤與換棒倒數時間 (MM:SS)"""
         now = datetime.datetime.now(tz_ny)
         cur_min = now.minute
         cur_sec = now.second
+        
+        slot_min = (cur_min // 5) * 5
+        cur_slot_time = now.replace(minute=slot_min, second=0, microsecond=0)
+        slot_str = cur_slot_time.strftime('%H:%M')
+        
         rem_min = 4 - (cur_min % 5)
         rem_sec = 60 - cur_sec
         if rem_sec == 60:
             rem_min += 1
             rem_sec = 0
-        return f"{rem_min:02d}:{rem_sec:02d}"
+            
+        countdown_str = f"{rem_min:02d}:{rem_sec:02d}"
+        return cur_slot_time, slot_str, countdown_str
+
+    def check_and_append_new_bar(self, code: str, df_5m: pd.DataFrame, cur_slot_time: datetime.datetime, curr_price: float):
+        """【自動增量落盤】當跨入新 5M 時，自動沉澱已閉合柱至硬碟 CSV"""
+        if df_5m.empty:
+            return df_5m
+
+        last_csv_time = pd.to_datetime(df_5m['time_key'].iloc[-1]).tz_localize(None)
+        target_slot = cur_slot_time.replace(tzinfo=None)
+
+        if target_slot > last_csv_time:
+            # 建立剛閉合定格的新柱
+            new_row = pd.DataFrame([{
+                'time_key': target_slot.strftime('%Y-%m-%d %H:%M:%S'),
+                'open': curr_price,
+                'close': curr_price,
+                'high': curr_price,
+                'low': curr_price,
+                'volume': 1.0
+            }])
+            df_5m = pd.concat([df_5m, new_row]).reset_index(drop=True)
+            
+            # 追加寫入硬碟
+            save_prefix = "CC_BTCUSD" if "BTC" in code.upper() else code.replace('.', '_')
+            f_path = os.path.join(self.data_dir, f"{save_prefix}_5M.csv")
+            try:
+                new_row.to_csv(f_path, mode='a', header=not os.path.exists(f_path), index=False)
+            except Exception:
+                pass
+
+        return df_5m
 
     def render_cockpit(self, code: str, budget_usd: float = 200.0):
         """【毫秒 Snapshot 驅動 · 精簡雙表座艙】"""
         snap, status_msg, df_5m = self.get_realtime_snapshot_and_history(code)
         df_day = self.load_cold_data(code, "DAY")
-        countdown_str = self.get_countdown_to_next_5m()
+        cur_slot_time, live_slot_str, countdown_str = self.get_countdown_and_current_slot()
 
         # 現價與動態呼吸閃爍
         curr_price = snap["price"]
@@ -176,6 +213,9 @@ class ChartPlugin:
             curr_price = float(df_5m['close'].iloc[-1])
         if curr_price <= 0:
             curr_price = 79700.0 if "BTC" in code.upper() else 488.50
+
+        # 自動增量落盤檢查
+        df_5m = self.check_and_append_new_bar(code, df_5m, cur_slot_time, curr_price)
 
         prev_p_key = f"{code}_prev_price"
         prev_p = st.session_state.get(prev_p_key, curr_price)
@@ -240,7 +280,8 @@ class ChartPlugin:
         raw_bull_pattern = bull_2b_raw | bull_engulf | bull_star
         raw_bear_pattern = bear_2b_raw | bear_engulf | bear_star
 
-        bars_6 = df_5m.tail(6).iloc[::-1].copy().reset_index(drop=True)
+        # 截取已收盤的最後 5 根 + 最上方 1 根 LIVE
+        closed_bars_5 = df_5m.tail(5).iloc[::-1].copy().reset_index(drop=True)
 
         table1_rows = []
         table2_rows = []
@@ -249,7 +290,30 @@ class ChartPlugin:
         latest_trigger_action = "☕ 處於安全中繼區，耐心等待 5M 收盤確認右側突破"
         latest_trigger_type = "NONE"
 
-        for idx, row in bars_6.iterrows():
+        # ─── 第 1 行：動態 LIVE 行 (當前即時時段 + 倒數計時同一風格) ───
+        live_col1_t1 = f"<b style='color:#58a6ff;'>{live_slot_str}</b> <span style='background:#1f293d; color:#58a6ff; padding:2px 6px; border-radius:4px; font-weight:bold;'>⚡ LIVE</span> <span style='background:#161b22; color:#00E676; border:1px solid #238636; padding:2px 6px; border-radius:4px; font-weight:bold;'>⏱️ {countdown_str}</span>"
+        live_col1_t2 = f"<b style='color:#58a6ff;'>{live_slot_str}</b> <span style='color:#8b949e;'>⚪ 待機中</span>"
+        live_c_display = f"<span style='color:{flash_color}; font-weight:bold;'>${curr_price:,.2f} ({flash_sym})</span>"
+        
+        table1_rows.append({
+            "5M時段與狀態": live_col1_t1,
+            "現價/收盤 (Close)": live_c_display,
+            "影線極值 (High / Low)": f"{curr_price:.2f} / {curr_price:.2f}",
+            "5M量能 (VPA)": "<span style='color:#8b949e;'>⚪ 即時撮合中</span>",
+            "_style": ""
+        })
+
+        table2_rows.append({
+            "5M時段與TD計數": live_col1_t2,
+            "形態與戰區診斷": "⚪ 棒線走動中 (等待 5M 收盤定格)",
+            "1:2 結構指令 & 動作": "☕ 觀望待機 (未收盤禁止開單)",
+            "_style": ""
+        })
+
+        audit_bars_log.append(f"• {live_slot_str} ⚡ LIVE  | 現價: ${curr_price:,.2f} ({flash_sym}) | 當根極值: {curr_price:.2f}/{curr_price:.2f} | 狀態: 即時撮合動態推進")
+
+        # ─── 第 2~6 行：已收盤定格行 ───
+        for idx, row in closed_bars_5.iterrows():
             t_str = pd.to_datetime(row['time_key']).strftime('%H:%M')
             o, c, h, l, v = float(row['open']), float(row['close']), float(row['high']), float(row['low']), float(row['volume'])
             vma = float(row['vma20']) if row['vma20'] > 0 else 1.0
@@ -264,88 +328,72 @@ class ChartPlugin:
             action_str = "⚪ 待機中"
             diag_str = "⚪ 常規波動"
 
-            if idx == 0:
-                # ─── 第 1 行：LIVE 行 (時段 + LIVE + 倒數計時同一字體風格) ───
-                col1_t1 = f"<b style='color:#58a6ff;'>{t_str}</b> <span style='background:#1f293d; color:#58a6ff; padding:2px 6px; border-radius:4px; font-weight:bold;'>⚡ LIVE</span> <span style='background:#161b22; color:#00E676; border:1px solid #238636; padding:2px 6px; border-radius:4px; font-weight:bold;'>⏱️ {countdown_str}</span>"
-                col1_t2 = f"<b style='color:#58a6ff;'>{t_str}</b> <span style='color:#8b949e;'>{td_s}</span>"
-                c_display = f"<span style='color:{flash_color}; font-weight:bold;'>${curr_price:,.2f} ({flash_sym})</span>"
-                h_display = f"{max(h, curr_price):.2f}"
-                l_display = f"{min(l, curr_price):.2f}"
-                diag_str = "⚪ 棒線走動中 (等待 5M 收盤定格)"
-                action_str = "☕ 觀望待機 (未收盤禁止開單)"
-                audit_log_line = f"• {t_str} ⚡ LIVE  | 現價: ${curr_price:,.2f} ({flash_sym}) | 當根極值: {h_display}/{l_display} | 量: {vol_ratio:.2f}x ({'🟢放量' if is_heavy else '⚪常規'}) | TD: {td_s}"
+            col1_t1 = f"<b style='color:#8b949e;'>{t_str}</b> <span style='background:#21262d; color:#8b949e; padding:2px 6px; border-radius:4px;'>🔒 收盤</span>"
+            
+            if "S9" in td_s:
+                td_html = f"<span style='background:rgba(255,82,82,0.25); color:#FF5252; padding:2px 6px; border-radius:4px; font-weight:bold;'>{td_s}</span>"
+            elif "買入" in td_s:
+                td_html = f"<span style='color:#00E676; font-weight:bold;'>{td_s}</span>"
+            elif "賣出" in td_s:
+                td_html = f"<span style='color:#FF5252; font-weight:bold;'>{td_s}</span>"
             else:
-                # ─── 第 2~6 行：已收盤定格行 ───
-                col1_t1 = f"<b style='color:#8b949e;'>{t_str}</b> <span style='background:#21262d; color:#8b949e; padding:2px 6px; border-radius:4px;'>🔒 收盤</span>"
-                
-                if "S9" in td_s:
-                    td_html = f"<span style='background:rgba(255,82,82,0.25); color:#FF5252; padding:2px 6px; border-radius:4px; font-weight:bold;'>{td_s}</span>"
-                elif "買入" in td_s:
-                    td_html = f"<span style='color:#00E676; font-weight:bold;'>{td_s}</span>"
-                elif "賣出" in td_s:
-                    td_html = f"<span style='color:#FF5252; font-weight:bold;'>{td_s}</span>"
+                td_html = f"<span style='color:#8b949e;'>{td_s}</span>"
+
+            col1_t2 = f"<b style='color:#8b949e;'>{t_str}</b> {td_html}"
+            c_display = f"${c:,.2f} [{candle_color}]"
+
+            # 提取前一根棒線執行【富途 PART 6 保守右側確認】
+            if idx + 1 < len(closed_bars_5):
+                prev_bar = closed_bars_5.iloc[idx + 1]
+                p_h, p_l = float(prev_bar['high']), float(prev_bar['low'])
+                p_vol_ratio = float(prev_bar['volume']) / (float(prev_bar['vma20']) if prev_bar['vma20'] > 0 else 1.0)
+                p_heavy = p_vol_ratio >= 1.25
+
+                orig_idx = df_5m.index[df_5m['time_key'] == row['time_key']].tolist()
+                if orig_idx:
+                    p_orig_idx = orig_idx[0] - 1
+                    has_prev_bull = raw_bull_pattern.iloc[p_orig_idx] if p_orig_idx >= 0 else False
+                    has_prev_bear = raw_bear_pattern.iloc[p_orig_idx] if p_orig_idx >= 0 else False
                 else:
-                    td_html = f"<span style='color:#8b949e;'>{td_s}</span>"
+                    has_prev_bull, has_prev_bear = False, False
 
-                col1_t2 = f"<b style='color:#8b949e;'>{t_str}</b> {td_html}"
-                c_display = f"${c:,.2f} [{candle_color}]"
-                h_display = f"{h:.2f}"
-                l_display = f"{l:.2f}"
+                is_bull_confirmed = has_prev_bull and (h > p_h) and (c > o) and (is_heavy or p_heavy) and (trend_bias >= 0)
+                is_bear_confirmed = has_prev_bear and (l < p_l) and (c < o) and (is_heavy or p_heavy) and (trend_bias <= 0)
 
-                # 提取前一根 (T-1) 棒線執行【富途 PART 6 保守右側確認】
-                if idx + 1 < len(bars_6):
-                    prev_bar = bars_6.iloc[idx + 1]
-                    p_h, p_l = float(prev_bar['high']), float(prev_bar['low'])
-                    p_vol_ratio = float(prev_bar['volume']) / (float(prev_bar['vma20']) if prev_bar['vma20'] > 0 else 1.0)
-                    p_heavy = p_vol_ratio >= 1.25
+                if is_bull_confirmed:
+                    row_style = "background-color: rgba(0, 230, 118, 0.18); color: #ffffff; font-weight: bold; border-left: 5px solid #00E676;"
+                    diag_str = "🔥 2B/晨星 右側放量衝破確認"
+                    sl = p_l - 0.5 * atr
+                    tp = c + 2.0 * (c - sl)
+                    action_str = f"🎯 【買入 CALL】(入: ${c:.2f} | 止: ${sl:.2f} | 盈: ${tp:.2f})"
+                    if idx == 0:
+                        latest_trigger_type = "CALL"
+                        latest_trigger_action = f"🔥 【右側確認 · 買入 0DTE CALL】 入場: ${c:.2f} | 止損: ${sl:.2f} | 2R止盈: ${tp:.2f}"
 
-                    orig_idx = df_5m.index[df_5m['time_key'] == row['time_key']].tolist()
-                    if orig_idx:
-                        p_orig_idx = orig_idx[0] - 1
-                        has_prev_bull = raw_bull_pattern.iloc[p_orig_idx] if p_orig_idx >= 0 else False
-                        has_prev_bear = raw_bear_pattern.iloc[p_orig_idx] if p_orig_idx >= 0 else False
+                elif is_bear_confirmed:
+                    row_style = "background-color: rgba(255, 82, 82, 0.18); color: #ffffff; font-weight: bold; border-left: 5px solid #FF5252;"
+                    diag_str = "🔥 2B/暮星 右側放量跌破確認"
+                    sl = p_h + 0.5 * atr
+                    tp = c - 2.0 * (sl - c)
+                    action_str = f"🎯 【買入 PUT】(入: ${c:.2f} | 止: ${sl:.2f} | 盈: ${tp:.2f})"
+                    if idx == 0:
+                        latest_trigger_type = "PUT"
+                        latest_trigger_action = f"🔥 【右側確認 · 買入 0DTE PUT】 入場: ${c:.2f} | 止損: ${sl:.2f} | 2R止盈: ${tp:.2f}"
+                else:
+                    if has_prev_bull:
+                        diag_str = "⚪ 扎針完成 (等待衝破前高確認)"
+                    elif has_prev_bear:
+                        diag_str = "⚪ 衝頂完成 (等待跌破前低確認)"
                     else:
-                        has_prev_bull, has_prev_bear = False, False
-
-                    is_bull_confirmed = has_prev_bull and (h > p_h) and (c > o) and (is_heavy or p_heavy) and (trend_bias >= 0)
-                    is_bear_confirmed = has_prev_bear and (l < p_l) and (c < o) and (is_heavy or p_heavy) and (trend_bias <= 0)
-
-                    if is_bull_confirmed:
-                        row_style = "background-color: rgba(0, 230, 118, 0.18); color: #ffffff; font-weight: bold; border-left: 5px solid #00E676;"
-                        diag_str = "🔥 2B/晨星 右側放量衝破確認"
-                        sl = p_l - 0.5 * atr
-                        tp = c + 2.0 * (c - sl)
-                        action_str = f"🎯 【買入 CALL】(入: ${c:.2f} | 止: ${sl:.2f} | 盈: ${tp:.2f})"
-                        if idx == 1:
-                            latest_trigger_type = "CALL"
-                            latest_trigger_action = f"🔥 【右側確認 · 買入 0DTE CALL】 入場: ${c:.2f} | 止損: ${sl:.2f} | 2R止盈: ${tp:.2f}"
-
-                    elif is_bear_confirmed:
-                        row_style = "background-color: rgba(255, 82, 82, 0.18); color: #ffffff; font-weight: bold; border-left: 5px solid #FF5252;"
-                        diag_str = "🔥 2B/暮星 右側放量跌破確認"
-                        sl = p_h + 0.5 * atr
-                        tp = c - 2.0 * (sl - c)
-                        action_str = f"🎯 【買入 PUT】(入: ${c:.2f} | 止: ${sl:.2f} | 盈: ${tp:.2f})"
-                        if idx == 1:
-                            latest_trigger_type = "PUT"
-                            latest_trigger_action = f"🔥 【右側確認 · 買入 0DTE PUT】 入場: ${c:.2f} | 止損: ${sl:.2f} | 2R止盈: ${tp:.2f}"
-                    else:
-                        if has_prev_bull:
-                            diag_str = "⚪ 扎針完成 (等待衝破前高確認)"
-                        elif has_prev_bear:
-                            diag_str = "⚪ 衝頂完成 (等待跌破前低確認)"
-                        else:
-                            diag_str = "⚪ 均線上方蓄勢" if c > o else "⚪ 區間震盪整理"
-                        action_str = "☕ 觀望待機"
-
-                audit_log_line = f"• {t_str} 🔒 收盤  | 收盤: ${c:,.2f} | 影線: {h_display}/{l_display} | 量: {vol_ratio:.2f}x ({'🟢放量' if is_heavy else '⚪常規'}) | TD: {td_s} | 診斷: {diag_str}"
+                        diag_str = "⚪ 均線上方蓄勢" if c > o else "⚪ 區間震盪整理"
+                    action_str = "☕ 觀望待機"
 
             vol_pill = f"<span style='background:rgba(0,230,118,0.2); color:#00E676; padding:2px 8px; border-radius:12px; font-weight:bold;'>🟢 {vol_ratio:.2f}x 放量</span>" if is_heavy else f"<span style='color:#8b949e;'>⚪ {vol_ratio:.2f}x 常規</span>"
 
             table1_rows.append({
                 "5M時段與狀態": col1_t1,
                 "現價/收盤 (Close)": c_display,
-                "影線極值 (High / Low)": f"{h_display} / {l_display}",
+                "影線極值 (High / Low)": f"{h:.2f} / {l:.2f}",
                 "5M量能 (VPA)": vol_pill,
                 "_style": row_style
             })
@@ -357,7 +405,7 @@ class ChartPlugin:
                 "_style": row_style
             })
 
-            audit_bars_log.append(audit_log_line)
+            audit_bars_log.append(f"• {t_str} 🔒 收盤  | 收盤: ${c:,.2f} | 影線: {h:.2f}/{l:.2f} | 量: {vol_ratio:.2f}x ({'🟢放量' if is_heavy else '⚪常規'}) | TD: {td_s} | 診斷: {diag_str}")
 
         # ====== 頂部 HUD ======
         with stylable_container(
@@ -374,9 +422,9 @@ class ChartPlugin:
             """
         ):
             st.markdown(f"📶 通道: **{snap['source']}** | 撮合時間: **{snap['server_time']} ET** | 延遲: **{snap['latency_ms']} ms** | 宏觀方向: **{trend_text}**")
-            st.caption(f"⚙️ 狀態: `{status_msg}`")
+            st.caption(f"⚙️ 狀態: `{status_msg}` | 💾 CSV 增量自動歸檔就緒")
 
-        # ====== 表 1：5M 即時量價核心表 (瘦身版 4 欄) ======
+        # ====== 表 1：5M 即時量價核心表 ======
         st.markdown("##### 📊 表 1：5M 即時量價核心表 (黃金 30 分鐘滾動窗口)")
         t1_html = "<table style='width:100%; border-collapse: collapse; font-family: monospace; font-size: 14px; text-align: left; background-color: #0d1117; border-radius: 8px; overflow: hidden;'>"
         t1_html += "<tr style='border-bottom: 2px solid #30363d; color: #8b949e; background-color: #161b22;'>"
@@ -397,7 +445,7 @@ class ChartPlugin:
 
         st.markdown("<div style='margin-top: 15px;'></div>", unsafe_allow_html=True)
 
-        # ====== 表 2：德馬克 TD 9轉與戰術表 (瘦身版 3 欄) ======
+        # ====== 表 2：德馬克 TD 9轉與戰術表 ======
         st.markdown("##### ⏱️ 表 2：德馬克 TD 9轉與戰術表 (保守右側確認)")
         t2_html = "<table style='width:100%; border-collapse: collapse; font-family: monospace; font-size: 14px; text-align: left; background-color: #0d1117; border-radius: 8px; overflow: hidden;'>"
         t2_html += "<tr style='border-bottom: 2px solid #30363d; color: #8b949e; background-color: #161b22;'>"
@@ -436,7 +484,7 @@ class ChartPlugin:
         </div>
         """, unsafe_allow_html=True)
 
-        # ====== 模組 7: 完整 Audit Logs 審核日誌 (原生代碼塊，右上角自帶複製小按鈕) ======
+        # ====== 模組 7: 完整 Audit Logs 審核日誌 (原生代碼塊，右上角自帶複製按鈕) ======
         now_my_str = datetime.datetime.now(tz_my).strftime('%Y-%m-%d %H:%M:%S MYT')
         now_ny_str = datetime.datetime.now(tz_ny).strftime('%Y-%m-%d %H:%M:%S ET')
 
