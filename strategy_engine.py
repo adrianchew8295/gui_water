@@ -1,5 +1,5 @@
 # 文件名: strategy_engine.py
-# 核心職責: 【獨立策略大腦】VPA 多空對稱形態分類、Trend Bias 門禁、2B 假突破、TD 9 轉、0DTE 期權點位
+# 核心職責: 【獨立策略大腦】VPA 多空對稱形態分類、Trend Bias 門禁、2B 假突破、TD 9 轉、0DTE 期權換算
 
 import numpy as np
 import pandas as pd
@@ -45,28 +45,24 @@ class StrategyEngine:
         return setup_type
 
     @staticmethod
-    def classify_candle_shape(open_p: float, high_p: float, low_p: float, close_p: float, prev_close: float = None) -> str:
+    def classify_candle_shape(open_p: float, high_p: float, low_p: float, close_p: float) -> str:
         """
         【VPA 核心經典形態 · 多空對稱分類】
         🟢 青色 (收盤 >= 開盤 / 多頭偏向) | 🔴 紅色 (收盤 < 開盤 / 空頭偏向)
         """
         total_range = high_p - low_p
-        
-        # 1. 若無影線振幅，比對前一根收盤價
+        is_up = close_p >= open_p
+
+        # 1. 無振幅或極窄十字
         if total_range <= 0.0001:
-            if prev_close is not None and prev_close > 0:
-                return "🔴 紅陰跌" if close_p < prev_close else "🟢 青陽漲"
-            return "🟢 青陽漲" if close_p >= open_p else "🔴 紅陰跌"
+            return "🟢 青陽漲" if is_up else "🔴 紅陰跌"
 
         body = abs(close_p - open_p)
         upper_wick = high_p - max(open_p, close_p)
         lower_wick = min(open_p, close_p) - low_p
-        is_up = close_p >= open_p
 
         # 2. 實體極窄 (≤ 15% 振幅) -> 長腿十字星
         if body <= total_range * 0.15:
-            if prev_close is not None and prev_close > 0:
-                return "🔴 十字跌 ⚖️" if close_p < prev_close else "🟢 十字漲 ⚖️"
             return "🟢 十字漲 ⚖️" if is_up else "🔴 十字跌 ⚖️"
 
         # 3. 長上影線形態 (上影線 ≥ 2 倍實體)
