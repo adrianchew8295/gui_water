@@ -1,5 +1,5 @@
 # 文件名: strategy_engine.py
-# 核心職責: 【獨立策略大腦】修正 2B 頂底假突破、嚴格 K 線解剖幾何、Candle Close 收盤定罪
+# 核心職責: 【獨立策略大腦】開收盤顏色一票否決 + 影線 PK 精準形態 + 2B 頂底真理
 
 import numpy as np
 import pandas as pd
@@ -47,13 +47,14 @@ class StrategyEngine:
     @staticmethod
     def classify_candle_shape(open_p: float, high_p: float, low_p: float, close_p: float) -> str:
         """
-        【嚴格 K 線解剖幾何】
-        杜絕長影線衝高受阻誤判為大陽
+        【精準 K 線解剖與顏色判定】
+        1. 顏色優先級：Close >= Open 必為 🟢 青，Close < Open 必為 🔴 紅
+        2. 影線長度 PK 杜絕形態誤判
         """
         total_range = high_p - low_p
         is_up = close_p >= open_p
 
-        # 1. 無振幅
+        # 1. 極小振幅
         if total_range <= 0.0001:
             return "🟢 青陽漲" if is_up else "🔴 紅陰跌"
 
@@ -65,17 +66,17 @@ class StrategyEngine:
         if body <= total_range * 0.15:
             return "🟢 十字漲 ⚖️" if is_up else "🔴 十字跌 ⚖️"
 
-        # 3. 長上影線形態 (上影線 ≥ 1.5 倍實體 且 上影線佔總振幅 > 35%)
-        if upper_wick >= 1.5 * body and upper_wick >= 0.35 * total_range:
-            return "🔴 射星跌 🌠" if not is_up else "🟢 倒錘漲 🛸"
+        # 3. 實體大陽 / 大陰 (實體佔比 ≥ 75%)
+        if body >= 0.75 * total_range:
+            return "🟢 大陽衝鋒 🚀" if is_up else "🔴 大陰破位 💥"
 
-        # 4. 長下影線形態 (下影線 ≥ 1.5 倍實體 且 下影線佔總振幅 > 35%)
-        if lower_wick >= 1.5 * body and lower_wick >= 0.35 * total_range:
+        # 4. 下影線顯著長於上影線 (下影線占優勢)
+        if lower_wick >= 1.3 * upper_wick and lower_wick >= 0.30 * total_range:
             return "🟢 鐵錘漲 🔨" if is_up else "🔴 吊頸跌 🪓"
 
-        # 5. 實體大陽 / 大陰 (實體佔比 ≥ 80% 且 上下影線極短)
-        if body >= 0.80 * total_range:
-            return "🟢 大陽衝鋒 🚀" if is_up else "🔴 大陰破位 💥"
+        # 5. 上影線顯著長於下影線 (上影線占優勢)
+        if upper_wick >= 1.3 * lower_wick and upper_wick >= 0.30 * total_range:
+            return "🟢 倒錘漲 🛸" if is_up else "🔴 射星跌 🌠"
 
         # 6. 常規 K 線
         return "🟢 青陽漲" if is_up else "🔴 紅陰跌"
@@ -105,9 +106,7 @@ class StrategyEngine:
 
     @staticmethod
     def evaluate_5m_signals(df_5m: pd.DataFrame, trend_bias: int, pdh_line: float, pdl_line: float) -> tuple:
-        """
-        【模組：5M 戰術信號與 2B 頂底真理診斷】
-        """
+        """【模組：5M 戰術信號與 2B 頂底真理診斷】"""
         df = df_5m.copy()
         df['vma20'] = df['volume'].rolling(20).mean().bfill()
         df['atr14'] = StrategyEngine.calculate_atr(df, 14)
@@ -116,18 +115,16 @@ class StrategyEngine:
         llv5 = df['low'].rolling(5).min().shift(1).bfill()
         hhv5 = df['high'].rolling(5).max().shift(1).bfill()
 
-        # 【2B 多空真理定義】
-        # 1. 看跌 2B 假突破 (衝高遇阻回落 -> 買入 PUT)
+        # 看跌 2B 假突破 (衝高遇阻回落 -> 買 PUT)
         bear_2b_raw = ((df['high'] > hhv5) | (df['high'] > pdh_line)) & (df['close'] < hhv5)
         
-        # 2. 看多 2B 假突破 (探底破底翻拉回 -> 買入 CALL)
+        # 看多 2B 假突破 (探底破底翻拉回 -> 買 CALL)
         bull_2b_raw = ((df['low'] < llv5) | (df['low'] < pdl_line)) & (df['close'] > llv5)
 
         c1, o1 = df['close'].shift(1), df['open'].shift(1)
         c2, o2 = df['close'].shift(2), df['open'].shift(2)
         h1, l1 = df['high'].shift(1), df['low'].shift(1)
 
-        # 晨星 / 暮星形態
         bull_star = (c2 < o2) & ((c1 - o1).abs() <= 0.35 * (h1 - l1)) & (df['close'] > df['open']) & (df['close'] >= (o2 + c2) / 2)
         bear_star = (c2 > o2) & ((c1 - o1).abs() <= 0.35 * (h1 - l1)) & (df['close'] < df['open']) & (df['close'] <= (o2 + c2) / 2)
 
