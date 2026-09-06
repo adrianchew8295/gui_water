@@ -1,11 +1,5 @@
 # 文件名: journal_plugin.py
-# 核心職責: 【高階可視化復盤與 5M 原生定格插件】
-# 1. 模式 A 極致靜態 + 換棒平滑推進 (Seamless Bar Transition)
-# 2. 視角記憶鎖定 (uirevision 拖曳不重置)
-# 3. 標籤向外避讓防遮擋 K 線 (Anti-Overlap Annotations)
-# 4. 贏綠輸紅高對比損益 (Win 🟢 vs Loss 🔴)
-# 5. 4 維 100 分制客觀評分模型 (趨勢25 + 戰區25 + 形態25 + 量能25)
-# 6. 大馬 22:00-24:00 黃金時段分割 (⭐) + Active & Error Logs
+# 核心職責: 【高階可視化復盤插件 · 視口記憶鎖定 · JS動態Timer · 可摺疊Audit Log】
 
 import os
 import sys
@@ -118,7 +112,6 @@ class JournalPlugin:
         }
 
     def _load_real_kline_slice(self, code: str, entry_date_str: str, entry_time_str: str, entry_p: float):
-        """讀取真實 5M CSV 數據切片"""
         clean_code = code.replace('.', '_')
         csv_path = os.path.join(CURRENT_DIR, 'market_data', f"{clean_code}_5M_2026.csv")
         if not os.path.exists(csv_path):
@@ -128,7 +121,6 @@ class JournalPlugin:
             try:
                 df_raw = pd.read_csv(csv_path)
                 df_raw.columns = [c.lower() for c in df_raw.columns]
-                
                 match_indices = df_raw[df_raw['time_key'].astype(str).str.contains(entry_date_str, na=False)].index.tolist()
                 if match_indices:
                     mid_idx = match_indices[len(match_indices)//2]
@@ -162,7 +154,6 @@ class JournalPlugin:
         return times, opens, highs, lows, closes, volumes, 16
 
     def render_interactive_replay_chart(self, trade_row: pd.Series):
-        """雙層高階圖表 · 實施「向外避讓防遮擋機制」+ 視角記憶鎖定"""
         entry_p = float(trade_row.get('entry', 0.0))
         sl_p = float(trade_row.get('sl', 0.0))
         tp_p = float(trade_row.get('tp', 0.0))
@@ -190,7 +181,6 @@ class JournalPlugin:
             row_heights=[0.70, 0.30]
         )
 
-        # 1. 主圖：真實 5M K 線 (綠陽/紅陰)
         fig.add_trace(go.Candlestick(
             x=times, open=opens, high=highs, low=lows, close=closes,
             increasing_line_color='#00E676', decreasing_line_color='#FF5252',
@@ -198,21 +188,17 @@ class JournalPlugin:
             name="5M K線"
         ), row=1, col=1)
 
-        # 2. PDH / PDL 水平線
         fig.add_hline(y=pdh_p, line_dash="dot", line_color="#ffd700", line_width=1.2, annotation_text=f"PDH: ${pdh_p:,.2f}", annotation_position="top left", row=1, col=1)
         fig.add_hline(y=pdl_p, line_dash="dot", line_color="#ffd700", line_width=1.2, annotation_text=f"PDL: ${pdl_p:,.2f}", annotation_position="bottom left", row=1, col=1)
 
-        # 3. 戰區色塊
         step_val = 15.0 if entry_p > 1000 else 0.4
         fig.add_hrect(y0=rbs_p - step_val * 0.3, y1=rbs_p + step_val * 0.3, line_width=0, fillcolor="#00E676", opacity=0.12, annotation_text="RBS 支撐", annotation_position="bottom left", row=1, col=1)
         fig.add_hrect(y0=sbr_p - step_val * 0.3, y1=sbr_p + step_val * 0.3, line_width=0, fillcolor="#FF5252", opacity=0.12, annotation_text="SBR 阻力", annotation_position="top left", row=1, col=1)
 
-        # 4. 交易打點水平線
         fig.add_hline(y=entry_p, line_dash="dash", line_color="#58a6ff", annotation_text=f"進場: ${entry_p:,.2f}", annotation_position="top right", row=1, col=1)
         fig.add_hline(y=sl_p, line_dash="dash", line_color="#FF5252", annotation_text=f"止損: ${sl_p:,.2f}", annotation_position="bottom right", row=1, col=1)
         fig.add_hline(y=tp_p, line_dash="dash", line_color="#00E676", annotation_text=f"2R止盈: ${tp_p:,.2f}", annotation_position="top right", row=1, col=1)
 
-        # 5. 【防遮擋核心】開倉標籤：向最低點下方沉降 -y 偏移
         if entry_idx < len(times):
             fig.add_annotation(
                 x=times[entry_idx], y=lows[entry_idx],
@@ -224,7 +210,6 @@ class JournalPlugin:
                 row=1, col=1
             )
 
-        # 6. 【防遮擋核心】出場標籤：向最高點上方推升 +y 偏移
         if exit_idx < len(times):
             arrow_color = "#00E676" if is_win else "#FF5252"
             fig.add_annotation(
@@ -237,7 +222,6 @@ class JournalPlugin:
                 row=1, col=1
             )
 
-        # 7. 副圖：成交量柱
         vol_colors = ['#00E676' if c >= o else '#FF5252' for o, c in zip(opens, closes)]
         fig.add_trace(go.Bar(
             x=times, y=volumes, marker_color=vol_colors, name="5M 成交量"
@@ -246,14 +230,13 @@ class JournalPlugin:
         vma20_val = sum(volumes) / len(volumes) if len(volumes) > 0 else 1.0
         fig.add_hline(y=vma20_val, line_dash="dash", line_color="#ffffff", line_width=1, annotation_text="VMA20", annotation_position="top left", row=2, col=1)
 
-        # 自適應動態座標
         kline_min = min(lows)
         kline_max = max(highs)
         padding = max(step_val * 2.5, (kline_max - kline_min) * 0.22)
 
         fig.update_layout(
             height=460,
-            uirevision="lock_view_constant", # 鎖定視口，拖曳放大不重置
+            uirevision="lock_view_constant",
             margin=dict(l=10, r=10, t=25, b=10),
             paper_bgcolor="#0d1117",
             plot_bgcolor="#0d1117",
@@ -278,21 +261,38 @@ class JournalPlugin:
         </style>
         """, unsafe_allow_html=True)
 
-        # 動態 Timer 心跳條 (前端驅動)
-        now_dt_my = datetime.datetime.now(tz_my)
-        now_dt_ny = datetime.datetime.now(tz_ny)
-        curr_seconds = now_dt_my.minute * 60 + now_dt_my.second
-        rem_sec = 300 - (curr_seconds % 300)
-        rem_m = rem_sec // 60
-        rem_s = rem_sec % 60
-        timer_text = f"⏱️ 距離下根 5M 定格: {rem_m:02d}:{rem_s:02d}"
-
-        st.markdown(f"""
-        <div style="background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 6px 12px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; font-family: monospace; font-size: 12px;">
+        # 1. 前端本機 JavaScript 動態倒數計時心跳 (每秒平滑跳動，零頁面刷新)
+        js_timer_html = f"""
+        <div style="background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 6px 14px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; font-family: monospace; font-size: 13px;">
             <div><span style="color: #00E676;">🟢 OpenD 原生長連線</span> | 標的: <b style="color:#58a6ff;">{code}</b> | 模式: <b>模式 A (極致靜態無閃爍)</b></div>
-            <div style="color: #ffd700; font-weight: bold;">{timer_text}</div>
+            <div id="live_5m_timer" style="color: #ffd700; font-weight: bold; font-size: 14px;">⏱️ 倒數計時加載中...</div>
         </div>
-        """, unsafe_allow_html=True)
+        <script>
+        (function() {{
+            function update5MTimer() {{
+                var now = new Date();
+                var sec = now.getSeconds();
+                var min = now.getMinutes();
+                var totalSec = min * 60 + sec;
+                var remSec = 300 - (totalSec % 300);
+                if (remSec === 300) remSec = 0;
+                var m = Math.floor(remSec / 60);
+                var s = remSec % 60;
+                var mStr = (m < 10 ? "0" : "") + m;
+                var sStr = (s < 10 ? "0" : "") + s;
+                var el = document.getElementById("live_5m_timer");
+                if (el) {{
+                    el.innerHTML = "⏱️ 距離下根 5M 定格: " + mStr + ":" + sStr;
+                }}
+            }}
+            update5MTimer();
+            if (!window.__timer5m_interval) {{
+                window.__timer5m_interval = setInterval(update5MTimer, 1000);
+            }}
+        }})();
+        </script>
+        """
+        st.markdown(js_timer_html, unsafe_allow_html=True)
 
         df_all = self.load_journal()
 
@@ -312,6 +312,9 @@ class JournalPlugin:
         col_m1, col_m2 = st.columns([1.8, 3.2])
         with col_m1:
             sel_month = st.selectbox("📅 選擇回測/復盤月份:", month_list, index=1 if len(month_list) > 1 else 0)
+
+        now_dt_my = datetime.datetime.now(tz_my)
+        now_dt_ny = datetime.datetime.now(tz_ny)
 
         if sel_month == "📅 今天 (實盤 Live 進行中)":
             today_str = now_dt_ny.strftime('%Y-%m-%d')
@@ -374,7 +377,7 @@ class JournalPlugin:
         else:
             st.info(f"💡 【{sel_month}】暫無已結算訂單，實盤監控中...")
 
-        # 底部標準 Active & Error Logs
+        # 2. 構建標準文字日誌 (無論有無選取訂單，均完整生成)
         now_my_str = now_dt_my.strftime('%Y-%m-%d %H:%M:%S MYT')
         now_et_str = now_dt_ny.strftime('%H:%M:%S ET')
 
@@ -405,5 +408,7 @@ class JournalPlugin:
             audit_log += f"• 異常監控: 0 報錯 / 0 斷線 (系統處於最佳健康狀態)\n"
             audit_log += f"========================================================"
 
-        st.caption("📋 策略復盤與系統排查日誌 (標準文字代碼塊 · 一鍵複製)：")
-        st.code(audit_log, language="text")
+        # 3. 【可收縮展開抽屜】不佔用介面空間，點擊展開即可隨時複製發送
+        with st.expander("📋 點擊展開/收起：系統審核與排查日誌 (Active & Error Logs · 一鍵複製)", expanded=False):
+            st.caption("點選下方文本框右上角圖示即可一鍵複製全部內容：")
+            st.code(audit_log, language="text")
