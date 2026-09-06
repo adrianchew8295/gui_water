@@ -1,125 +1,99 @@
-# 文件名: strategy_engine.py
-# 核心職責: 【策略獨立大腦】專門計算 Trend Bias、2B假突破、TD 9轉、保守右側確認、0DTE點位
-# 以後任何交易理念的修改 (例如不要 2B、更換 Trend Bias、修改均線)，只需改這個檔案！
+# 文件名: trendline_engine.py
+# 核心功能: 依據 Tom DeMark TD Lines 算法計算阻力線、支撐線與 50/50 多空目標投影
 
+from typing import Dict, List, Tuple, Any
 import numpy as np
 import pandas as pd
 
-class StrategyEngine:
-    """量化策略計算中樞"""
+def find_td_pivots(df: pd.DataFrame, window: int = 4) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    客觀量化提取 TD 頂點 (TD High) 與 TD 底點 (TD Low)
+    window: 前後對比根數 (預設 window N=4)
+    """
+    td_highs, td_lows = [], []
+    if df is None or len(df) < (2 * window + 1):
+        return td_highs, td_lows
 
-    @staticmethod
-    def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-        """計算 ATR14 波動率"""
-        if len(df) < 2:
-            return pd.Series([1.0] * len(df))
-        high = df['high']
-        low = df['low']
-        close = df['close'].shift(1).bfill()
-        tr = np.maximum(high - low, np.maximum((high - close).abs(), (low - close).abs()))
-        return tr.rolling(window=period).mean().bfill()
+    high_col = 'high' if 'high' in df.columns else 'High'
+    low_col = 'low' if 'low' in df.columns else 'Low'
+    time_col = 'time_clean' if 'time_clean' in df.columns else ('time_key' if 'time_key' in df.columns else df.columns[0])
 
-    @staticmethod
-    def compute_td_setup(df: pd.DataFrame) -> list:
-        """依據彭博 Bloomberg 標準計算德馬克 TD Setup (1~9 轉)"""
-        setup_type = ["⚪ 待機中"] * len(df)
-        if len(df) < 5:
-            return setup_type
+    highs, lows = df[high_col].values, df[low_col].values
+    times = df[time_col].astype(str).values
+    n = len(df)
 
-        buy_count = 0
-        sell_count = 0
-        for i in range(4, len(df)):
-            curr_c = df['close'].iloc[i]
-            ref_c = df['close'].iloc[i - 4]
-            if curr_c < ref_c:
-                buy_count += 1
-                sell_count = 0
-                setup_type[i] = f"🟢 買入 S{buy_count}" if buy_count < 9 else "🔥 買入 S9轉"
-            elif curr_c > ref_c:
-                sell_count += 1
-                buy_count = 0
-                setup_type[i] = f"🔴 賣出 S{sell_count}" if sell_count < 9 else "⚡ 賣出 S9轉"
-            else:
-                buy_count = 0
-                sell_count = 0
-                setup_type[i] = "⚪ 待機中"
-        return setup_type
+    for i in range(window, n - window):
+        curr_high = highs[i]
+        curr_low = lows[i]
 
-    @staticmethod
-    def evaluate_trend_bias(df_day: pd.DataFrame, curr_price: float) -> tuple:
-        """
-        【模組：宏觀方向門禁】
-        若想換別的理念 (例如大盤 MACD、VIX、多空均線)，修改這裡即可！
-        """
-        trend_bias = 0
-        trend_text = "⚪ 0 (中立震盪)"
-        pdh_line = curr_price * 1.008
-        pdl_line = curr_price * 0.992
+        # 1. TD Supply Point (阻力頂點 / TD High) 判定
+        if np.all(curr_high >= highs[i - window : i]) and np.all(curr_high >= highs[i + 1 : i + window + 1]):
+            td_highs.append({"bar_idx": i, "time": str(times[i]), "price": float(curr_high)})
 
-        if not df_day.empty and len(df_day) >= 2:
-            df_day['ema20'] = df_day['close'].ewm(span=20, adjust=False).mean()
-            last_d = df_day.iloc[-1]
-            prev_d = df_day.iloc[-2]
-            pdh_line = float(prev_d.get('high', curr_price * 1.008))
-            pdl_line = float(prev_d.get('low', curr_price * 0.992))
-            if float(last_d['close']) > float(last_d['ema20']):
-                trend_bias = 1
-                trend_text = "🟢 +1 (多頭控盤 [日線>EMA20])"
-            else:
-                trend_bias = -1
-                trend_text = "🔴 -1 (空頭壓制 [日線<EMA20])"
+        # 2. TD Demand Point (支撐底點 / TD Low) 判定
+        if np.all(curr_low <= lows[i - window : i]) and np.all(curr_low <= lows[i + 1 : i + window + 1]):
+            td_lows.append({"bar_idx": i, "time": str(times[i]), "price": float(curr_low)})
 
-        return trend_bias, trend_text, pdh_line, pdl_line
+    return td_highs, td_lows
 
-    @staticmethod
-    def evaluate_5m_signals(df_5m: pd.DataFrame, trend_bias: int, pdh_line: float, pdl_line: float) -> tuple:
-        """
-        【模組：5M 戰術信號與形態診斷】
-        若不想用 2B，想換成 SMC 或突破回踩，修改這裡即可！
-        """
-        df = df_5m.copy()
-        df['vma20'] = df['volume'].rolling(20).mean().bfill()
-        df['atr14'] = StrategyEngine.calculate_atr(df, 14)
-        df['td_setup'] = StrategyEngine.compute_td_setup(df)
+def compute_demark_trendlines(df: pd.DataFrame, window: int = 4) -> Dict[str, Any]:
+    """
+    計算最新兩條 TD 趨勢線（阻力線與支撐線）的坐標與現價延伸位置
+    """
+    res = {
+        "status": "fail",
+        "resistance_line": [],
+        "support_line": [],
+        "curr_res_val": None,
+        "curr_sup_val": None,
+        "bull_target_1": None,
+        "bull_target_2": None,
+        "bear_target_1": None,
+        "bear_target_2": None
+    }
+    if df is None or len(df) < (2 * window + 1):
+        return res
 
-        llv5 = df['low'].rolling(5).min().shift(1).bfill()
-        hhv5 = df['high'].rolling(5).max().shift(1).bfill()
+    td_highs, td_lows = find_td_pivots(df, window=window)
+    last_idx = len(df) - 1
+    time_col = 'time_clean' if 'time_clean' in df.columns else ('time_key' if 'time_key' in df.columns else df.columns[0])
+    times = df[time_col].astype(str).values
 
-        # 2B 假突破 (RAW 形態)
-        bull_2b_raw = ((df['low'] < llv5) | (df['low'] < pdl_line)) & (df['close'] > llv5) & (df['close'] > df['open'])
-        bear_2b_raw = ((df['high'] > hhv5) | (df['high'] > pdh_line)) & (df['close'] < hhv5) & (df['close'] < df['open'])
+    # 1. 阻力線計算 (連接最近 2 個 TD High 頂點向最新 K 線延伸)
+    if len(td_highs) >= 2:
+        p1, p2 = td_highs[-2], td_highs[-1]
+        dx, dy = p2["bar_idx"] - p1["bar_idx"], p2["price"] - p1["price"]
+        if dx > 0:
+            slope = dy / dx
+            curr_res_val = p2["price"] + slope * (last_idx - p2["bar_idx"])
+            res["curr_res_val"] = round(curr_res_val, 2)
+            res["resistance_line"] = [
+                {"time": str(times[i]), "value": round(float(p1["price"] + slope * (i - p1["bar_idx"])), 2)}
+                for i in range(p1["bar_idx"], last_idx + 1)
+            ]
 
-        # 吞沒與晨星
-        c1, o1 = df['close'].shift(1), df['open'].shift(1)
-        c2, o2 = df['close'].shift(2), df['open'].shift(2)
-        h1, l1 = df['high'].shift(1), df['low'].shift(1)
+    # 2. 支撐線計算 (連接最近 2 個 TD Low 底點向最新 K 線延伸)
+    if len(td_lows) >= 2:
+        p1, p2 = td_lows[-2], td_lows[-1]
+        dx, dy = p2["bar_idx"] - p1["bar_idx"], p2["price"] - p1["price"]
+        if dx > 0:
+            slope = dy / dx
+            curr_sup_val = p2["price"] + slope * (last_idx - p2["bar_idx"])
+            res["curr_sup_val"] = round(curr_sup_val, 2)
+            res["support_line"] = [
+                {"time": str(times[i]), "value": round(float(p1["price"] + slope * (i - p1["bar_idx"])), 2)}
+                for i in range(p1["bar_idx"], last_idx + 1)
+            ]
 
-        bull_engulf = (df['close'] > df['open']) & (c1 < o1) & (df['close'] >= o1) & (df['open'] <= c1)
-        bear_engulf = (df['close'] < df['open']) & (c1 > o1) & (df['close'] <= o1) & (df['open'] >= c1)
+    # 3. 德馬克突破目標價量化投影 (TD Target Projections)
+    if res["curr_res_val"] and res["curr_sup_val"]:
+        channel_height = abs(res["curr_res_val"] - res["curr_sup_val"])
+        # 多頭目標計算
+        res["bull_target_1"] = round(res["curr_res_val"] + channel_height * 0.618, 2)
+        res["bull_target_2"] = round(res["curr_res_val"] + channel_height * 1.0, 2)
+        # 空頭目標計算
+        res["bear_target_1"] = round(res["curr_sup_val"] - channel_height * 0.618, 2)
+        res["bear_target_2"] = round(res["curr_sup_val"] - channel_height * 1.0, 2)
+        res["status"] = "success"
 
-        bull_star = (c2 < o2) & ((c1 - o1).abs() <= 0.35 * (h1 - l1)) & (df['close'] > df['open']) & (df['close'] >= (o2 + c2) / 2)
-        bear_star = (c2 > o2) & ((c1 - o1).abs() <= 0.35 * (h1 - l1)) & (df['close'] < df['open']) & (df['close'] <= (o2 + c2) / 2)
-
-        raw_bull_pattern = bull_2b_raw | bull_engulf | bull_star
-        raw_bear_pattern = bear_2b_raw | bear_engulf | bear_star
-
-        return df, raw_bull_pattern, raw_bear_pattern
-
-    @staticmethod
-    def calculate_option_plan(curr_price: float, trigger_type: str, budget_usd: float = 200.0) -> dict:
-        """
-        【模組：0DTE 期權智能換算】
-        """
-        strike_atm = round(curr_price)
-        est_option_price = 1.45
-        total_cost = est_option_price * 100
-
-        opt_dir_str = "🟢 CALL 多單" if trigger_type == "CALL" else ("🔴 PUT 空單" if trigger_type == "PUT" else "⚪ 待機觀望")
-        opt_sym_str = f"QQQ {strike_atm} {'CALL' if trigger_type != 'PUT' else 'PUT'}"
-
-        return {
-            "strike_atm": strike_atm,
-            "total_cost": total_cost,
-            "opt_dir_str": opt_dir_str,
-            "opt_sym_str": opt_sym_str
-        }
+    return res
