@@ -1,5 +1,5 @@
 # 文件名: strategy_engine.py
-# 核心職責: 【獨立策略大腦】開收盤顏色一票否決 + 影線 PK 精準形態 + 2B 頂底真理
+# 核心職責: 【獨立策略大腦】1H EMA20 日內門禁 + 2B頂底假突破 + VPA雙色形態 + 0DTE智能換算
 
 import numpy as np
 import pandas as pd
@@ -20,9 +20,9 @@ class StrategyEngine:
 
     @staticmethod
     def compute_td_setup(df: pd.DataFrame) -> list:
-        """依據彭博 Bloomberg 標準計算德馬克 TD Setup (1~9 轉)"""
+        """依據彭博 Bloomberg 標準計算德馬克 TD Setup (含 Qualifier 資格過濾)"""
         setup_type = ["🟢 待機中"] * len(df)
-        if len(df) < 5:
+        if len(df) < 9:
             return setup_type
 
         buy_count = 0
@@ -30,31 +30,46 @@ class StrategyEngine:
         for i in range(4, len(df)):
             curr_c = df['close'].iloc[i]
             ref_c = df['close'].iloc[i - 4]
+            
             if curr_c < ref_c:
                 buy_count += 1
                 sell_count = 0
-                setup_type[i] = f"🟢 買入 S{buy_count}" if buy_count < 9 else "🔥 買入 S9轉"
+                if buy_count < 9:
+                    setup_type[i] = f"🟢 買入 S{buy_count}"
+                elif buy_count == 9:
+                    low8, low9 = df['low'].iloc[i-1], df['low'].iloc[i]
+                    low6, low7 = df['low'].iloc[i-3], df['low'].iloc[i-2]
+                    if (low8 < min(low6, low7)) or (low9 < min(low6, low7)):
+                        setup_type[i] = "🔥 買入 S9轉 (合格)"
+                    else:
+                        setup_type[i] = "⚪ 買入 S9轉 (未達標)"
+                    buy_count = 0
             elif curr_c > ref_c:
                 sell_count += 1
                 buy_count = 0
-                setup_type[i] = f"🔴 賣出 S{sell_count}" if sell_count < 9 else "⚡ 賣出 S9轉"
+                if sell_count < 9:
+                    setup_type[i] = f"🔴 賣出 S{sell_count}"
+                elif sell_count == 9:
+                    high8, high9 = df['high'].iloc[i-1], df['high'].iloc[i]
+                    high6, high7 = df['high'].iloc[i-3], df['high'].iloc[i-2]
+                    if (high8 > max(high6, high7)) or (high9 > max(high6, high7)):
+                        setup_type[i] = "⚡ 賣出 S9轉 (合格)"
+                    else:
+                        setup_type[i] = "⚪ 賣出 S9轉 (未達標)"
+                    sell_count = 0
             else:
                 buy_count = 0
                 sell_count = 0
                 setup_type[i] = "🟢 待機中"
+                
         return setup_type
 
     @staticmethod
     def classify_candle_shape(open_p: float, high_p: float, low_p: float, close_p: float) -> str:
-        """
-        【精準 K 線解剖與顏色判定】
-        1. 顏色優先級：Close >= Open 必為 🟢 青，Close < Open 必為 🔴 紅
-        2. 影線長度 PK 杜絕形態誤判
-        """
+        """【精準 K 線解剖與顏色判定】"""
         total_range = high_p - low_p
         is_up = close_p >= open_p
 
-        # 1. 極小振幅
         if total_range <= 0.0001:
             return "🟢 青陽漲" if is_up else "🔴 紅陰跌"
 
@@ -62,45 +77,51 @@ class StrategyEngine:
         upper_wick = high_p - max(open_p, close_p)
         lower_wick = min(open_p, close_p) - low_p
 
-        # 2. 實體極窄 (≤ 15% 振幅) -> 十字星
         if body <= total_range * 0.15:
             return "🟢 十字漲 ⚖️" if is_up else "🔴 十字跌 ⚖️"
 
-        # 3. 實體大陽 / 大陰 (實體佔比 ≥ 75%)
         if body >= 0.75 * total_range:
             return "🟢 大陽衝鋒 🚀" if is_up else "🔴 大陰破位 💥"
 
-        # 4. 下影線顯著長於上影線 (下影線占優勢)
         if lower_wick >= 1.3 * upper_wick and lower_wick >= 0.30 * total_range:
             return "🟢 鐵錘漲 🔨" if is_up else "🔴 吊頸跌 🪓"
 
-        # 5. 上影線顯著長於下影線 (上影線占優勢)
         if upper_wick >= 1.3 * lower_wick and upper_wick >= 0.30 * total_range:
             return "🟢 倒錘漲 🛸" if is_up else "🔴 射星跌 🌠"
 
-        # 6. 常規 K 線
         return "🟢 青陽漲" if is_up else "🔴 紅陰跌"
 
     @staticmethod
-    def evaluate_trend_bias(df_day: pd.DataFrame, curr_price: float) -> tuple:
-        """【模組：宏觀方向門禁】"""
-        trend_bias = 1
-        trend_text = "🟢 +1 (多頭控盤 [日線>EMA20])"
+    def evaluate_trend_bias(df_1h: pd.DataFrame, curr_price: float, df_day: pd.DataFrame = None) -> tuple:
+        """
+        【模組：1H 日內級別方向門禁】
+        由 1 小時圖 EMA20 決定日內主控權
+        """
+        trend_bias = 0
+        trend_text = "⚪ 0 (中立震盪)"
         pdh_line = curr_price * 1.008
         pdl_line = curr_price * 0.992
 
-        if not df_day.empty and len(df_day) >= 2:
-            df_day['ema20'] = df_day['close'].ewm(span=20, adjust=False).mean()
-            last_d = df_day.iloc[-1]
+        # 提取昨日極值（PDH/PDL 仍由日線或 1H 歷史提供）
+        if df_day is not None and not df_day.empty and len(df_day) >= 2:
             prev_d = df_day.iloc[-2]
             pdh_line = float(prev_d.get('high', curr_price * 1.008))
             pdl_line = float(prev_d.get('low', curr_price * 0.992))
-            if float(last_d['close']) >= float(last_d['ema20']):
+
+        # 1H EMA20 計算門禁
+        if df_1h is not None and not df_1h.empty and len(df_1h) >= 20:
+            df_1h_calc = df_1h.copy()
+            df_1h_calc['ema20'] = df_1h_calc['close'].ewm(span=20, adjust=False).mean()
+            last_h = df_1h_calc.iloc[-1]
+            h_close = float(last_h['close'])
+            h_ema20 = float(last_h['ema20'])
+
+            if h_close >= h_ema20:
                 trend_bias = 1
-                trend_text = "🟢 +1 (多頭控盤 [日線>EMA20])"
+                trend_text = f"🟢 +1 (1H多頭控盤 [1H收>{h_ema20:.2f}])"
             else:
                 trend_bias = -1
-                trend_text = "🔴 -1 (空頭壓制 [日線<EMA20])"
+                trend_text = f"🔴 -1 (1H空頭壓制 [1H收<{h_ema20:.2f}])"
 
         return trend_bias, trend_text, pdh_line, pdl_line
 
