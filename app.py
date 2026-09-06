@@ -1,5 +1,5 @@
 # 文件名: app.py
-# 核心功能: 癸水 · 0DTE 量化實戰座艙主入口 (每 1 秒更新現價跳動與倒數)
+# 核心功能: 癸水 · 0DTE 量化實戰座艙主入口 (每 1 秒局部刷新現價跳動與倒數)
 
 import streamlit as st
 from chart_plugin import ChartPlugin
@@ -20,7 +20,7 @@ budget_input = sidebar.number_input("💰 0DTE 單筆預算上限 (USD)", min_va
 
 st.title(f"⚡ 癸水 · 0DTE 量化實戰純數據座艙 ({target_code})")
 
-# 每 1 秒局部刷新（現價跳動 + 倒數計時 + 換棒偵測）
+# 每 1 秒局部刷新（現價呼吸跳動 + 倒數計時 + 換棒偵測）
 @st.fragment(run_every=1.0)
 def render_main_cockpit(code: str, budget: float):
     plugin.render_cockpit(code, budget_usd=budget)
