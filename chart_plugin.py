@@ -1,7 +1,8 @@
 # 文件名: chart_plugin.py
-# 核心特性: streamlit-extras Grid 網格分段 + 1H EMA20 門禁 + 5M 2B 當根定罪 + 0DTE 風控
+# 核心特性: 修復 Grid Layout 語法 + 1H EMA20 門禁 + 5M 2B 當根定罪 + 0DTE 極簡風控
 
 import os
+import sys
 import time
 import datetime
 import numpy as np
@@ -9,10 +10,13 @@ import pandas as pd
 import pytz
 import streamlit as st
 from moomoo import OpenQuoteContext, RET_OK, KLType, SubType, AuType
-
-# 引入 streamlit-extras 核心佈局組件
-from streamlit_extras.grid import grid
 from streamlit_extras.stylable_container import stylable_container
+
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+if CURRENT_DIR not in sys.path:
+    sys.path.insert(0, CURRENT_DIR)
+
+from strategy_engine import StrategyEngine
 
 tz_ny = pytz.timezone("America/New_York")
 tz_my = pytz.timezone("Asia/Kuala_Lumpur")
@@ -53,56 +57,7 @@ class ChartPlugin:
         self.data_dir = data_dir
 
     def calculate_atr(self, df: pd.DataFrame, period: int = 14) -> pd.Series:
-        if len(df) < 2:
-            return pd.Series([1.0] * len(df))
-        high = df['high']
-        low = df['low']
-        close = df['close'].shift(1).bfill()
-        tr = np.maximum(high - low, np.maximum((high - close).abs(), (low - close).abs()))
-        return tr.rolling(window=period).mean().bfill()
-
-    def compute_td_setup(self, df: pd.DataFrame) -> list:
-        """依據彭博 Bloomberg 標準計算德馬克 TD Setup (含 Qualifier 資格認證)"""
-        setup_type = ["⚪ 待機中"] * len(df)
-        if len(df) < 9:
-            return setup_type
-
-        buy_count = 0
-        sell_count = 0
-        for i in range(4, len(df)):
-            curr_c = df['close'].iloc[i]
-            ref_c = df['close'].iloc[i - 4]
-            if curr_c < ref_c:
-                buy_count += 1
-                sell_count = 0
-                if buy_count < 9:
-                    setup_type[i] = f"🟢 買入 S{buy_count}"
-                elif buy_count == 9:
-                    low8, low9 = df['low'].iloc[i-1], df['low'].iloc[i]
-                    low6, low7 = df['low'].iloc[i-3], df['low'].iloc[i-2]
-                    if (low8 < min(low6, low7)) or (low9 < min(low6, low7)):
-                        setup_type[i] = "🔥 買入 S9轉 (合格)"
-                    else:
-                        setup_type[i] = "⚪ 買入 S9轉 (未達標)"
-                    buy_count = 0
-            elif curr_c > ref_c:
-                sell_count += 1
-                buy_count = 0
-                if sell_count < 9:
-                    setup_type[i] = f"🔴 賣出 S{sell_count}"
-                elif sell_count == 9:
-                    high8, high9 = df['high'].iloc[i-1], df['high'].iloc[i]
-                    high6, high7 = df['high'].iloc[i-3], df['high'].iloc[i-2]
-                    if (high8 > max(high6, high7)) or (high9 > max(high6, high7)):
-                        setup_type[i] = "⚡ 賣出 S9轉 (合格)"
-                    else:
-                        setup_type[i] = "⚪ 賣出 S9轉 (未達標)"
-                    sell_count = 0
-            else:
-                buy_count = 0
-                sell_count = 0
-                setup_type[i] = "⚪ 待機中"
-        return setup_type
+        return StrategyEngine.calculate_atr(df, period)
 
     def get_realtime_and_kline_data(self, code: str) -> tuple:
         snap = {"price": 0.0, "source": "未連線", "server_time": "--", "latency_ms": 0}
@@ -200,36 +155,15 @@ class ChartPlugin:
             st.info(f"⚙️ 後台狀態: {status_msg}")
             return
 
-        # 1. 宏觀方向門禁：1H EMA20
-        trend_bias = 0
-        trend_text = "⚪ 0 (1H中立震盪)"
-        pdh_line = curr_price * 1.008
-        pdl_line = curr_price * 0.992
+        # 1. 宏觀方向門禁 (1H EMA20)
+        trend_bias, trend_text, pdh_line, pdl_line = StrategyEngine.evaluate_trend_bias(df_1h, curr_price, df_day)
 
-        if not df_day.empty and len(df_day) >= 2:
-            prev_d = df_day.iloc[-2]
-            pdh_line = float(prev_d.get('high', curr_price * 1.008))
-            pdl_line = float(prev_d.get('low', curr_price * 0.992))
+        # 2. 5M 信號與 2B 邊界當根定罪
+        df_5m_calc, raw_bull_pattern, raw_bear_pattern = StrategyEngine.evaluate_5m_signals(
+            df_5m, trend_bias, pdh_line, pdl_line
+        )
 
-        if not df_1h.empty and len(df_1h) >= 20:
-            df_1h['ema20'] = df_1h['close'].ewm(span=20, adjust=False).mean()
-            last_h = df_1h.iloc[-1]
-            if float(last_h['close']) >= float(last_h['ema20']):
-                trend_bias = 1
-                trend_text = f"🟢 +1 (1H多頭 [收>{float(last_h['ema20']):.2f}])"
-            else:
-                trend_bias = -1
-                trend_text = f"🔴 -1 (1H空頭 [收<{float(last_h['ema20']):.2f}])"
-
-        # 2. 5M 計算與 2B 當根定罪
-        df_5m['vma20'] = df_5m['volume'].rolling(20).mean().bfill()
-        df_5m['atr14'] = self.calculate_atr(df_5m, 14)
-        df_5m['td_setup'] = self.compute_td_setup(df_5m)
-
-        bull_2b_raw = (df_5m['low'] < pdl_line) & (df_5m['close'] > pdl_line) & (df_5m['close'] >= df_5m['open'])
-        bear_2b_raw = (df_5m['high'] > pdh_line) & (df_5m['close'] < pdh_line) & (df_5m['close'] < df_5m['open'])
-
-        bars_6 = df_5m.tail(6).iloc[::-1].copy().reset_index(drop=True)
+        bars_6 = df_5m_calc.tail(6).iloc[::-1].copy().reset_index(drop=True)
         table1_rows = []
         table2_rows = []
         audit_bars_log = []
@@ -266,8 +200,8 @@ class ChartPlugin:
                 c_display = f"${c:,.2f}"
                 h_display, l_display = f"{h:.2f}", f"{l:.2f}"
 
-                is_bull_2b = bull_2b_raw.iloc[df_5m.index[df_5m['time_key'] == row['time_key']][0]]
-                is_bear_2b = bear_2b_raw.iloc[df_5m.index[df_5m['time_key'] == row['time_key']][0]]
+                is_bull_2b = raw_bull_pattern.iloc[df_5m_calc.index[df_5m_calc['time_key'] == row['time_key']][0]]
+                is_bear_2b = raw_bear_pattern.iloc[df_5m_calc.index[df_5m_calc['time_key'] == row['time_key']][0]]
 
                 if is_bull_2b and trend_bias >= 0:
                     row_style = "background-color: rgba(0, 230, 118, 0.18); border-left: 5px solid #00E676;"
@@ -298,25 +232,31 @@ class ChartPlugin:
             audit_bars_log.append(audit_log_line)
 
         # ==========================================
-        # 🌟 核心分段：STREAMLIT-EXTRAS GRID LAYOUT
+        # 🌟 結構化網格佈局（原生且穩定的 Grid Layout）
         # ==========================================
 
         # 【分段 1：頂部狀態 4 欄網格】
-        status_grid = grid(4, vertical_align="center")
-        with status_grid:
+        g1_col1, g1_col2, g1_col3, g1_col4 = st.columns(4)
+        with g1_col1:
             st.metric("📶 連線通道", snap['source'], f"{snap['latency_ms']} ms")
+        with g1_col2:
             st.metric("🕒 美東撮合時間", f"{snap['server_time']} ET")
+        with g1_col3:
             st.metric("🚦 1H EMA20 門禁", trend_text)
+        with g1_col4:
             st.metric("⏱️ 5M 換棒倒數", countdown_str)
 
         st.markdown("<div style='margin-top: 15px;'></div>", unsafe_allow_html=True)
 
-        # 【分段 2：雙表並排/獨立網格 (1.1 : 1.0)】
-        tables_grid = grid([1.1, 1.0], vertical_align="top")
+        # 【分段 2：雙表對稱網格 (1.1 : 1.0)】
+        g2_col1, g2_col2 = st.columns([1.1, 1.0])
 
-        with tables_grid:
-            # 左網格：表 1 量價核心表
-            with stylable_container(key="t1_box", css_styles="{background-color: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;}"):
+        # 左側表 1
+        with g2_col1:
+            with stylable_container(
+                key="t1_box",
+                css_styles="{background-color: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;}"
+            ):
                 st.markdown("##### 📊 5M 即時量價核心表")
                 t1_html = "<table style='width:100%; border-collapse: collapse; font-family: monospace; font-size: 13px;'>"
                 t1_html += "<tr style='border-bottom: 2px solid #30363d; color: #8b949e;'><th>時段</th><th>現價/收盤</th><th>極值(H/L)</th><th>量能</th></tr>"
@@ -326,8 +266,12 @@ class ChartPlugin:
                 t1_html += "</table>"
                 st.markdown(t1_html, unsafe_allow_html=True)
 
-            # 右網格：表 2 TD9 與 2B 診斷表
-            with stylable_container(key="t2_box", css_styles="{background-color: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;}"):
+        # 右側表 2
+        with g2_col2:
+            with stylable_container(
+                key="t2_box",
+                css_styles="{background-color: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;}"
+            ):
                 st.markdown("##### ⏱️ 德馬克 TD 9轉與 2B 診斷")
                 t2_html = "<table style='width:100%; border-collapse: collapse; font-family: monospace; font-size: 13px;'>"
                 t2_html += "<tr style='border-bottom: 2px solid #30363d; color: #8b949e;'><th>時段與TD</th><th>形態診斷</th><th>1:2 動作</th></tr>"
@@ -339,11 +283,8 @@ class ChartPlugin:
 
         st.markdown("<div style='margin-top: 15px;'></div>", unsafe_allow_html=True)
 
-        # 【分段 3：0DTE 期權射控決策卡片網格 (1 欄通欄)】
-        strike_atm = round(curr_price)
-        total_cost = 1.45 * 100
-        opt_dir_str = "🟢 CALL 多單" if latest_trigger_type == "CALL" else ("🔴 PUT 空單" if latest_trigger_type == "PUT" else "⚪ 待機觀望")
-        opt_sym_str = f"QQQ {strike_atm} {'CALL' if latest_trigger_type != 'PUT' else 'PUT'}"
+        # 【分段 3：0DTE 期權射控決策卡片】
+        opt_plan = StrategyEngine.calculate_option_plan(curr_price, latest_trigger_type, budget_usd)
 
         with stylable_container(
             key="opt_radar_box",
@@ -357,11 +298,11 @@ class ChartPlugin:
                 }}
             """
         ):
-            st.markdown(f"🎯 **模組 6：0DTE 智能期權雷達 (預算上限: ${budget_usd:.2f} USD | 方向: {opt_dir_str})**")
+            st.markdown(f"🎯 **模組 6：0DTE 智能期權雷達 (預算上限: ${budget_usd:.2f} USD | 方向: {opt_plan['opt_dir_str']})**")
             st.markdown(f"### {latest_trigger_action}")
-            st.caption(f"推薦合約: **{opt_sym_str}** | 單張預算: **${total_cost:.2f} USD** | Delta: **0.51** | 盈虧比: **1:2**")
+            st.caption(f"推薦合約: **{opt_plan['opt_sym_str']}** | 單張預算: **${opt_plan['total_cost']:.2f} USD** | Delta: **0.51** | 盈虧比: **1:2**")
 
-        # 【分段 4：審核日誌 Audit Logs 複製網格】
+        # 【分段 4：審核日誌 Audit Logs 複製區】
         now_my_str = datetime.datetime.now(tz_my).strftime('%Y-%m-%d %H:%M:%S MYT')
         now_ny_str = datetime.datetime.now(tz_ny).strftime('%Y-%m-%d %H:%M:%S ET')
 
@@ -371,7 +312,7 @@ class ChartPlugin:
         audit_text += f"\n[5M 閉合時序 (過去 6 根)]\n"
         for l in audit_bars_log:
             audit_text += f"{l}\n"
-        audit_text += f"\n• 戰術動作: {latest_trigger_action} | 推薦: {opt_sym_str}\n"
+        audit_text += f"\n• 戰術動作: {latest_trigger_action} | 推薦: {opt_plan['opt_sym_str']}\n"
         audit_text += f"===========================================\n"
 
         st.markdown("<div style='margin-top: 15px;'></div>", unsafe_allow_html=True)
