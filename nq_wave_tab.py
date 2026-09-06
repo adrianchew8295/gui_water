@@ -1,17 +1,15 @@
 # 文件名: nq_wave_tab.py
-# 核心功能: NQ Main 1年期數據波浪理論專屬推演看板 (免 K 線純數據座艙)
+# 核心功能: 1年期數據波浪理論專屬推演看板 (免 K 線純數據座艙)
 
 import streamlit as st
 import pandas as pd
-import datetime
 import os
 from elliott_wave_engine import ElliottWaveEngine
 
 def load_nq_1year_data(data_dir: str = './market_data') -> pd.DataFrame:
-    """加載 NQ Main 1年期 1H 數據"""
     file_path = os.path.join(data_dir, "US_NQmain_1Hr.csv")
     if not os.path.exists(file_path):
-        file_path = os.path.join(data_dir, "US_NQmain_60M.csv")
+        file_path = os.path.join(data_dir, "US_QQQ_1Hr.csv")
     
     if os.path.exists(file_path):
         try:
@@ -23,37 +21,33 @@ def load_nq_1year_data(data_dir: str = './market_data') -> pd.DataFrame:
     return pd.DataFrame()
 
 def render_nq_wave_prediction_dashboard():
-    st.markdown("## 🌊 NQ Main 艾略特全波浪理論預測中樞 (1H 級別推演)")
-    st.caption("標的: **US.NQmain (納指期貨主力)** | 數據跨度: **1 年期 1H (60M) 歷史序列** | 核心算法: **Elliott Wave + 斐波那契時間空間對稱**")
+    st.markdown("## 🌊 NQ Main / QQQ 艾略特全波浪理論預測中樞 (1H 級別推演)")
+    st.caption("標的: **US.NQmain (納指主力鏡像)** | 數據跨度: **1 年期 1H 歷史序列** | 核心算法: **Elliott Wave + 斐波那契時空對稱**")
 
     df_nq = load_nq_1year_data()
     if df_nq.empty or len(df_nq) < 50:
-        st.warning("⏳ 尚未檢測到 `US_NQmain_1Hr.csv` 歷史數據或數據量不足。請先確保數據已下載！")
+        st.warning("⏳ 尚未檢測到 1Hr 歷史數據。請先在終端機運行 `python fetch_nq_1year.py` 下載數據！")
         return
 
-    # 計算全量波浪推演
     wave_res = ElliottWaveEngine.analyze_wave_structure(df_nq)
     curr_price = float(df_nq['close'].iloc[-1])
 
-    # 1. 頂部核心波浪狀態指標
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("📌 NQ Main 現價", f"${curr_price:,.2f}")
+    m1.metric("📌 當前基準價", f"${curr_price:,.2f}")
     m2.metric("🌊 當前波浪定位", wave_res["current_wave"])
     m3.metric("🧭 宏觀浪級方向", wave_res["trend_dir"])
     m4.metric("⏱️ 本浪運行時間", f"{wave_res['time_elapsed_hrs']} 小時", f"預期週期 ~{wave_res['expected_duration_hrs']}H")
 
     st.markdown("---")
 
-    # 2. 🔮 接下來 1 小時走勢預測與路徑推演 Window
     st.markdown("### 🧭 接下來 1 小時走勢與波浪路徑預測 (Prediction Window)")
-    
     pred_col1, pred_col2 = st.columns([1.6, 1.0])
     
     with pred_col1:
-        st.info(f"### 🤖 艾略特波浪實時推演結論\n\n{wave_res['prediction_narrative']}")
+        st.info(f"### 🤖 艾略特波浪推演結論\n\n{wave_res['prediction_narrative']}")
         st.markdown(f"""
-        * **當前子浪階梯 (Sub-Wave)**: `{wave_res['sub_wave']}` ({wave_res['wave_phase']})
-        * **時間對稱性判定**: 本輪波浪已運行 **{wave_res['time_elapsed_hrs']} 根 1H Bar**，距離時間窗口拐點尚有 **{max(0, wave_res['expected_duration_hrs'] - wave_res['time_elapsed_hrs'])} 小時**。
+        * **當前子浪階梯**: `{wave_res['sub_wave']}` ({wave_res['wave_phase']})
+        * **時間對稱性**: 已運行 **{wave_res['time_elapsed_hrs']} 根 1H Bar**，距時間窗口拐點尚有 **{max(0, wave_res['expected_duration_hrs'] - wave_res['time_elapsed_hrs'])} 小時**。
         """)
 
     with pred_col2:
@@ -67,8 +61,6 @@ def render_nq_wave_prediction_dashboard():
 
     st.markdown("---")
 
-    # 3. 📊 歷史波浪端點定位與幾何結構表 (純數據 Table)
-    st.markdown("### 📋 波浪關鍵拐點計數表 (Wave Pivots & Time Logs)")
+    st.markdown("### 📋 波浪關鍵拐點計數表 (Wave Pivots & Logs)")
     if wave_res["wave_table"]:
-        df_table = pd.DataFrame(wave_res["wave_table"])
-        st.dataframe(df_table, use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(wave_res["wave_table"]), use_container_width=True, hide_index=True)
