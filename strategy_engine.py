@@ -1,5 +1,5 @@
 # 文件名: strategy_engine.py
-# 核心職責: 【獨立策略大腦】雙重判定對齊 K 線顏色 + 多空對稱形態分類 + 0DTE 智能換算
+# 核心職責: 【獨立策略大腦】VPA 多空對稱形態分類、Trend Bias 門禁、2B 假突破、TD 9 轉、0DTE 期權點位
 
 import numpy as np
 import pandas as pd
@@ -47,18 +47,15 @@ class StrategyEngine:
     @staticmethod
     def classify_candle_shape(open_p: float, high_p: float, low_p: float, close_p: float, prev_close: float = None) -> str:
         """
-        【雙重判定 K 線解剖與顏色對齊】
-        若 High == Low (歷史點位)，自動比對 prev_close 判定紅綠
+        【VPA 核心經典形態 · 多空對稱分類】
+        🟢 青色 (收盤 >= 開盤 / 多頭偏向) | 🔴 紅色 (收盤 < 開盤 / 空頭偏向)
         """
         total_range = high_p - low_p
-
-        # 1. 處理缺乏振幅的歷史點位 (與上一根收盤價對比)
+        
+        # 1. 若無影線振幅，比對前一根收盤價
         if total_range <= 0.0001:
             if prev_close is not None and prev_close > 0:
-                if close_p < prev_close:
-                    return "🔴 紅陰跌"
-                elif close_p > prev_close:
-                    return "🟢 青陽漲"
+                return "🔴 紅陰跌" if close_p < prev_close else "🟢 青陽漲"
             return "🟢 青陽漲" if close_p >= open_p else "🔴 紅陰跌"
 
         body = abs(close_p - open_p)
@@ -121,6 +118,7 @@ class StrategyEngine:
         llv5 = df['low'].rolling(5).min().shift(1).bfill()
         hhv5 = df['high'].rolling(5).max().shift(1).bfill()
 
+        # 2B 假突破 (RAW 形態)
         bull_2b_raw = ((df['low'] < llv5) | (df['low'] < pdl_line)) & (df['close'] > llv5) & (df['close'] >= df['open'])
         bear_2b_raw = ((df['high'] > hhv5) | (df['high'] > pdh_line)) & (df['close'] < hhv5) & (df['close'] < df['open'])
 
