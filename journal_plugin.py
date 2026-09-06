@@ -1,5 +1,5 @@
 # 文件名: journal_plugin.py
-# 核心職責: 【圖表專屬通欄流暢 Timer · 5M 靜態鎖定 · 雙日誌隔離 · 零閃爍】
+# 核心職責: 【修復整頁跳轉回首頁 + 圖表頂部流暢 Timer + 鎖定當前頁面不重置】
 
 import os
 import sys
@@ -125,6 +125,7 @@ class JournalPlugin:
                 df_raw = pd.read_csv(csv_path)
                 df_raw.columns = [c.lower() for c in df_raw.columns]
                 
+                # 歷史訂單切片
                 if entry_date_str and entry_time_str:
                     match_indices = df_raw[df_raw['time_key'].astype(str).str.contains(entry_date_str, na=False)].index.tolist()
                     if match_indices:
@@ -137,11 +138,13 @@ class JournalPlugin:
                         end_i = min(len(df_raw), mid_idx + 20)
                         df_slice = df_raw.iloc[start_i:end_i].copy().reset_index(drop=True)
                         times = [str(t)[-8:-3] for t in df_slice['time_key']]
-                        return times, df_slice['open'].astype(float).tolist(), df_slice['high'].astype(float).tolist(), df_slice['low'].astype(float).tolist(), df_slice['close'].astype(float).tolist(), df_slice['volume'].astype(float).tolist(), (mid_idx - start_i)
+                        return times, df_slice['open'].astype(float).tolist(), df_slice['high'].astype(float).tolist(), df_slice['low'].astype(float).tolist(), df_slice['close'].astype(float).tolist(), df_slice['volume'].astype(float).tolist(), (mid_idx - start_i), str(df_slice.iloc[-1]['time_key'])
 
+                # 實盤展示最近 36 根真實 K 線
                 df_slice = df_raw.tail(36).copy().reset_index(drop=True)
                 times = [str(t)[-8:-3] for t in df_slice['time_key']]
-                return times, df_slice['open'].astype(float).tolist(), df_slice['high'].astype(float).tolist(), df_slice['low'].astype(float).tolist(), df_slice['close'].astype(float).tolist(), df_slice['volume'].astype(float).tolist(), -1
+                last_ts = str(df_slice.iloc[-1]['time_key']) if not df_slice.empty else "N/A"
+                return times, df_slice['open'].astype(float).tolist(), df_slice['high'].astype(float).tolist(), df_slice['low'].astype(float).tolist(), df_slice['close'].astype(float).tolist(), df_slice['volume'].astype(float).tolist(), -1, last_ts
             except Exception:
                 pass
 
@@ -150,7 +153,7 @@ class JournalPlugin:
         anchor = now_dt.replace(minute=curr_min, second=0, microsecond=0)
         times = [(anchor - datetime.timedelta(minutes=(35 - i) * 5)).strftime('%H:%M') for i in range(36)]
         base_p = 79980.0 if "BTC" in code else 718.50
-        return times, [base_p]*36, [base_p+15]*36, [base_p-15]*36, [base_p]*36, [120.0]*36, -1
+        return times, [base_p]*36, [base_p+15]*36, [base_p-15]*36, [base_p]*36, [120.0]*36, -1, "DEMO"
 
     def render_interactive_chart(self, code: str, trade_row: pd.Series = None):
         if trade_row is not None:
@@ -165,12 +168,12 @@ class JournalPlugin:
             is_win = trade_row.get('status') == 'WIN_TP'
             date_str = str(trade_row.get('date', '2026-09-04'))
             time_str = str(trade_row.get('time_et', '10:15'))
-            times, opens, highs, lows, closes, volumes, entry_idx = self._load_kline_data(code, date_str, time_str)
+            times, opens, highs, lows, closes, volumes, entry_idx, last_ts = self._load_kline_data(code, date_str, time_str)
             exit_idx = min(len(times) - 1, entry_idx + 6) if entry_idx >= 0 else -1
             exit_p = float(trade_row.get('exit_price', entry_p))
             exit_label = "🎯 命中 2R 止盈 (+2.0R)" if is_win else "🛡️ 觸發止損出場 (-1.0R)"
         else:
-            times, opens, highs, lows, closes, volumes, entry_idx = self._load_kline_data(code)
+            times, opens, highs, lows, closes, volumes, entry_idx, last_ts = self._load_kline_data(code)
             entry_p = closes[-1] if len(closes) > 0 else 79980.0
             sl_p, tp_p = entry_p * 0.998, entry_p * 1.004
             pdh_p, pdl_p = max(highs), min(lows)
@@ -245,6 +248,7 @@ class JournalPlugin:
         )
 
         st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True, 'displayModeBar': True})
+        return last_ts
 
     def render_journal_dashboard(self, code: str, budget_usd: float = 200.0):
         st.markdown("""
@@ -310,15 +314,15 @@ class JournalPlugin:
 
             selected_row = df_day.iloc[sel_sig_idx]
 
-        # 【核心位置】：將 Timer 與走勢圖標題融為一體，直接置於 5M K 線圖頂部通欄
+        # 【核心修復】：純前端計時器，倒數歸零時僅提示換棒，絕不執行 location.reload()，保證 100% 停留在當前 Tab
         chart_timer_html = f"""
         <div style="background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 6px 12px; margin-bottom: 4px; display: flex; justify-content: space-between; align-items: center; font-family: monospace; font-size: 13px; color: #c9d1d9;">
             <div>
                 <b style="color:#58a6ff; font-size:14px;">📈 5M 走勢圖 · 標的: {code}</b> 
-                <span style="color: #8b949e; font-size: 12px; margin-left: 8px;">(富途 OpenD 官方 5M 原生柱 · 最近 3 小時)</span>
+                <span style="color: #8b949e; font-size: 12px; margin-left: 8px;">(富途 OpenD 官方原生數據)</span>
             </div>
             <div id="chart_inline_timer" style="color: #ffd700; font-weight: bold; font-size: 14px; background: rgba(255, 215, 0, 0.12); border: 1px solid rgba(255, 215, 0, 0.3); border-radius: 4px; padding: 2px 8px;">
-                ⏱️ 距離下根定格: 計算中...
+                ⏱️ 換棒倒數: 計算中...
             </div>
         </div>
         <script>
@@ -333,13 +337,13 @@ class JournalPlugin:
             var sStr = (s < 10 ? "0" : "") + s;
             var el = document.getElementById("chart_inline_timer");
             if (el) {{
-                el.innerHTML = "⏱️ 距離下根定格: " + mStr + ":" + sStr;
-            }}
-            // 換棒歸零時觸發精準推進
-            if (remSec === 0) {{
-                setTimeout(function() {{
-                    window.parent.location.reload();
-                }}, 1500);
+                if (remSec === 0 || remSec >= 298) {{
+                    el.innerHTML = "🟡 正在定格推進官方新 K 線...";
+                    el.style.color = "#00E676";
+                }} else {{
+                    el.innerHTML = "⏱️ 距離下根定格: " + mStr + ":" + sStr;
+                    el.style.color = "#ffd700";
+                }}
             }}
         }}
         setInterval(updateInlineTimer, 1000);
@@ -349,7 +353,7 @@ class JournalPlugin:
         components.html(chart_timer_html, height=44)
 
         # 渲染 5M K 線主圖
-        self.render_interactive_chart(code, selected_row)
+        last_kline_ts = self.render_interactive_chart(code, selected_row)
 
         if selected_row is not None:
             is_win_sel = selected_row.get('status') == 'WIN_TP'
@@ -361,12 +365,12 @@ class JournalPlugin:
             </div>
             """, unsafe_allow_html=True)
         else:
-            st.info(f"💡 【{sel_month}】實盤監控中，後台守護進程每 5 分鐘收盤自動寫入官方定格 K 線。")
+            st.info(f"💡 【{sel_month}】實盤監控中 | 當前圖表最新 K 線時間: **{last_kline_ts}**")
 
         # 雙日誌抽屜
         with st.expander("🛠️ [排查專用] 系統運行日誌 (System Health Log)", expanded=False):
             st.code(self.load_health_log(), language="text")
 
-        trade_audit_log = f"=== 癸水 · 策略復盤日誌 (TRADE AUDIT LOG) ===\n• 標的: {code} | 狀態: 實盤監控中\n• 當前最近 3 小時官方 5M K 線已對齊，後台守護進程每 5 分鐘自動寫入。\n============================================"
+        trade_audit_log = f"=== 癸水 · 策略復盤日誌 (TRADE AUDIT LOG) ===\n• 標的: {code} | 當前圖表最新柱: {last_kline_ts}\n• 狀態: 實盤監控中，後台守護進程每 5 分鐘自動寫入官方收盤 K 線。\n============================================"
         with st.expander("📋 [策略專用] 訂單審核日誌 (Trade Audit Log)", expanded=False):
             st.code(trade_audit_log, language="text")
