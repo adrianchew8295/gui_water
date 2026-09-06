@@ -1,5 +1,5 @@
 # 文件名: chart_plugin.py
-# 核心特性: 最新 5M 真實歷史對齊 (end=now) + 毫秒 Snapshot 現價動態推進 + 影線/成交量/顏色完全同步
+# 核心特性: get_cur_kline 獲取真實 60 根當前 5M 柱 + 毫秒級 Snapshot 現價推進 + 無縫時序對齊
 
 import os
 import sys
@@ -8,7 +8,7 @@ import datetime
 import pandas as pd
 import pytz
 import streamlit as st
-from moomoo import OpenQuoteContext, RET_OK, SubType, KLType, AuType
+from moomoo import OpenQuoteContext, RET_OK, SubType, KLType
 from streamlit_extras.stylable_container import stylable_container
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -53,29 +53,17 @@ class ChartPlugin:
     def __init__(self, data_dir: str = DATA_DIR):
         self.data_dir = data_dir
 
-    def fetch_real_history_5m(self, code: str) -> pd.DataFrame:
-        """【真理數據源】索取截至當前美東時刻最近的 60 根真實 5M 歷史 K 線"""
+    def fetch_real_cur_5m(self, code: str) -> pd.DataFrame:
+        """【真理數據源】調用 get_cur_kline 獲取當前真實 60 根 5M 柱 (自帶真實 High/Low/Volume)"""
         ctx = MarketDataEngine.get_context()
         target_symbol = "CC.BTCUSD" if "BTC" in code.upper() else code
         if ctx:
             MarketDataEngine.ensure_subscription(target_symbol)
             try:
-                # 以美東當前時刻作為 end，不設 start，OpenD 會自動倒推最新的 60 根
-                now_str = datetime.datetime.now(tz_ny).strftime("%Y-%m-%d %H:%M:%S")
-                
-                ret, df_k, msg = ctx.request_history_kline(
-                    code=target_symbol,
-                    start='',
-                    end=now_str,
-                    ktype=KLType.K_5M,
-                    autype=AuType.NONE,
-                    max_count=60
-                )
+                ret, df_k = ctx.get_cur_kline(target_symbol, num=60, ktype=KLType.K_5M)
                 if ret == RET_OK and not df_k.empty:
-                    df_k = df_k[['time_key', 'open', 'close', 'high', 'low', 'volume']]
+                    df_k = df_k[['time_key', 'open', 'close', 'high', 'low', 'volume']].copy()
                     df_k['time_key'] = pd.to_datetime(df_k['time_key'])
-                    
-                    # 依時間升序排序，確保最後一行為最近收盤柱
                     df_k = df_k.sort_values('time_key').reset_index(drop=True)
                     
                     save_prefix = "CC_BTCUSD" if "BTC" in code.upper() else code.replace('.', '_')
@@ -167,7 +155,6 @@ class ChartPlugin:
         return cur_slot_time, slot_str, countdown_str
 
     def track_live_bar_extremes(self, code: str, cur_slot_time: datetime.datetime, curr_price: float) -> tuple:
-        """動態追蹤當前 5M 走動期間的真實 High / Low"""
         slot_key = cur_slot_time.strftime('%Y-%m-%d %H:%M:%S')
         cache_key = f"{code}_live_bar"
         bar_data = st.session_state.get(cache_key, None)
@@ -189,15 +176,15 @@ class ChartPlugin:
         return bar_data['open'], bar_data['high'], bar_data['low'], bar_data['close']
 
     def render_cockpit(self, code: str, budget_usd: float = 200.0):
-        # 1. 抓取真實最近 60 根 5M 與即時快照
-        df_5m = self.fetch_real_history_5m(code)
+        # 1. 抓取真實 5M 歷史與即時快照
+        df_5m_all = self.fetch_real_cur_5m(code)
         snap, status_msg = self.get_realtime_snapshot(code)
         df_day = self.load_cold_data(code, "DAY")
         cur_slot_time, live_slot_str, countdown_str = self.get_countdown_and_current_slot()
 
         curr_price = snap["price"]
-        if curr_price <= 0 and not df_5m.empty:
-            curr_price = float(df_5m['close'].iloc[-1])
+        if curr_price <= 0 and not df_5m_all.empty:
+            curr_price = float(df_5m_all['close'].iloc[-1])
         if curr_price <= 0:
             curr_price = 79900.0 if "BTC" in code.upper() else 488.50
 
@@ -218,17 +205,23 @@ class ChartPlugin:
             flash_color = "#00E676"
             flash_sym = "--"
 
-        if df_5m.empty or len(df_5m) < 8:
+        if df_5m_all.empty or len(df_5m_all) < 8:
             st.warning("⏳ 正在向 OpenD 同步最近真實 5M 歷史 K 線...")
             st.info(f"⚙️ 後台狀態: {status_msg}")
             return
 
         # 2. 策略大腦計算
         trend_bias, trend_text, pdh_line, pdl_line = StrategyEngine.evaluate_trend_bias(df_day, curr_price)
-        df_5m_calc, raw_bull, raw_bear = StrategyEngine.evaluate_5m_signals(df_5m, trend_bias, pdh_line, pdl_line)
+        df_5m_calc, raw_bull, raw_bear = StrategyEngine.evaluate_5m_signals(df_5m_all, trend_bias, pdh_line, pdl_line)
 
-        # 倒序取最近 5 根收盤柱
-        closed_bars_5 = df_5m_calc.tail(5).iloc[::-1].copy().reset_index(drop=True)
+        # 審核防禦：檢查最後一根是否為當前走動中的柱子，若是則剔除，確保歷史行只顯示已閉合定格的柱子
+        last_k_time = pd.to_datetime(df_5m_calc['time_key'].iloc[-1]).strftime('%H:%M')
+        if last_k_time == live_slot_str and len(df_5m_calc) > 5:
+            closed_df = df_5m_calc.iloc[:-1]
+        else:
+            closed_df = df_5m_calc
+
+        closed_bars_5 = closed_df.tail(5).iloc[::-1].copy().reset_index(drop=True)
 
         table1_rows = []
         table2_rows = []
@@ -238,8 +231,7 @@ class ChartPlugin:
         latest_trigger_type = "NONE"
 
         # ─── 第 1 行：動態 LIVE 行 ───
-        last_closed_c = float(closed_bars_5.iloc[0]['close']) if not closed_bars_5.empty else curr_price
-        live_shape = StrategyEngine.classify_candle_shape(live_o, live_h, live_l, live_c, prev_close=last_closed_c)
+        live_shape = StrategyEngine.classify_candle_shape(live_o, live_h, live_l, live_c)
         live_col1_t1 = f"<b style='color:#58a6ff;'>{live_slot_str}</b> <span style='background:#1f293d; color:#58a6ff; padding:2px 6px; border-radius:4px; font-weight:bold;'>⚡ LIVE</span> <span style='background:#161b22; color:#00E676; border:1px solid #238636; padding:2px 6px; border-radius:4px; font-weight:bold;'>⏱️ {countdown_str}</span>"
         live_col1_t2 = f"<b style='color:#58a6ff;'>{live_slot_str}</b> <span style='color:#00E676;'>🟢 待機中</span>"
         live_c_display = f"<span style='color:{flash_color}; font-weight:bold;'>${curr_price:,.2f} ({flash_sym}) [{live_shape}]</span>"
@@ -269,11 +261,9 @@ class ChartPlugin:
             atr = float(row['atr14'])
             td_s = str(row['td_setup'])
             
-            vol_ratio = v / vma
+            vol_ratio = v / max(vma, 1.0)
             is_heavy = vol_ratio >= 1.25
-
-            p_close = float(closed_bars_5.iloc[idx + 1]['close']) if idx + 1 < len(closed_bars_5) else None
-            candle_shape = StrategyEngine.classify_candle_shape(o, h, l, c, prev_close=p_close)
+            candle_shape = StrategyEngine.classify_candle_shape(o, h, l, c)
 
             row_style = ""
             action_str = "🟢 待機中"
@@ -374,7 +364,7 @@ class ChartPlugin:
             """
         ):
             st.markdown(f"📶 通道: **{snap['source']}** | 撮合時間: **{snap['server_time']} ET** | 延遲: **{snap['latency_ms']} ms** | 宏觀方向: **{trend_text}**")
-            st.caption(f"⚙️ 狀態: `{status_msg}` | 🎯 最新 60 根真實 5M 時序已無縫對齊")
+            st.caption(f"⚙️ 狀態: `{status_msg}` | 🎯 當前真實 5M 連續時序已對齊")
 
         # ====== 表 1 ======
         st.markdown("##### 📊 表 1：5M 即時量價核心表 (黃金 30 分鐘滾動窗口)")
