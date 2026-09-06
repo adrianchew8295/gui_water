@@ -1,5 +1,5 @@
 # 文件名: chart_plugin.py
-# 核心特性: 富途原生 K 線時間完全鏡像 + 實時快照動態刷新 + 影線/成交量精準輸出 + Logs 全面標註形態柱體
+# 核心特性: 表 1 傍邊添加 Moomoo 風格 5 根迷你 K 線圖 + 原生雙表 + 形態 Logs 標籤
 
 import os
 import sys
@@ -8,6 +8,7 @@ import datetime
 import pandas as pd
 import pytz
 import streamlit as st
+import plotly.graph_objects as go
 from moomoo import OpenQuoteContext, RET_OK, SubType, KLType
 from streamlit_extras.stylable_container import stylable_container
 
@@ -54,7 +55,7 @@ class ChartPlugin:
         self.data_dir = data_dir
 
     def fetch_real_cur_5m(self, code: str) -> pd.DataFrame:
-        """調用 get_cur_kline 獲取當前真實 60 根 5M 柱"""
+        """獲取真實 60 根 5M 柱"""
         ctx = MarketDataEngine.get_context()
         target_symbol = "CC.BTCUSD" if "BTC" in code.upper() else code
         if ctx:
@@ -136,7 +137,6 @@ class ChartPlugin:
         return pd.DataFrame()
 
     def get_countdown_str(self) -> str:
-        """計算距離下一個 5M 換棒的精準倒數秒數"""
         now = datetime.datetime.now(tz_ny)
         cur_min = now.minute
         cur_sec = now.second
@@ -146,6 +146,62 @@ class ChartPlugin:
             rem_min += 1
             rem_sec = 0
         return f"{rem_min:02d}:{rem_sec:02d}"
+
+    def render_mini_kline(self, df_5bars: pd.DataFrame, curr_price: float):
+        """【Moomoo 高級暗黑風】渲染專屬 5 根迷你 K 線圖"""
+        df_plot = df_5bars.copy()
+        
+        # 動態更新最後一根為 LIVE 現價
+        df_plot.loc[df_plot.index[-1], 'close'] = curr_price
+        df_plot.loc[df_plot.index[-1], 'high'] = max(df_plot.loc[df_plot.index[-1], 'high'], curr_price)
+        df_plot.loc[df_plot.index[-1], 'low'] = min(df_plot.loc[df_plot.index[-1], 'low'], curr_price)
+        
+        time_labels = [pd.to_datetime(t).strftime('%H:%M') for t in df_plot['time_key']]
+        
+        fig = go.Figure(data=[go.Candlestick(
+            x=time_labels,
+            open=df_plot['open'],
+            high=df_plot['high'],
+            low=df_plot['low'],
+            close=df_plot['close'],
+            increasing_line_color='#00E676', # 翡翠綠
+            increasing_fillcolor='#00E676',
+            decreasing_line_color='#FF5252', # 玫瑰紅
+            decreasing_fillcolor='#FF5252',
+            whiskerwidth=0.6,
+            line=dict(width=1.5)
+        )])
+
+        # 現價水平虛線
+        fig.add_hline(
+            y=curr_price, 
+            line_dash="dot", 
+            line_color="#ffd700", 
+            line_width=1.2,
+            annotation_text=f"${curr_price:,.1f}", 
+            annotation_position="right",
+            annotation_font=dict(size=10, color="#ffd700", family="monospace")
+        )
+
+        fig.update_layout(
+            height=260,
+            margin=dict(l=10, r=45, t=25, b=20),
+            paper_bgcolor='#0d1117',
+            plot_bgcolor='#0d1117',
+            xaxis_rangeslider_visible=False,
+            xaxis=dict(
+                showgrid=False,
+                tickfont=dict(color='#8b949e', size=11, family="monospace"),
+                type='category'
+            ),
+            yaxis=dict(
+                showgrid=True,
+                gridcolor='#21262d',
+                side='right',
+                tickfont=dict(color='#8b949e', size=10, family="monospace")
+            )
+        )
+        return fig
 
     def render_cockpit(self, code: str, budget_usd: float = 200.0):
         # 1. 抓取數據
@@ -188,7 +244,6 @@ class ChartPlugin:
         live_raw = df_5m_calc.iloc[-1]
         live_slot_str = pd.to_datetime(live_raw['time_key']).strftime('%H:%M')
         
-        # 動態即時極值
         live_o = float(live_raw['open'])
         live_h = max(float(live_raw['high']), curr_price)
         live_l = min(float(live_raw['low']), curr_price)
@@ -320,7 +375,6 @@ class ChartPlugin:
                 "_style": row_style
             })
 
-            # Audit Logs 標註形態標籤
             audit_bars_log.append(f"• {t_str} 🔒 收盤  | 收盤: ${c:,.2f} [{candle_shape}] | 影線: {h:.2f}/{l:.2f} | 量: {vol_ratio:.2f}x ({v:.2f} BTC) | TD: {td_s} | 診斷: {diag_str}")
 
         opt_plan = StrategyEngine.calculate_option_plan(curr_price, latest_trigger_type, budget_usd)
@@ -342,41 +396,55 @@ class ChartPlugin:
             st.markdown(f"📶 通道: **{snap['source']}** | 撮合時間: **{snap['server_time']} ET** | 延遲: **{snap['latency_ms']} ms** | 宏觀方向: **{trend_text}**")
             st.caption(f"⚙️ 狀態: `{status_msg}` | 🎯 富途原生 K 線時間 100% 鏡像對齊")
 
-        # ====== 表 1 ======
-        st.markdown("##### 📊 表 1：5M 即時量價核心表 (黃金 30 分鐘滾動窗口)")
-        t1_html = "<table style='width:100%; border-collapse: collapse; font-family: monospace; font-size: 14px; text-align: left; background-color: #0d1117; border-radius: 8px; overflow: hidden;'>"
-        t1_html += "<tr style='border-bottom: 2px solid #30363d; color: #8b949e; background-color: #161b22;'>"
-        for col in ["5M時段與狀態", "現價/收盤 (Close)", "影線極值 (High / Low)", "5M量能 (VPA)"]:
-            t1_html += f"<th style='padding: 10px;'>{col}</th>"
-        t1_html += "</tr>"
+        # ====== 表 1 核心區：左邊表格 + 右邊 Moomoo 迷你 5 根 K 線圖 ======
+        col_t1, col_chart = st.columns([1.25, 1.0])
 
-        for r in table1_rows:
-            style = r["_style"] if r["_style"] else "border-bottom: 1px solid #21262d; color: #f0f6fc;"
-            t1_html += f"<tr style='{style}'>"
-            t1_html += f"<td style='padding: 10px;'>{r['5M時段與狀態']}</td>"
-            t1_html += f"<td style='padding: 10px;'>{r['現價/收盤 (Close)']}</td>"
-            t1_html += f"<td style='padding: 10px;'>{r['影線極值 (High / Low)']}</td>"
-            t1_html += f"<td style='padding: 10px;'>{r['5M量能 (VPA)']}</td>"
+        with col_t1:
+            st.markdown("##### 📊 表 1：5M 即時量價核心表")
+            t1_html = "<table style='width:100%; border-collapse: collapse; font-family: monospace; font-size: 13px; text-align: left; background-color: #0d1117; border-radius: 8px; overflow: hidden;'>"
+            t1_html += "<tr style='border-bottom: 2px solid #30363d; color: #8b949e; background-color: #161b22;'>"
+            for col in ["5M時段與狀態", "現價/收盤 (Close)", "影線極值 (High / Low)", "5M量能 (VPA)"]:
+                t1_html += f"<th style='padding: 8px;'>{col}</th>"
             t1_html += "</tr>"
-        t1_html += "</table>"
-        st.markdown(t1_html, unsafe_allow_html=True)
+
+            for r in table1_rows:
+                style = r["_style"] if r["_style"] else "border-bottom: 1px solid #21262d; color: #f0f6fc;"
+                t1_html += f"<tr style='{style}'>"
+                t1_html += f"<td style='padding: 8px;'>{r['5M時段與狀態']}</td>"
+                t1_html += f"<td style='padding: 8px;'>{r['現價/收盤 (Close)']}</td>"
+                t1_html += f"<td style='padding: 8px;'>{r['影線極值 (High / Low)']}</td>"
+                t1_html += f"<td style='padding: 8px;'>{r['5M量能 (VPA)']}</td>"
+                t1_html += "</tr>"
+            t1_html += "</table>"
+            st.markdown(t1_html, unsafe_allow_html=True)
+
+        with col_chart:
+            st.markdown("##### 📈 5M 走勢迷你圖 (對應 5 根)")
+            with stylable_container(
+                key="mini_chart_box",
+                css_styles="{background-color: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 4px;}"
+            ):
+                # 提取最近 5 根（正序）傳給圖表
+                df_last5 = df_5m_calc.tail(5).copy().reset_index(drop=True)
+                fig = self.render_mini_kline(df_last5, curr_price)
+                st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
 
         st.markdown("<div style='margin-top: 15px;'></div>", unsafe_allow_html=True)
 
         # ====== 表 2 ======
         st.markdown("##### ⏱️ 表 2：德馬克 TD 9轉與戰術表 (保守右側確認)")
-        t2_html = "<table style='width:100%; border-collapse: collapse; font-family: monospace; font-size: 14px; text-align: left; background-color: #0d1117; border-radius: 8px; overflow: hidden;'>"
+        t2_html = "<table style='width:100%; border-collapse: collapse; font-family: monospace; font-size: 13px; text-align: left; background-color: #0d1117; border-radius: 8px; overflow: hidden;'>"
         t2_html += "<tr style='border-bottom: 2px solid #30363d; color: #8b949e; background-color: #161b22;'>"
         for col in ["5M時段與TD 9轉", "形態與戰區診斷", "1:2 結構指令 & 動作"]:
-            t2_html += f"<th style='padding: 10px;'>{col}</th>"
+            t2_html += f"<th style='padding: 8px;'>{col}</th>"
         t2_html += "</tr>"
 
         for r in table2_rows:
             style = r["_style"] if r["_style"] else "border-bottom: 1px solid #21262d; color: #f0f6fc;"
             t2_html += f"<tr style='{style}'>"
-            t2_html += f"<td style='padding: 10px;'>{r['5M時段與TD計數']}</td>"
-            t2_html += f"<td style='padding: 10px;'>{r['形態與戰區診斷']}</td>"
-            t2_html += f"<td style='padding: 10px;'>{r['1:2 結構指令 & 動作']}</td>"
+            t2_html += f"<td style='padding: 8px;'>{r['5M時段與TD計數']}</td>"
+            t2_html += f"<td style='padding: 8px;'>{r['形態與戰區診斷']}</td>"
+            t2_html += f"<td style='padding: 8px;'>{r['1:2 結構指令 & 動作']}</td>"
             t2_html += "</tr>"
         t2_html += "</table>"
         st.markdown(t2_html, unsafe_allow_html=True)
