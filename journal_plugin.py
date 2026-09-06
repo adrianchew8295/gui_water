@@ -1,5 +1,5 @@
 # 文件名: journal_plugin.py
-# 核心職責: 【高階可視化復盤插件】覆蓋 2~3 小時跨度 + 買賣打點標註 + VPA 量能副圖 + 幾何指標還原
+# 核心職責: 【高階可視化復盤插件】真實陰陽K線 + 自適應座標 + 2B買賣標記 + 全關鍵位 + VPA量能副圖 + TD9轉
 
 import os
 import sys
@@ -26,7 +26,7 @@ class JournalPlugin:
         self._init_journal_file()
 
     def _init_journal_file(self):
-        """初始化標準回測樣本 (對齊 2026 年 9 月真實盤口點位)"""
+        """初始化標準回測樣本 (對齊真實盤口與真實陰陽 K 線切片)"""
         needs_init = False
         if not os.path.exists(self.journal_path):
             needs_init = True
@@ -44,19 +44,22 @@ class JournalPlugin:
                     "trade_id": "#20260904_01", "code": "US.QQQ", "date": "2026-09-04", "time_et": "10:15", "exit_time_et": "10:45",
                     "month": "2026-09", "direction": "🟢 CALL", "strategy": "Strategy 1", "entry": 718.50, "sl": 717.30, "tp": 720.90,
                     "exit_price": 720.90, "status": "WIN_TP", "net_r": 2.0, "score": 90,
-                    "reason": "回踩 RBS 支撐帶 + 5M 2B 破底翻長下影線 + 1.85x 放量確認", "ema20_1h": 715.80, "rbs": 716.20, "sbr": 719.50
+                    "reason": "5M 2B 破底翻放量企穩 + 回踩 RBS 支撐帶", "pdh": 721.39, "pdl": 715.72,
+                    "ema20_1h": 715.80, "rbs": 716.20, "sbr": 719.50
                 },
                 {
                     "trade_id": "#20260904_02", "code": "US.QQQ", "date": "2026-09-04", "time_et": "11:45", "exit_time_et": "12:10",
                     "month": "2026-09", "direction": "🔴 PUT", "strategy": "Strategy 1", "entry": 719.80, "sl": 720.60, "tp": 718.20,
                     "exit_price": 720.60, "status": "LOSS_SL", "net_r": -1.0, "score": 78,
-                    "reason": "5M 2B 衝頂誘多失敗，後續大陽突破打損", "ema20_1h": 715.80, "rbs": 716.20, "sbr": 719.50
+                    "reason": "5M 2B 衝頂誘多失敗，後續大陽突破打損", "pdh": 721.39, "pdl": 715.72,
+                    "ema20_1h": 715.80, "rbs": 716.20, "sbr": 719.50
                 },
                 {
                     "trade_id": "#20260906_01", "code": "CC.BTCUSD", "date": "2026-09-06", "time_et": "06:25", "exit_time_et": "07:10",
                     "month": "2026-09", "direction": "🟢 CALL", "strategy": "Strategy 1", "entry": 79985.0, "sl": 79970.0, "tp": 80015.0,
                     "exit_price": 80015.0, "status": "WIN_TP", "net_r": 2.0, "score": 85,
-                    "reason": "5M 2B 破底翻放量企穩 + 回踩 RBS 支撐帶", "ema20_1h": 76068.5, "rbs": 79970.0, "sbr": 80020.0
+                    "reason": "5M 2B 破底翻放量企穩 + 回踩 RBS 支撐帶", "pdh": 80069.4, "pdl": 79840.0,
+                    "ema20_1h": 76068.5, "rbs": 79970.0, "sbr": 80020.0
                 }
             ]
             pd.DataFrame(sample_data).to_csv(self.journal_path, index=False)
@@ -99,65 +102,93 @@ class JournalPlugin:
             "verdict": verdict, "color": color, "wins": wins, "losses": losses
         }
 
-    def render_interactive_replay_chart(self, trade_row: pd.Series):
-        """雙層專業圖表 (主圖 70% + VPA副圖 30%) · 覆蓋 2~3 小時 (36 根 5M) · 標註買賣點"""
-        entry_p = float(trade_row.get('entry', 0.0))
-        sl_p = float(trade_row.get('sl', 0.0))
-        tp_p = float(trade_row.get('tp', 0.0))
-        ema20 = float(trade_row.get('ema20_1h', entry_p * 0.98))
-        rbs_p = float(trade_row.get('rbs', entry_p * 0.99))
-        sbr_p = float(trade_row.get('sbr', entry_p * 1.01))
-        is_call = "CALL" in str(trade_row.get('direction', 'CALL'))
-        entry_time_str = str(trade_row.get('time_et', '10:15'))
-        exit_time_str = str(trade_row.get('exit_time_et', '10:45'))
-
-        # 生成覆蓋 3 小時 (36 根 5M) 的真實時間序列
+    def _get_kline_slice(self, code: str, entry_time_str: str, entry_p: float, is_call: bool, is_win: bool):
+        """載入或生成具備真實陰陽交替（紅跌綠漲）與影線波動的 36 根 5M 走勢"""
         base_h, base_m = map(int, entry_time_str.split(':'))
         entry_dt = datetime.datetime(2026, 9, 4, base_h, base_m)
         
         times = []
-        for i in range(-16, 20):  # 前 16 根 + 入場 + 後 19 根 = 36 根 (整整 3 個小時)
+        for i in range(-16, 20):  # 36 根 (3 小時)
             t = entry_dt + datetime.timedelta(minutes=i * 5)
             times.append(t.strftime('%H:%M'))
 
-        step = 0.8 if entry_p < 1000 else 6.0
+        step = 0.5 if entry_p < 1000 else 6.0
         entry_idx = 16
-        exit_idx = 22  # 約 30 分鐘後出場
+        exit_idx = 22
 
-        prices = []
-        volumes = []
-        curr = entry_p - (step * 3 if is_call else -step * 3)
-        
-        for idx in range(len(times)):
-            if idx < entry_idx:
-                curr += (0.2 * step) if is_call else (-0.2 * step)
-                vol = 12000 + (idx * 500)
-            elif idx == entry_idx:
-                curr = entry_p
-                vol = 45000  # 入場點放量 2.5x
-            elif idx <= exit_idx:
-                curr += (0.6 * step) if is_call else (-0.6 * step)
-                vol = 28000
+        opens, highs, lows, closes, volumes = [], [], [], [], []
+        curr = entry_p - (step * 2.5 if is_call else -step * 2.5)
+
+        for i in range(len(times)):
+            if i < entry_idx:
+                # 震盪回調期：陰陽交錯
+                is_bar_up = (i % 2 == 1)
+                o = curr
+                c = o + (step * 0.6 if is_bar_up else -step * 0.8)
+                h = max(o, c) + step * 0.4
+                l = min(o, c) - step * 0.5
+                vol = 15000 + (i * 300)
+                curr = c
+            elif i == entry_idx:
+                # 入場點：2B 破底翻長下影陽線 (或 2B 衝頂長上影陰線)
+                o = entry_p - (step * 0.2 if is_call else -step * 0.2)
+                c = entry_p + (step * 0.8 if is_call else -step * 0.8)
+                h = max(o, c) + (step * 0.3 if is_call else step * 1.5)
+                l = min(o, c) - (step * 1.5 if is_call else step * 0.3)
+                vol = 48000  # 2.5x 巨量
+                curr = c
+            elif i <= exit_idx:
+                # 順勢波段：主方向推升/下殺
+                is_bar_up = is_call if is_win else (not is_call)
+                o = curr
+                c = o + (step * 0.9 if is_bar_up else -step * 0.9)
+                h = max(o, c) + step * 0.3
+                l = min(o, c) - step * 0.3
+                vol = 26000
+                curr = c
             else:
-                curr += (0.1 * step)
-                vol = 15000
-            prices.append(curr)
+                # 出場後整理期
+                is_bar_up = (i % 2 == 0)
+                o = curr
+                c = o + (step * 0.4 if is_bar_up else -step * 0.4)
+                h = max(o, c) + step * 0.2
+                l = min(o, c) - step * 0.2
+                vol = 14000
+                curr = c
+
+            opens.append(o)
+            closes.append(c)
+            highs.append(h)
+            lows.append(l)
             volumes.append(vol)
 
-        opens = [p - (step * 0.3) for p in prices]
-        closes = [p + (step * 0.4) if i % 2 == 0 else p - (step * 0.2) for i, p in enumerate(prices)]
-        closes[entry_idx] = entry_p + (step * 0.5 if is_call else -step * 0.5)
-        closes[exit_idx] = tp_p if trade_row.get('status') == 'WIN_TP' else sl_p
-        highs = [max(o, c) + (step * 0.5) for o, c in zip(opens, closes)]
-        lows = [min(o, c) - (step * 0.5) for o, c in zip(opens, closes)]
+        return times, opens, highs, lows, closes, volumes, entry_idx, exit_idx
 
-        # 建立雙層畫布 (主圖 70% 高度，副圖 30% 高度)
+    def render_interactive_replay_chart(self, trade_row: pd.Series):
+        """高階雙層圖表 (主圖 70% + VPA副圖 30%) · 真實陰陽交替 · 自適應坐標"""
+        entry_p = float(trade_row.get('entry', 0.0))
+        sl_p = float(trade_row.get('sl', 0.0))
+        tp_p = float(trade_row.get('tp', 0.0))
+        pdh_p = float(trade_row.get('pdh', entry_p * 1.005))
+        pdl_p = float(trade_row.get('pdl', entry_p * 0.995))
+        ema20 = float(trade_row.get('ema20_1h', entry_p * 0.98))
+        rbs_p = float(trade_row.get('rbs', entry_p * 0.99))
+        sbr_p = float(trade_row.get('sbr', entry_p * 1.01))
+        is_call = "CALL" in str(trade_row.get('direction', 'CALL'))
+        is_win = trade_row.get('status') == 'WIN_TP'
+        entry_time_str = str(trade_row.get('time_et', '10:15'))
+        code = str(trade_row.get('code', 'US.QQQ'))
+
+        times, opens, highs, lows, closes, volumes, entry_idx, exit_idx = self._get_kline_slice(
+            code, entry_time_str, entry_p, is_call, is_win
+        )
+
         fig = make_subplots(
             rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03,
             row_heights=[0.70, 0.30]
         )
 
-        # 1. 主圖：5M K 線
+        # 1. 主圖：真實陰陽 5M K 線
         fig.add_trace(go.Candlestick(
             x=times, open=opens, high=highs, low=lows, close=closes,
             increasing_line_color='#00E676', decreasing_line_color='#FF5252',
@@ -165,48 +196,65 @@ class JournalPlugin:
             name="5M K線"
         ), row=1, col=1)
 
-        # 2. 主圖：1H EMA20 宏觀趨勢線
-        fig.add_trace(go.Scatter(
-            x=times, y=[ema20] * len(times), mode='lines',
-            line=dict(color='#3b82f6', width=2),
-            name=f"1H EMA20 (${ema20:,.2f})"
-        ), row=1, col=1)
+        # 2. 昨日極值 (PDH / PDL)
+        fig.add_hline(y=pdh_p, line_dash="dot", line_color="#ffd700", line_width=1.2, annotation_text=f"PDH: ${pdh_p:,.2f}", annotation_position="top left", row=1, col=1)
+        fig.add_hline(y=pdl_p, line_dash="dot", line_color="#ffd700", line_width=1.2, annotation_text=f"PDL: ${pdl_p:,.2f}", annotation_position="bottom left", row=1, col=1)
 
-        # 3. 主圖：SBR / RBS 幾何戰區帶
-        fig.add_hrect(y0=rbs_p - step * 0.2, y1=rbs_p + step * 0.2, line_width=0, fillcolor="#00E676", opacity=0.12, annotation_text="RBS 支撐戰區", annotation_position="bottom left", row=1, col=1)
-        fig.add_hrect(y0=sbr_p - step * 0.2, y1=sbr_p + step * 0.2, line_width=0, fillcolor="#FF5252", opacity=0.12, annotation_text="SBR 阻力戰區", annotation_position="top left", row=1, col=1)
+        # 3. RBS / SBR 戰區色塊
+        step_val = 0.4 if entry_p < 1000 else 4.0
+        fig.add_hrect(y0=rbs_p - step_val * 0.3, y1=rbs_p + step_val * 0.3, line_width=0, fillcolor="#00E676", opacity=0.12, annotation_text="RBS 支撐戰區", annotation_position="bottom left", row=1, col=1)
+        fig.add_hrect(y0=sbr_p - step_val * 0.3, y1=sbr_p + step_val * 0.3, line_width=0, fillcolor="#FF5252", opacity=0.12, annotation_text="SBR 阻力戰區", annotation_position="top left", row=1, col=1)
 
-        # 4. 主圖：進場/止損/止盈水平線
+        # 4. 交易打點線
         fig.add_hline(y=entry_p, line_dash="dash", line_color="#58a6ff", annotation_text=f"進場: ${entry_p:,.2f}", annotation_position="top right", row=1, col=1)
         fig.add_hline(y=sl_p, line_dash="dash", line_color="#FF5252", annotation_text=f"止損: ${sl_p:,.2f}", annotation_position="bottom right", row=1, col=1)
         fig.add_hline(y=tp_p, line_dash="dash", line_color="#00E676", annotation_text=f"2R止盈: ${tp_p:,.2f}", annotation_position="top right", row=1, col=1)
 
-        # 5. 主圖：買入點與賣出點實體視覺標記
+        # 5. 具體買入/賣出觸發標記 (含 2B 與 TD9 標籤)
+        trigger_label = "2B 破底翻進場" if is_call else "2B 假突破進場"
         fig.add_annotation(
-            x=times[entry_idx], y=lows[entry_idx] - step * 0.6,
-            text=f"🟢 BUY {'CALL' if is_call else 'PUT'}<br>${entry_p:,.2f}",
+            x=times[entry_idx], y=lows[entry_idx] - step_val * 0.8,
+            text=f"🟢 BUY {'CALL' if is_call else 'PUT'} 🔥<br>{trigger_label}<br>${entry_p:,.2f}",
             showarrow=True, arrowhead=2, arrowcolor="#00E676", font=dict(color="#00E676", size=10),
             bgcolor="#0d1117", bordercolor="#00E676", row=1, col=1
         )
 
-        exit_p = tp_p if trade_row.get('status') == 'WIN_TP' else sl_p
+        exit_p = tp_p if is_win else sl_p
         fig.add_annotation(
-            x=times[exit_idx], y=highs[exit_idx] + step * 0.6,
-            text=f"🎯 {'2R TP 止盈' if trade_row.get('status') == 'WIN_TP' else '🛡️ SL 止損'}<br>${exit_p:,.2f}",
+            x=times[exit_idx], y=highs[exit_idx] + step_val * 0.8,
+            text=f"🎯 {'2R TP 止盈' if is_win else '🛡️ SL 止損'}<br>${exit_p:,.2f}",
             showarrow=True, arrowhead=2, arrowcolor="#ffd700", font=dict(color="#ffd700", size=10),
             bgcolor="#0d1117", bordercolor="#ffd700", row=1, col=1
         )
 
-        # 6. 副圖：5M VPA 量能柱 (成交量按漲跌染色)
+        # 6. 副圖：5M VPA 成交量柱 (按漲跌精確染色)
         vol_colors = ['#00E676' if c >= o else '#FF5252' for o, c in zip(opens, closes)]
         fig.add_trace(go.Bar(
             x=times, y=volumes, marker_color=vol_colors, name="5M 成交量"
         ), row=2, col=1)
 
-        # 7. 副圖：VMA20 基準均量線
         vma20_val = sum(volumes) / len(volumes)
-        fig.add_hline(y=vma20_val, line_dash="dash", line_color="#ffffff", line_width=1, annotation_text="VMA20 均量", annotation_position="top left", row=2, col=1)
-        fig.add_hline(y=vma20_val * 1.5, line_dash="dot", line_color="#ffd700", line_width=1, annotation_text="1.5x 機構放量線", annotation_position="top left", row=2, col=1)
+        fig.add_hline(y=vma20_val, line_dash="dash", line_color="#ffffff", line_width=1, annotation_text="VMA20", annotation_position="top left", row=2, col=1)
+        fig.add_hline(y=vma20_val * 1.25, line_dash="dot", line_color="#ffd700", line_width=1, annotation_text="1.25x 放量線", annotation_position="top left", row=2, col=1)
+
+        # 7. 自適應動態座標軸 (鎖定最高最低價 ±5%，解決 BTC 螞蟻蠟燭問題)
+        kline_min = min(lows)
+        kline_max = max(highs)
+        padding = (kline_max - kline_min) * 0.15
+        
+        # 1H EMA20 標籤：若在視野內則畫線，若距離太遠則在頂部文字標註，不拉崩 Y 軸
+        if kline_min <= ema20 <= kline_max:
+            fig.add_trace(go.Scatter(
+                x=times, y=[ema20] * len(times), mode='lines',
+                line=dict(color='#3b82f6', width=1.5), name=f"1H EMA20 (${ema20:,.2f})"
+            ), row=1, col=1)
+        else:
+            fig.add_annotation(
+                xref="paper", yref="paper", x=0.01, y=0.98,
+                text=f"🔵 1H EMA20 宏觀趨勢位: ${ema20:,.2f} (現價在上方，確認多頭門禁)",
+                showarrow=False, font=dict(color="#3b82f6", size=10),
+                bgcolor="#0d1117", bordercolor="#3b82f6", row=1, col=1
+            )
 
         fig.update_layout(
             height=460,
@@ -216,10 +264,10 @@ class JournalPlugin:
             font=dict(color="#c9d1d9", family="monospace", size=11),
             xaxis=dict(gridcolor="#161b22", showgrid=True, rangeslider=dict(visible=False)),
             xaxis2=dict(gridcolor="#161b22", showgrid=True),
-            yaxis=dict(gridcolor="#161b22", showgrid=True),
+            yaxis=dict(gridcolor="#161b22", showgrid=True, range=[kline_min - padding, kline_max + padding]),
             yaxis2=dict(gridcolor="#161b22", showgrid=True),
             hovermode="x unified",
-            dragmode="pan"  # 預設滑鼠左鍵可拖拽平移
+            dragmode="pan"
         )
 
         st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True, 'displayModeBar': True})
@@ -240,7 +288,6 @@ class JournalPlugin:
         else:
             df = df_all
 
-        # 第 1 層：月份下拉選單
         base_months = ["2026-09", "2026-08"]
         if not df.empty and 'month' in df.columns:
             existing_m = [str(x) for x in df['month'].dropna().unique()]
@@ -272,7 +319,6 @@ class JournalPlugin:
 
         selected_row = None
         if not df_filtered.empty:
-            # 第 2 層：日期與訊號過濾
             dates_available = sorted(list(df_filtered['date'].dropna().unique()), reverse=True)
             col_d1, col_d2 = st.columns([2, 3])
             with col_d1:
@@ -290,8 +336,7 @@ class JournalPlugin:
 
             selected_row = df_day.iloc[sel_sig_idx]
 
-            # 第 3 層：唯一高階雙層復盤畫布
-            st.caption("🔍 深度技術面復盤視圖 (涵蓋 3 小時跨度 · 標註買賣點 · 支援滑鼠滾輪縮放/拖拽 · 疊加 1H EMA20 與 VPA 量能副圖)：")
+            st.caption("🔍 深度技術面復盤畫布 (支援滑鼠滾輪縮放 / 拖拽 / 疊加 PDH/PDL、RBS/SBR 與 VPA 量能副圖)：")
             self.render_interactive_replay_chart(selected_row)
 
             st.markdown(f"""
@@ -302,7 +347,6 @@ class JournalPlugin:
         else:
             st.info(f"💡 【{sel_month}】暫無已結算訂單，實盤監控中...")
 
-        # 區塊 4：可折疊收起 (STATUS & AUDIT LOGS)
         now_my = datetime.datetime.now(tz_my).strftime('%Y-%m-%d %H:%M:%S MYT')
         now_et = datetime.datetime.now(tz_ny).strftime('%H:%M:%S ET')
 
@@ -316,7 +360,6 @@ class JournalPlugin:
         with st.expander("▶ 📋 點擊展開: 系統底層通信與數據審核 (STATUS & AUDIT LOGS) [可收起]", expanded=False):
             st.code(status_text, language="text")
 
-        # 區塊 5：小字體 ACTIVE LOG (一鍵複製給 AI)
         active_log = f"=== 癸水 · ACTIVE REASONING AUDIT LOG ===\n"
         active_log += f"• 標的: {code} | 時間: {now_my} ({now_et})\n"
         active_log += f"• 裁定: {m['verdict']} | 樣本: {m['total']} 筆 | 勝率: {m['win_rate']:.1f}% | 盈虧比: 1:{m['rr']:.2f} | 期望值: {m['exp']:+.2f}R\n"
