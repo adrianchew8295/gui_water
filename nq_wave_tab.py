@@ -1,5 +1,5 @@
 # 文件名: nq_wave_tab.py
-# 核心功能: 左右雙屏 TradingView 波浪終端 + 8H 走勢核驗 + AI Prompt
+# 核心功能: 左右雙屏 TradingView 波浪終端 (高相容性防黑屏版)
 
 import os
 import json
@@ -29,6 +29,7 @@ def load_data(symbol: str, timeframe: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 def render_dual_tradingview_charts(df_day: pd.DataFrame, df_1h: pd.DataFrame, wave_res: dict, show_fib_price: bool, show_fib_time: bool):
+    # 1. 處理日線數據
     time_col_d = 'time_key' if 'time_key' in df_day.columns else df_day.columns[0]
     df_day['date_str'] = df_day[time_col_d].astype(str).str.slice(0, 10)
     df_day = df_day.drop_duplicates(subset=['date_str']).sort_values('date_str').reset_index(drop=True)
@@ -66,18 +67,26 @@ def render_dual_tradingview_charts(df_day: pd.DataFrame, df_1h: pd.DataFrame, wa
             'text': f"{lbl} ${pr:,.1f}"
         })
 
-    time_col_1h = 'time_key' if 'time_key' in df_1h.columns else df_1h.columns[0]
-    df_1h['dt_str'] = df_1h[time_col_1h].astype(str)
-    df_1h = df_1h.drop_duplicates(subset=['dt_str']).sort_values('dt_str').reset_index(drop=True)
-    df_plot_1h = df_1h.tail(48).copy().reset_index(drop=True)
+    # 2. 處理 1H 數據 (防呆保護：若 1H 為空則以日線末端做切片展示)
+    source_1h = df_1h if not df_1h.empty else df_day
+    time_col_1h = 'time_key' if 'time_key' in source_1h.columns else source_1h.columns[0]
+    source_1h['dt_str'] = source_1h[time_col_1h].astype(str)
+    source_1h = source_1h.drop_duplicates(subset=['dt_str']).sort_values('dt_str').reset_index(drop=True)
+    df_plot_1h = source_1h.tail(48).copy().reset_index(drop=True)
 
     candles_1h = []
     for _, r in df_plot_1h.iterrows():
         try:
-            dt_val = pd.to_datetime(r['dt_str'])
-            ts = int(dt_val.timestamp())
+            dt_str_val = str(r['dt_str'])
+            # 若含有時間時分秒轉時間戳，純日期則保留字串
+            if len(dt_str_val) > 10:
+                ts = int(pd.to_datetime(dt_str_val).timestamp())
+                t_val = ts
+            else:
+                t_val = dt_str_val[:10]
+
             candles_1h.append({
-                'time': ts,
+                'time': t_val,
                 'open': float(r['open']),
                 'high': float(r['high']),
                 'low': float(r['low']),
@@ -86,20 +95,10 @@ def render_dual_tradingview_charts(df_day: pd.DataFrame, df_1h: pd.DataFrame, wa
         except Exception:
             continue
 
-    pivots_1h = ElliottWaveEngine.extract_pivots(df_plot_1h, window=3)
-    wave_line_1h = []
-    for p in pivots_1h:
-        try:
-            ts = int(pd.to_datetime(p["time"]).timestamp())
-            wave_line_1h.append({'time': ts, 'value': float(p["price"])})
-        except Exception:
-            continue
-
     candles_day_json = json.dumps(candles_day)
     wave_day_json = json.dumps(wave_line_day)
     markers_day_json = json.dumps(markers_day)
     candles_1h_json = json.dumps(candles_1h)
-    wave_1h_json = json.dumps(wave_line_1h)
     fib_levels_json = json.dumps(wave_res.get('fib_levels', {}))
     show_fib_p_js = "true" if show_fib_price else "false"
 
@@ -145,7 +144,7 @@ def render_dual_tradingview_charts(df_day: pd.DataFrame, df_1h: pd.DataFrame, wa
 
             <div class="chart-box">
                 <div class="box-header">
-                    <b style="color:#00E676;">[右屏] 1小時微觀驗證 (1Hr · 最近8~48H)</b>
+                    <b style="color:#00E676;">[右屏] 微觀驗證 (最近 8~48 根 K線)</b>
                     <span style="color:#00E676; margin-left:6px;">── Target1: ${target_1:,.2f}</span>
                     <span style="color:#ff7b72; margin-left:6px;">── 防守: ${invalid_p:,.2f}</span>
                 </div>
@@ -160,6 +159,7 @@ def render_dual_tradingview_charts(df_day: pd.DataFrame, df_1h: pd.DataFrame, wa
                     return;
                 }}
 
+                // 左圖渲染
                 const containerDay = document.getElementById('tv_chart_day');
                 const chartDay = LightweightCharts.createChart(containerDay, {{
                     width: containerDay.clientWidth,
@@ -209,6 +209,7 @@ def render_dual_tradingview_charts(df_day: pd.DataFrame, df_1h: pd.DataFrame, wa
                 }}
                 chartDay.timeScale().fitContent();
 
+                // 右圖渲染
                 const container1h = document.getElementById('tv_chart_1h');
                 const chart1h = LightweightCharts.createChart(container1h, {{
                     width: container1h.clientWidth,
@@ -217,7 +218,7 @@ def render_dual_tradingview_charts(df_day: pd.DataFrame, df_1h: pd.DataFrame, wa
                     grid: {{ vertLines: {{ color: '#161b22' }}, horzLines: {{ color: '#161b22' }} }},
                     crosshair: {{ mode: LightweightCharts.CrosshairMode.Normal }},
                     rightPriceScale: {{ borderColor: '#21262d' }},
-                    timeScale: {{ borderColor: '#21262d', timeVisible: true, secondsVisible: false }},
+                    timeScale: {{ borderColor: '#21262d', timeVisible: true }},
                     handleScroll: {{ mouseWheel: true, pressedMouseMove: true }},
                     handleScale: {{ axisPressedMouseMove: true, mouseWheel: true }},
                 }});
@@ -229,30 +230,18 @@ def render_dual_tradingview_charts(df_day: pd.DataFrame, df_1h: pd.DataFrame, wa
                 }});
                 candleSeries1h.setData({candles_1h_json});
 
-                const waveSeries1h = chart1h.addLineSeries({{
-                    color: '#ffd700', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Dashed, crosshairMarkerVisible: false,
-                }});
-                waveSeries1h.setData({wave_1h_json});
-
                 if ({target_1} > 0) {{
                     candleSeries1h.createPriceLine({{
                         price: {target_1}, color: '#00E676', lineWidth: 1.5,
                         lineStyle: LightweightCharts.LineStyle.Solid,
-                        axisLabelVisible: true, title: '日線 Target 1 ($' + {target_1}.toFixed(1) + ')',
-                    }});
-                }}
-                if ({target_2} > 0) {{
-                    candleSeries1h.createPriceLine({{
-                        price: {target_2}, color: '#3fb950', lineWidth: 1,
-                        lineStyle: LightweightCharts.LineStyle.Dashed,
-                        axisLabelVisible: true, title: '日線 Target 2 ($' + {target_2}.toFixed(1) + ')',
+                        axisLabelVisible: true, title: 'Target 1 ($' + {target_1}.toFixed(1) + ')',
                     }});
                 }}
                 if ({invalid_p} > 0) {{
                     candleSeries1h.createPriceLine({{
                         price: {invalid_p}, color: '#ff7b72', lineWidth: 1.5,
                         lineStyle: LightweightCharts.LineStyle.Solid,
-                        axisLabelVisible: true, title: '日線 SL 鐵律防守 ($' + {invalid_p}.toFixed(1) + ')',
+                        axisLabelVisible: true, title: '防守 SL ($' + {invalid_p}.toFixed(1) + ')',
                     }});
                 }}
 
@@ -277,15 +266,20 @@ def render_nq_wave_prediction_dashboard():
     df_day = load_data("US.QQQ", "DAY")
     df_1h = load_data("US.QQQ", "1Hr")
 
-    if df_day.empty or df_1h.empty:
-        st.warning("⏳ 尚未檢測到完整的 `US_QQQ_DAY.csv` 或 `US_QQQ_1Hr.csv` 數據，請先運行 `python data_fetcher.py`！")
+    if df_day.empty:
+        st.warning("⏳ 尚未檢測到 `US_QQQ_DAY.csv` 數據，請先運行 `python data_fetcher.py`！")
         return
 
-    wave_res = ElliottWaveEngine.analyze_wave_structure(df_day if len(df_day) >= 50 else df_1h)
+    wave_res = ElliottWaveEngine.analyze_wave_structure(df_day)
     curr_price = float(df_day['close'].iloc[-1])
 
-    recent_8h = df_1h.tail(8)
-    h8_change = float(recent_8h['close'].iloc[-1] - recent_8h['open'].iloc[0])
+    # 計算最近 8H 變動
+    if not df_1h.empty and len(df_1h) >= 8:
+        recent_8h = df_1h.tail(8)
+        h8_change = float(recent_8h['close'].iloc[-1] - recent_8h['open'].iloc[0])
+    else:
+        h8_change = 0.0
+
     is_bull = "多頭" in wave_res["trend_dir"] or "⑤" in wave_res["current_wave"]
     score_8h = "🟢 正常軌道 (87.5% 吻合)" if (is_bull and h8_change >= 0) or (not is_bull and h8_change < 0) else "🟡 震盪微調 (62.5% 偏離)"
 
@@ -335,35 +329,3 @@ def render_nq_wave_prediction_dashboard():
         if wave_res["time_window_dates"]:
             df_time = pd.DataFrame(wave_res["time_window_dates"])
             st.dataframe(df_time, use_container_width=True, hide_index=True)
-
-    st.markdown("---")
-
-    st.markdown("#### 🤖 專屬 AI 智能分析 Prompt")
-    st.caption("點擊下方代碼框右上角一鍵複製，貼給 AI 即刻解讀：")
-
-    ai_prompt_text = f"""你現在是華爾街資深宏觀量化策略師與科技股分析專家。請基於以下【納指 QQQ / NQ 多週期艾略特波浪實時量化數據】，用通俗易懂的【大白話】為我深度解讀當前盤面，並即時【聯網檢索華爾街最新科技股動態】：
-
-【1. 艾略特波浪多週期量化數據】
-• 監控標的: 納斯達克 100 指數 (QQQ / NQ)
-• 當前基準現價: ${curr_price:,.2f}
-• 日線宏觀波浪: {wave_res['current_wave']} ({wave_res['wave_phase']})
-• 浪級結構特徵: {wave_res['complex_type']} (擴展倍數: {wave_res['extension_ratio']}x)
-• 子浪進展: {wave_res['sub_wave']} (日線已運行 {wave_res['time_elapsed_bars']} 根 Bar)
-• 1小時圖最近 8 小時實盤表現:
-  - 8 小時價格淨變動: {h8_change:+,.2f} USD
-  - 8 小時走勢吻合度: {score_8h}
-• 斐波那契關鍵回調位:
-  - Fib 0.382 (4浪常規支撐): ${wave_res['fib_levels'].get('0.382 (4浪常規支撐)', 'N/A')}
-  - Fib 0.500 (平衡防線): ${wave_res['fib_levels'].get('0.500 (平衡防線)', 'N/A')}
-  - Fib 0.618 (黃金分割): ${wave_res['fib_levels'].get('0.618 (黃金分割)', 'N/A')}
-• 跨週期投影目標點位:
-  - Target 1 (1.0x 對稱浪) = ${wave_res['next_target_1']:,.2f}
-  - Target 2 (1.618x 擴展浪) = ${wave_res['next_target_2']:,.2f}
-  - 結構失效防守線 (SL) = ${wave_res['invalid_price']:,.2f}
-
-【2. 請回答以下三個問題】：
-1. 【大白話走勢與 8 小時驗證】：對比日線目標與 1小時圖最近 8 小時走勢，推升是否順利？接下來 1~3 天如何應對？
-2. 【華爾街科技股新聞與巨頭動態】：請聯網檢索今日科技 7 巨頭最新動態。
-3. 【實戰決策】：給出明確的 0DTE / 短期期權操作計劃（開倉、止損、止盈）。"""
-
-    st.code(ai_prompt_text, language="markdown")
