@@ -1,5 +1,5 @@
 # 文件名: nq_wave_tab.py
-# 核心優化: TradingView Lightweight Charts 官方原廠渲染標準 (雙屏聯動 + 毫秒級容錯 + 視口鎖定)
+# 核心升級: 1小時圖多維度交互調控台 + Lightweight Charts 原廠雙屏聯動
 
 import os
 import json
@@ -28,8 +28,15 @@ def load_data(symbol: str, timeframe: str) -> pd.DataFrame:
             pass
     return pd.DataFrame()
 
-def render_dual_tradingview_charts(df_day: pd.DataFrame, df_1h: pd.DataFrame, wave_res: dict, show_fib_price: bool, show_fib_time: bool):
-    # 1. 日線數據精確清洗 (官方標準: YYYY-MM-DD 字符日期)
+def render_dual_tradingview_charts(
+    df_day: pd.DataFrame, 
+    df_1h: pd.DataFrame, 
+    wave_res: dict, 
+    show_fib_price: bool, 
+    show_targets: bool,
+    bars_1h_count: int
+):
+    # 1. 日線數據 (YYYY-MM-DD)
     time_col_d = 'time_key' if 'time_key' in df_day.columns else df_day.columns[0]
     df_day['date_str'] = df_day[time_col_d].astype(str).str.slice(0, 10)
     df_day = df_day.drop_duplicates(subset=['date_str']).sort_values('date_str').reset_index(drop=True)
@@ -67,12 +74,14 @@ def render_dual_tradingview_charts(df_day: pd.DataFrame, df_1h: pd.DataFrame, wa
             'text': f"{lbl} ${pr:,.1f}"
         })
 
-    # 2. 1H 數據精確清洗 (官方標準: 分鐘級必須為整數 UNIX Timestamp 秒)
+    # 2. 1H 數據 (依據調控的 Bars 數量切片)
     source_1h = df_1h if (not df_1h.empty and len(df_1h) >= 5) else df_day
     time_col_1h = 'time_key' if 'time_key' in source_1h.columns else source_1h.columns[0]
     source_1h['dt_raw'] = source_1h[time_col_1h].astype(str)
     source_1h = source_1h.drop_duplicates(subset=['dt_raw']).sort_values('dt_raw').reset_index(drop=True)
-    df_plot_1h = source_1h.tail(60).copy().reset_index(drop=True)
+    
+    # 根據用戶調控參數裁切 1H K線數量
+    df_plot_1h = source_1h.tail(bars_1h_count).copy().reset_index(drop=True)
 
     candles_1h = []
     for _, r in df_plot_1h.iterrows():
@@ -99,6 +108,7 @@ def render_dual_tradingview_charts(df_day: pd.DataFrame, df_1h: pd.DataFrame, wa
     candles_1h_json = json.dumps(candles_1h)
     fib_levels_json = json.dumps(wave_res.get('fib_levels', {}))
     show_fib_p_js = "true" if show_fib_price else "false"
+    show_targets_js = "true" if show_targets else "false"
 
     target_1 = wave_res.get('next_target_1', 0.0)
     target_2 = wave_res.get('next_target_2', 0.0)
@@ -128,6 +138,12 @@ def render_dual_tradingview_charts(df_day: pd.DataFrame, df_1h: pd.DataFrame, wa
                 font-size: 12px; color: #c9d1d9; background: rgba(22, 27, 34, 0.88);
                 backdrop-filter: blur(4px); padding: 5px 10px; border-radius: 6px; border: 1px solid #30363d; pointer-events: none;
             }}
+            .reset-btn {{
+                position: absolute; top: 10px; right: 12px; z-index: 10;
+                font-size: 11px; color: #58a6ff; background: rgba(22, 27, 34, 0.9);
+                border: 1px solid #30363d; border-radius: 4px; padding: 3px 8px; cursor: pointer;
+            }}
+            .reset-btn:hover {{ background: #21262d; color: #79c0ff; }}
             .container {{ width: 100%; height: 100%; }}
         </style>
     </head>
@@ -138,20 +154,27 @@ def render_dual_tradingview_charts(df_day: pd.DataFrame, df_1h: pd.DataFrame, wa
                     <b style="color:#58a6ff;">[左屏] 日線宏觀波浪 (Daily)</b>
                     <span style="color:#ffd700; margin-left:8px;">── 浪級骨架標籤</span>
                 </div>
+                <button class="reset-btn" onclick="fitDayChart()">🔍 適配視野</button>
                 <div id="tv_chart_day" class="container"></div>
             </div>
 
             <div class="chart-box">
                 <div class="box-header">
-                    <b style="color:#00E676;">[右屏] 1H 微觀時空驗證</b>
+                    <b style="color:#00E676;">[右屏] 1H 微觀調控驗證 ({bars_1h_count} Bars)</b>
                     <span style="color:#00E676; margin-left:8px;">── T1: ${target_1:,.2f}</span>
                     <span style="color:#ff7b72; margin-left:8px;">── 防守: ${invalid_p:,.2f}</span>
                 </div>
+                <button class="reset-btn" onclick="fit1hChart()">🔍 適配視野</button>
                 <div id="tv_chart_1h" class="container"></div>
             </div>
         </div>
 
         <script>
+            let chartDay, chart1h;
+
+            function fitDayChart() {{ if (chartDay) chartDay.timeScale().fitContent(); }}
+            function fit1hChart() {{ if (chart1h) chart1h.timeScale().fitContent(); }}
+
             function initCharts() {{
                 if (typeof LightweightCharts === 'undefined') {{
                     setTimeout(initCharts, 80);
@@ -168,9 +191,9 @@ def render_dual_tradingview_charts(df_day: pd.DataFrame, df_1h: pd.DataFrame, wa
                     handleScale: {{ axisPressedMouseMove: true, mouseWheel: true, pinch: true }},
                 }};
 
-                // 1. 初始化左圖 (日線)
+                // 1. 初始化左圖
                 const cDay = document.getElementById('tv_chart_day');
-                const chartDay = LightweightCharts.createChart(cDay, Object.assign({{}}, chartOptionsBase, {{
+                chartDay = LightweightCharts.createChart(cDay, Object.assign({{}}, chartOptionsBase, {{
                     width: cDay.clientWidth,
                     height: cDay.clientHeight,
                 }}));
@@ -188,7 +211,6 @@ def render_dual_tradingview_charts(df_day: pd.DataFrame, df_1h: pd.DataFrame, wa
                 }});
                 waveSeriesDay.setData({wave_day_json});
 
-                // 疊加斐波那契回調水位
                 const showFib = {show_fib_p_js};
                 const fibLevels = {fib_levels_json};
                 if (showFib && Object.keys(fibLevels).length > 0) {{
@@ -212,9 +234,9 @@ def render_dual_tradingview_charts(df_day: pd.DataFrame, df_1h: pd.DataFrame, wa
                 }}
                 chartDay.timeScale().fitContent();
 
-                // 2. 初始化右圖 (1H)
+                // 2. 初始化右圖
                 const c1h = document.getElementById('tv_chart_1h');
-                const chart1h = LightweightCharts.createChart(c1h, Object.assign({{}}, chartOptionsBase, {{
+                chart1h = LightweightCharts.createChart(c1h, Object.assign({{}}, chartOptionsBase, {{
                     width: c1h.clientWidth,
                     height: c1h.clientHeight,
                 }}));
@@ -226,30 +248,34 @@ def render_dual_tradingview_charts(df_day: pd.DataFrame, df_1h: pd.DataFrame, wa
                 }});
                 candleSeries1h.setData({candles_1h_json});
 
-                if ({target_1} > 0) {{
-                    candleSeries1h.createPriceLine({{
-                        price: {target_1}, color: '#00E676', lineWidth: 1.5,
-                        lineStyle: LightweightCharts.LineStyle.Solid,
-                        axisLabelVisible: true, title: 'Target 1 ($' + {target_1}.toFixed(1) + ')',
-                    }});
+                // 調控開關：目標線與防守線
+                const showTargets = {show_targets_js};
+                if (showTargets) {{
+                    if ({target_1} > 0) {{
+                        candleSeries1h.createPriceLine({{
+                            price: {target_1}, color: '#00E676', lineWidth: 1.5,
+                            lineStyle: LightweightCharts.LineStyle.Solid,
+                            axisLabelVisible: true, title: 'Target 1 ($' + {target_1}.toFixed(1) + ')',
+                        }});
+                    }}
+                    if ({target_2} > 0) {{
+                        candleSeries1h.createPriceLine({{
+                            price: {target_2}, color: '#3fb950', lineWidth: 1,
+                            lineStyle: LightweightCharts.LineStyle.Dashed,
+                            axisLabelVisible: true, title: 'Target 2 ($' + {target_2}.toFixed(1) + ')',
+                        }});
+                    }}
+                    if ({invalid_p} > 0) {{
+                        candleSeries1h.createPriceLine({{
+                            price: {invalid_p}, color: '#ff7b72', lineWidth: 1.5,
+                            lineStyle: LightweightCharts.LineStyle.Solid,
+                            axisLabelVisible: true, title: 'SL 防守 ($' + {invalid_p}.toFixed(1) + ')',
+                        }});
+                    }}
                 }}
-                if ({target_2} > 0) {{
-                    candleSeries1h.createPriceLine({{
-                        price: {target_2}, color: '#3fb950', lineWidth: 1,
-                        lineStyle: LightweightCharts.LineStyle.Dashed,
-                        axisLabelVisible: true, title: 'Target 2 ($' + {target_2}.toFixed(1) + ')',
-                    }});
-                }}
-                if ({invalid_p} > 0) {{
-                    candleSeries1h.createPriceLine({{
-                        price: {invalid_p}, color: '#ff7b72', lineWidth: 1.5,
-                        lineStyle: LightweightCharts.LineStyle.Solid,
-                        axisLabelVisible: true, title: 'SL 防守 ($' + {invalid_p}.toFixed(1) + ')',
-                    }});
-                }}
+
                 chart1h.timeScale().fitContent();
 
-                // 3. 自適應 Resize 監聽器
                 const resizeObserver = new ResizeObserver(() => {{
                     chartDay.applyOptions({{ width: cDay.clientWidth, height: cDay.clientHeight }});
                     chart1h.applyOptions({{ width: c1h.clientWidth, height: c1h.clientHeight }});
@@ -266,7 +292,7 @@ def render_dual_tradingview_charts(df_day: pd.DataFrame, df_1h: pd.DataFrame, wa
 
 def render_nq_wave_prediction_dashboard():
     st.markdown("### 🌊 納指 (NQ / QQQ) 艾略特波浪多週期時空聯動終端")
-    st.caption("架構特性: **TradingView 原生 Lightweight Charts GPU 級渲染 + 視角記憶鎖定 + 空間投影**")
+    st.caption("架構特性: **1H 多維度調控台 + TradingView 原廠雙屏聯動 + 空間投影**")
 
     df_day = load_data("US.QQQ", "DAY")
     df_1h = load_data("US.QQQ", "1Hr")
@@ -295,15 +321,30 @@ def render_nq_wave_prediction_dashboard():
 
     st.markdown("---")
 
-    c_title, c_sw1, c_sw2 = st.columns([2.5, 1.2, 1.3])
+    # 🎛️ 1小時專屬調控中樞 (Controls Bar)
+    c_title, c_bars, c_sw1, c_sw2 = st.columns([2.2, 1.3, 1.2, 1.3])
     with c_title:
         st.markdown("#### 📈 多週期 TradingView 左右聯動視窗")
+    with c_bars:
+        bars_preset = st.selectbox(
+            "⏱️ 1H 視窗跨度調控", 
+            options=[8, 24, 48, 72, 120], 
+            index=2, 
+            format_func=lambda x: f"最近 {x} 根 1H 柱 ({x//8 if x>=8 else x} 天)"
+        )
     with c_sw1:
-        show_fib_p = st.toggle("📐 顯示斐波那契價格線", value=True)
+        show_fib_p = st.toggle("📐 斐波那契回調線", value=True)
     with c_sw2:
-        show_fib_t = st.toggle("⏱️ 費氏時間週期窗口", value=True)
+        show_targets = st.toggle("🎯 1H 空間目標/防守線", value=True)
 
-    render_dual_tradingview_charts(df_day, df_1h, wave_res, show_fib_price=show_fib_p, show_fib_time=show_fib_t)
+    render_dual_tradingview_charts(
+        df_day, 
+        df_1h, 
+        wave_res, 
+        show_fib_price=show_fib_p, 
+        show_targets=show_targets,
+        bars_1h_count=bars_preset
+    )
 
     st.markdown("---")
 
