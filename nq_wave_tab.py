@@ -1,5 +1,5 @@
 # 文件名: nq_wave_tab.py
-# 核心功能: 納指 (NQ / QQQ) 日線波浪對比 (我們的經典波浪 vs SmarterSystems ATR 自適應波浪) + AI Prompt 集成
+# 核心功能: 納指 (NQ / QQQ) 日線波浪雙屏對比 (我們的經典波浪 vs SmarterSystems ATR 自適應波浪) + AI Prompt 集成
 
 import os
 import json
@@ -33,18 +33,31 @@ class SmarterWaveAdapter:
     """吸納 SmarterSystems/ElliottWavesEngine 的 ATR 自適應拐點與 3 浪最短否決規則"""
     @staticmethod
     def calculate_smarter_waves(df: pd.DataFrame, atr_mult: float = 1.3) -> tuple:
-        if len(df) < 20:
+        if df.empty or len(df) < 20:
             return [], [], {"valid": True, "note": "數據累積中", "alt": "計算中"}
 
-        high = df['high'].values
-        low = df['low'].values
-        close = df['close'].values
-        dates = df['date_str'].values
+        # 自動防呆相容時間欄位，避免 KeyError: 'date_str'
+        if 'date_str' in df.columns:
+            dates = df['date_str'].astype(str).str.slice(0, 10).values
+        elif 'time_key' in df.columns:
+            dates = df['time_key'].astype(str).str.slice(0, 10).values
+        elif 'date' in df.columns:
+            dates = df['date'].astype(str).str.slice(0, 10).values
+        else:
+            dates = df.iloc[:, 0].astype(str).str.slice(0, 10).values
+
+        high_col = 'high' if 'high' in df.columns else df.columns[1]
+        low_col = 'low' if 'low' in df.columns else df.columns[2]
+        close_col = 'close' if 'close' in df.columns else df.columns[3]
+
+        high = df[high_col].astype(float).values
+        low = df[low_col].astype(float).values
+        close = df[close_col].astype(float).values
         n = len(df)
 
         # 1. ATR 波動率計算
         tr = np.maximum(high[1:] - low[1:], np.maximum(abs(high[1:] - close[:-1]), abs(low[1:] - close[:-1])))
-        atr = np.mean(tr[-14:]) if len(tr) >= 14 else np.mean(tr)
+        atr = np.mean(tr[-14:]) if len(tr) >= 14 else (np.mean(tr) if len(tr) > 0 else 2.0)
         threshold = max(atr * atr_mult, 1.5)
 
         pivots = []
@@ -280,6 +293,10 @@ def render_nq_wave_prediction_dashboard():
     if df_day.empty:
         st.warning("⏳ 尚未檢測到 `US_QQQ_DAY.csv` 數據，請先運行 `python data_fetcher.py`！")
         return
+
+    # 先為 df_day 生成統一的 date_str 欄位，徹底防止底層與衍生計算報錯
+    time_col = 'time_key' if 'time_key' in df_day.columns else df_day.columns[0]
+    df_day['date_str'] = df_day[time_col].astype(str).str.slice(0, 10)
 
     wave_res = ElliottWaveEngine.analyze_wave_structure(df_day)
     curr_price = float(df_day['close'].iloc[-1])
