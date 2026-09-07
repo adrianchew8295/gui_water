@@ -1,5 +1,5 @@
 # 文件名: nq_wave_tab.py
-# 核心功能: 左右雙屏 TradingView 金融級波浪終端 (左: 日線宏觀波浪 / 右: 1H 跨週期映射與 8小時走勢對比) + AI 智能大白話 Prompt
+# 核心功能: 左右雙屏 TradingView 波浪終端 + 8H 走勢核驗 + AI Prompt
 
 import os
 import json
@@ -29,8 +29,6 @@ def load_data(symbol: str, timeframe: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 def render_dual_tradingview_charts(df_day: pd.DataFrame, df_1h: pd.DataFrame, wave_res: dict, show_fib_price: bool, show_fib_time: bool):
-    """繪製左右對稱 TradingView 原生雙屏圖表"""
-    # 1. 處理日線數據
     time_col_d = 'time_key' if 'time_key' in df_day.columns else df_day.columns[0]
     df_day['date_str'] = df_day[time_col_d].astype(str).str.slice(0, 10)
     df_day = df_day.drop_duplicates(subset=['date_str']).sort_values('date_str').reset_index(drop=True)
@@ -68,7 +66,6 @@ def render_dual_tradingview_charts(df_day: pd.DataFrame, df_1h: pd.DataFrame, wa
             'text': f"{lbl} ${pr:,.1f}"
         })
 
-    # 2. 處理 1小時數據 (提取最近 48 根，聚焦最近 8 小時)
     time_col_1h = 'time_key' if 'time_key' in df_1h.columns else df_1h.columns[0]
     df_1h['dt_str'] = df_1h[time_col_1h].astype(str)
     df_1h = df_1h.drop_duplicates(subset=['dt_str']).sort_values('dt_str').reset_index(drop=True)
@@ -77,7 +74,6 @@ def render_dual_tradingview_charts(df_day: pd.DataFrame, df_1h: pd.DataFrame, wa
     candles_1h = []
     for _, r in df_plot_1h.iterrows():
         try:
-            # 轉換為 UNIX 時間戳以精確對齊小時
             dt_val = pd.to_datetime(r['dt_str'])
             ts = int(dt_val.timestamp())
             candles_1h.append({
@@ -90,7 +86,6 @@ def render_dual_tradingview_charts(df_day: pd.DataFrame, df_1h: pd.DataFrame, wa
         except Exception:
             continue
 
-    # 計算 1H 內部子浪骨架
     pivots_1h = ElliottWaveEngine.extract_pivots(df_plot_1h, window=3)
     wave_line_1h = []
     for p in pivots_1h:
@@ -100,7 +95,6 @@ def render_dual_tradingview_charts(df_day: pd.DataFrame, df_1h: pd.DataFrame, wa
         except Exception:
             continue
 
-    # 序列化 JSON
     candles_day_json = json.dumps(candles_day)
     wave_day_json = json.dumps(wave_line_day)
     markers_day_json = json.dumps(markers_day)
@@ -141,7 +135,6 @@ def render_dual_tradingview_charts(df_day: pd.DataFrame, df_1h: pd.DataFrame, wa
     </head>
     <body>
         <div class="dual-wrapper">
-            <!-- 左屏: 日線宏觀波浪 -->
             <div class="chart-box">
                 <div class="box-header">
                     <b style="color:#58a6ff;">[左屏] 日線宏觀波浪圖 (Daily)</b>
@@ -150,7 +143,6 @@ def render_dual_tradingview_charts(df_day: pd.DataFrame, df_1h: pd.DataFrame, wa
                 <div id="tv_chart_day" class="container"></div>
             </div>
 
-            <!-- 右屏: 1小時實戰與日線投影 -->
             <div class="chart-box">
                 <div class="box-header">
                     <b style="color:#00E676;">[右屏] 1小時微觀驗證 (1Hr · 最近8~48H)</b>
@@ -168,7 +160,6 @@ def render_dual_tradingview_charts(df_day: pd.DataFrame, df_1h: pd.DataFrame, wa
                     return;
                 }}
 
-                // --- 1. 初始化左側日線圖 ---
                 const containerDay = document.getElementById('tv_chart_day');
                 const chartDay = LightweightCharts.createChart(containerDay, {{
                     width: containerDay.clientWidth,
@@ -195,7 +186,6 @@ def render_dual_tradingview_charts(df_day: pd.DataFrame, df_1h: pd.DataFrame, wa
                 }});
                 waveSeriesDay.setData({wave_day_json});
 
-                // 斐波那契回調線 (日線)
                 const showFib = {show_fib_p_js};
                 const fibLevels = {fib_levels_json};
                 if (showFib && Object.keys(fibLevels).length > 0) {{
@@ -219,7 +209,6 @@ def render_dual_tradingview_charts(df_day: pd.DataFrame, df_1h: pd.DataFrame, wa
                 }}
                 chartDay.timeScale().fitContent();
 
-                // --- 2. 初始化右側 1小時圖 ---
                 const container1h = document.getElementById('tv_chart_1h');
                 const chart1h = LightweightCharts.createChart(container1h, {{
                     width: container1h.clientWidth,
@@ -245,7 +234,6 @@ def render_dual_tradingview_charts(df_day: pd.DataFrame, df_1h: pd.DataFrame, wa
                 }});
                 waveSeries1h.setData({wave_1h_json});
 
-                // 🌟 將日線波浪 Target 1 / Target 2 / SL 投影到 1小時圖中
                 if ({target_1} > 0) {{
                     candleSeries1h.createPriceLine({{
                         price: {target_1}, color: '#00E676', lineWidth: 1.5,
@@ -268,7 +256,6 @@ def render_dual_tradingview_charts(df_day: pd.DataFrame, df_1h: pd.DataFrame, wa
                     }});
                 }}
 
-                // 1H 視窗預設平滑縮放至最近 16 根 (包含最近 8 小時)
                 chart1h.timeScale().fitContent();
 
                 window.addEventListener('resize', () => {{
@@ -297,8 +284,6 @@ def render_nq_wave_prediction_dashboard():
     wave_res = ElliottWaveEngine.analyze_wave_structure(df_day if len(df_day) >= 50 else df_1h)
     curr_price = float(df_day['close'].iloc[-1])
 
-    # 1. 頂部四大狀態指標 (含 8 小時驗證評分)
-    # 計算 1H 最近 8 小時走勢與預測吻合度
     recent_8h = df_1h.tail(8)
     h8_change = float(recent_8h['close'].iloc[-1] - recent_8h['open'].iloc[0])
     is_bull = "多頭" in wave_res["trend_dir"] or "⑤" in wave_res["current_wave"]
@@ -312,7 +297,6 @@ def render_nq_wave_prediction_dashboard():
 
     st.markdown("---")
 
-    # 2. 控制列：Fibonacci 回調線與時間週期獨立開關
     c_title, c_sw1, c_sw2 = st.columns([2.5, 1.2, 1.3])
     with c_title:
         st.markdown("#### 📈 多週期 TradingView 左右聯動視窗")
@@ -321,12 +305,10 @@ def render_nq_wave_prediction_dashboard():
     with c_sw2:
         show_fib_t = st.toggle("⏱️ 費氏時間週期窗口", value=True)
 
-    # 渲染左右雙屏圖表
     render_dual_tradingview_charts(df_day, df_1h, wave_res, show_fib_price=show_fib_p, show_fib_time=show_fib_t)
 
     st.markdown("---")
 
-    # 3. 空間目標推演與 8 小時對比表
     st.markdown("#### 🧭 空間目標推演與 8 小時實盤驗證 (Time & Price Projection)")
     t1, t2, t3 = st.columns(3)
     
@@ -356,13 +338,12 @@ def render_nq_wave_prediction_dashboard():
 
     st.markdown("---")
 
-    # 4. 專屬 AI 智能分析 Prompt (融入日線 + 1H 最近 8 小時走勢 + 華爾街新聞)
-    st.markdown("#### 🤖 專屬 AI 智能分析 Prompt (大白話解讀 + 8小時走勢偏差 + 華爾街科技股新聞連網)")
-    st.caption("點擊下方代碼框右上角一鍵複製，貼給 ChatGPT、Claude 或 Gemini 即刻解讀！")
+    st.markdown("#### 🤖 專屬 AI 智能分析 Prompt")
+    st.caption("點擊下方代碼框右上角一鍵複製，貼給 AI 即刻解讀：")
 
-    ai_prompt_text = f"""你現在是華爾街資深宏觀量化策略師與科技股分析專家。請基於以下【納指 QQQ / NQ 多週期艾略特波浪實時量化數據（含日線宏觀 + 1小時最近 8 小時走勢）】，用通俗易懂的【大白話】為我深度解讀當前盤面，並即時【聯網檢索華爾街最新科技股動態】：
+    ai_prompt_text = f"""你現在是華爾街資深宏觀量化策略師與科技股分析專家。請基於以下【納指 QQQ / NQ 多週期艾略特波浪實時量化數據】，用通俗易懂的【大白話】為我深度解讀當前盤面，並即時【聯網檢索華爾街最新科技股動態】：
 
-【1. 艾略特波浪多週期量化數據（依據 Frost & Prechter 原著）】
+【1. 艾略特波浪多週期量化數據】
 • 監控標的: 納斯達克 100 指數 (QQQ / NQ)
 • 當前基準現價: ${curr_price:,.2f}
 • 日線宏觀波浪: {wave_res['current_wave']} ({wave_res['wave_phase']})
@@ -379,11 +360,10 @@ def render_nq_wave_prediction_dashboard():
   - Target 1 (1.0x 對稱浪) = ${wave_res['next_target_1']:,.2f}
   - Target 2 (1.618x 擴展浪) = ${wave_res['next_target_2']:,.2f}
   - 結構失效防守線 (SL) = ${wave_res['invalid_price']:,.2f}
-• 費氏時間轉折窗口: {', '.join([x['預計時間窗口'] for x in wave_res['time_window_dates'][:3]])}
 
-【2. 請回答以下三個問題（用大白話講，不要講太複雜的術語）】：
-1. 【大白話走勢與 8 小時驗證】：對比日線大目標與 1 小時圖最近 8 小時的走勢，當前多頭/空頭推升是否順利？有沒有偏離預測軌道？接下來 1~3 天散戶該如何應對？
-2. 【華爾街科技股新聞與巨頭動態】：請即刻聯網檢索今天/本週華爾街關於美股科技 7 巨頭（英偉達 NVDA、蘋果 AAPL、微軟 MSFT、谷歌 GOOGL、亞馬遜 AMZN、Meta、特斯拉 TSLA）以及 AI 芯片、算力板塊的最新重大新聞或機構評級。
-3. 【實戰決策】：結合波浪點位與科技股新聞，給出明確的【0DTE / 短期期權操作計劃】（包含開倉區間、止損防守位與止盈目標）。"""
+【2. 請回答以下三個問題】：
+1. 【大白話走勢與 8 小時驗證】：對比日線目標與 1小時圖最近 8 小時走勢，推升是否順利？接下來 1~3 天如何應對？
+2. 【華爾街科技股新聞與巨頭動態】：請聯網檢索今日科技 7 巨頭最新動態。
+3. 【實戰決策】：給出明確的 0DTE / 短期期權操作計劃（開倉、止損、止盈）。"""
 
     st.code(ai_prompt_text, language="markdown")
