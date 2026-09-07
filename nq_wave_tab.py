@@ -1,5 +1,5 @@
 # 文件名: nq_wave_tab.py
-# 核心功能: 納指 (NQ / QQQ) 日線波浪雙屏對比 (我們的經典波浪 vs SmarterSystems ATR 自適應波浪) + AI Prompt 集成
+# 核心功能: 納指 (NQ / QQQ) 日線雙屏波浪對比 (經典5浪 vs Wave 3 Estudio 專用主升推演) + AI Prompt 集成
 
 import os
 import json
@@ -29,85 +29,109 @@ def load_data(symbol: str, timeframe: str = "DAY") -> pd.DataFrame:
             pass
     return pd.DataFrame()
 
-class SmarterWaveAdapter:
-    """吸納 SmarterSystems/ElliottWavesEngine 的 ATR 自適應拐點與 3 浪最短否決規則"""
+class Wave3EstudioAdapter:
+    """
+    轉譯 elliott-wave3-estudio (Pine Script) 核心算法:
+    專案專注於 Wave 3 主升浪捕捉、1.618x / 2.618x 擴展目標推演與動能突破驗證
+    """
     @staticmethod
-    def calculate_smarter_waves(df: pd.DataFrame, atr_mult: float = 1.3) -> tuple:
+    def calculate_wave3_estudio(df: pd.DataFrame) -> tuple:
         if df.empty or len(df) < 20:
-            return [], [], {"valid": True, "note": "數據累積中", "alt": "計算中"}
+            return [], [], {"status": "數據累積中", "t1": 0.0, "t2": 0.0, "sl": 0.0, "valid": False}
 
-        # 自動防呆相容時間欄位，避免 KeyError: 'date_str'
+        # 1. 提取時間與價格序列
         if 'date_str' in df.columns:
             dates = df['date_str'].astype(str).str.slice(0, 10).values
         elif 'time_key' in df.columns:
             dates = df['time_key'].astype(str).str.slice(0, 10).values
-        elif 'date' in df.columns:
-            dates = df['date'].astype(str).str.slice(0, 10).values
         else:
             dates = df.iloc[:, 0].astype(str).str.slice(0, 10).values
 
-        high_col = 'high' if 'high' in df.columns else df.columns[1]
-        low_col = 'low' if 'low' in df.columns else df.columns[2]
-        close_col = 'close' if 'close' in df.columns else df.columns[3]
-
-        high = df[high_col].astype(float).values
-        low = df[low_col].astype(float).values
-        close = df[close_col].astype(float).values
+        high = df['high'].astype(float).values
+        low = df['low'].astype(float).values
+        close = df['close'].astype(float).values
         n = len(df)
 
-        # 1. ATR 波動率計算
-        tr = np.maximum(high[1:] - low[1:], np.maximum(abs(high[1:] - close[:-1]), abs(low[1:] - close[:-1])))
-        atr = np.mean(tr[-14:]) if len(tr) >= 14 else (np.mean(tr) if len(tr) > 0 else 2.0)
-        threshold = max(atr * atr_mult, 1.5)
-
+        # 2. 幾何拐點提取 (提取候選波段)
         pivots = []
-        last_type = None
-        last_p = close[0]
+        for i in range(3, n - 3):
+            if high[i] == max(high[i-3:i+4]):
+                pivots.append({"index": i, "time": dates[i], "price": high[i], "type": "PEAK"})
+            elif low[i] == min(low[i-3:i+4]):
+                pivots.append({"index": i, "time": dates[i], "price": low[i], "type": "VALLEY"})
 
-        for i in range(1, n):
-            h_i, l_i, t_i = high[i], low[i], dates[i]
-            if last_type != "PEAK" and (h_i - last_p) >= threshold:
-                pivots.append({"index": i, "time": t_i, "price": float(h_i), "type": "PEAK"})
-                last_type = "PEAK"
-                last_p = h_i
-            elif last_type != "VALLEY" and (last_p - l_i) >= threshold:
-                pivots.append({"index": i, "time": t_i, "price": float(l_i), "type": "VALLEY"})
-                last_type = "VALLEY"
-                last_p = l_i
+        # 清洗同向頂底
+        clean_p = []
+        for p in pivots:
+            if not clean_p:
+                clean_p.append(p)
+            else:
+                if clean_p[-1]["type"] != p["type"]:
+                    clean_p.append(p)
+                else:
+                    if p["type"] == "PEAK" and p["price"] > clean_p[-1]["price"]:
+                        clean_p[-1] = p
+                    elif p["type"] == "VALLEY" and p["price"] < clean_p[-1]["price"]:
+                        clean_p[-1] = p
 
-        # 2. 構建折線與標籤數據
         line_data = []
         markers = []
-        smarter_labels = ["P1 (起點)", "P2 (一浪頂)", "P3 (二浪底)", "P4 (三浪主升)", "P5 (四浪調整)", "P6 (五浪衝頂)"]
 
-        for idx, p in enumerate(pivots):
-            t = str(p["time"])[:10]
-            pr = float(p["price"])
-            line_data.append({"time": t, "value": pr})
+        if len(clean_p) < 4:
+            return line_data, markers, {"status": "波段積累中", "t1": 0.0, "t2": 0.0, "sl": 0.0, "valid": False}
+
+        # 取最近 4 個關鍵點作為 W0, W1, W2, W3
+        p0, p1, p2, p3 = clean_p[-4], clean_p[-3], clean_p[-2], clean_p[-1]
+        
+        # 構建折線
+        for p in [p0, p1, p2, p3]:
+            line_data.append({"time": str(p["time"])[:10], "value": float(p["price"])})
+
+        w1_len = abs(p1["price"] - p0["price"])
+        curr_p = close[-1]
+        
+        # 判定多頭 Wave 3 Estudio 形態
+        is_bull_w3 = p1["price"] > p0["price"] and p2["price"] > p0["price"]
+        
+        if is_bull_w3:
+            t1_1618 = round(p2["price"] + 1.618 * w1_len, 2)
+            t2_2618 = round(p2["price"] + 2.618 * w1_len, 2)
+            sl_price = round(p2["price"], 2)
             
-            lbl = smarter_labels[idx] if idx < len(smarter_labels) else f"P{idx+1}"
-            is_peak = p["type"] == "PEAK"
-            markers.append({
-                "time": t,
-                "position": "aboveBar" if is_peak else "belowBar",
-                "color": "#38bdf8",
-                "shape": "arrowDown" if is_peak else "arrowUp",
-                "text": f"{lbl} ${pr:,.1f}"
-            })
+            markers.append({"time": str(p0["time"])[:10], "position": "belowBar", "color": "#a855f7", "shape": "circle", "text": f"W0 ${p0['price']:,.1f}"})
+            markers.append({"time": str(p1["time"])[:10], "position": "aboveBar", "color": "#a855f7", "shape": "arrowDown", "text": f"W1 頂 ${p1['price']:,.1f}"})
+            markers.append({"time": str(p2["time"])[:10], "position": "belowBar", "color": "#00E676", "shape": "arrowUp", "text": f"W2 啟動底 ${p2['price']:,.1f}"})
+            
+            # W3 進行中標註
+            if curr_p > p1["price"]:
+                markers.append({"time": str(p3["time"])[:10], "position": "aboveBar", "color": "#f59e0b", "shape": "circle", "text": f"🔥 W3 主升加速 (${p3['price']:,.1f})"})
+                status_text = "🔥 W3 超級主升浪爆發中 (突破 W1 頂)"
+            else:
+                markers.append({"time": str(p3["time"])[:10], "position": "aboveBar", "color": "#38bdf8", "shape": "circle", "text": f"W3 醞釀中 (${p3['price']:,.1f})"})
+                status_text = "⚡ W3 蓄勢醞釀中 (即將衝擊 W1 頂)"
 
-        # 3. 鐵律審核 (3浪不能最短)
-        audit = {"valid": True, "note": "✅ 符合 Smarter 鐵律", "alt": "主推推動浪 (Primary Count)"}
-        if len(pivots) >= 5:
-            p_vals = [x["price"] for x in pivots[-5:]]
-            w1 = abs(p_vals[1] - p_vals[0])
-            w3 = abs(p_vals[3] - p_vals[2])
-            w5 = abs(p_vals[4] - p_vals[3])
-            if w3 < w1 and w3 < w5:
-                audit = {
-                    "valid": False,
-                    "note": "⚠️ 觸發鐵律否決: 3浪最短",
-                    "alt": "切換為複雜修正浪 (Complex ABC)"
-                }
+            audit = {
+                "status": status_text,
+                "t1": t1_1618,
+                "t2": t2_2618,
+                "sl": sl_price,
+                "valid": True,
+                "w1_len": round(w1_len, 2),
+                "w3_ratio": round(abs(curr_p - p2["price"]) / w1_len if w1_len > 0 else 1.0, 2)
+            }
+        else:
+            t1_1618 = round(p2["price"] - 1.618 * w1_len, 2)
+            t2_2618 = round(p2["price"] - 2.618 * w1_len, 2)
+            sl_price = round(p2["price"], 2)
+            audit = {
+                "status": "🔴 空頭 C 浪 / 下跌 3 浪釋放",
+                "t1": t1_1618,
+                "t2": t2_2618,
+                "sl": sl_price,
+                "valid": True,
+                "w1_len": round(w1_len, 2),
+                "w3_ratio": round(abs(p2["price"] - curr_p) / w1_len if w1_len > 0 else 1.0, 2)
+            }
 
         return line_data, markers, audit
 
@@ -130,7 +154,7 @@ def render_dual_tradingview_charts(df_day: pd.DataFrame, wave_res: dict, show_fi
         except Exception:
             continue
 
-    # 1. 我們的經典波浪
+    # 1. 我們的經典日線波浪
     day_pivots = ElliottWaveEngine.extract_pivots(df_plot, window=4)
     classic_line = []
     classic_markers = []
@@ -150,16 +174,20 @@ def render_dual_tradingview_charts(df_day: pd.DataFrame, wave_res: dict, show_fi
             'text': f"{lbl} ${pr:,.1f}"
         })
 
-    # 2. Smarter ATR 自適應波浪
-    smarter_line, smarter_markers, smarter_audit = SmarterWaveAdapter.calculate_smarter_waves(df_plot, atr_mult=1.3)
+    # 2. Wave 3 Estudio 專用主升推演
+    w3_line, w3_markers, w3_audit = Wave3EstudioAdapter.calculate_wave3_estudio(df_plot)
 
     candles_json = json.dumps(candles)
     classic_line_json = json.dumps(classic_line)
     classic_markers_json = json.dumps(classic_markers)
-    smarter_line_json = json.dumps(smarter_line)
-    smarter_markers_json = json.dumps(smarter_markers)
+    w3_line_json = json.dumps(w3_line)
+    w3_markers_json = json.dumps(w3_markers)
     fib_levels_json = json.dumps(wave_res.get('fib_levels', {}))
     show_fib_p_js = "true" if show_fib_price else "false"
+
+    t1_val = w3_audit.get("t1", 0.0)
+    t2_val = w3_audit.get("t2", 0.0)
+    sl_val = w3_audit.get("sl", 0.0)
 
     html_code = f"""
     <!DOCTYPE html>
@@ -206,11 +234,12 @@ def render_dual_tradingview_charts(df_day: pd.DataFrame, wave_res: dict, show_fi
                 <div id="tv_chart_left" class="container"></div>
             </div>
 
-            <!-- 右屏: SmarterSystems ATR 自適應浪形 -->
+            <!-- 右屏: Wave 3 Estudio 專用主升推演 -->
             <div class="chart-box">
                 <div class="box-header">
-                    <b style="color:#38bdf8;">[右屏] SmarterSystems 自適應 (Daily)</b>
-                    <span style="color:#38bdf8; margin-left:6px;">── ATR 拐點 + 鐵律驗證</span>
+                    <b style="color:#a855f7;">[右屏] Elliott Wave 3 Estudio</b>
+                    <span style="color:#00E676; margin-left:6px;">T1(1.618x): ${t1_val:,.1f}</span>
+                    <span style="color:#ff7b72; margin-left:6px;">SL: ${sl_val:,.1f}</span>
                 </div>
                 <button class="reset-btn" onclick="fitChart(chartRight)">🔍 適配</button>
                 <div id="tv_chart_right" class="container"></div>
@@ -258,18 +287,30 @@ def render_dual_tradingview_charts(df_day: pd.DataFrame, wave_res: dict, show_fi
                 }}
                 chartLeft.timeScale().fitContent();
 
-                // 2. 初始化右圖 (Smarter 自適應)
+                // 2. 初始化右圖 (Wave 3 Estudio)
                 const cRight = document.getElementById('tv_chart_right');
                 chartRight = LightweightCharts.createChart(cRight, Object.assign({{}}, baseOpt, {{ width: cRight.clientWidth, height: cRight.clientHeight }}));
                 const csRight = chartRight.addCandlestickSeries({{ upColor: '#00E676', downColor: '#FF5252', borderUpColor: '#00E676', borderDownColor: '#FF5252', wickUpColor: '#00E676', wickDownColor: '#FF5252' }});
                 csRight.setData({candles_json});
-                csRight.setMarkers({smarter_markers_json});
+                csRight.setMarkers({w3_markers_json});
 
-                const wsRight = chartRight.addLineSeries({{ color: '#38bdf8', lineWidth: 2, crosshairMarkerVisible: false }});
-                wsRight.setData({smarter_line_json});
+                const wsRight = chartRight.addLineSeries({{ color: '#a855f7', lineWidth: 2.5, crosshairMarkerVisible: false }});
+                wsRight.setData({w3_line_json});
+
+                // 標註 Wave 3 專用 1.618x 與 2.618x 目標線
+                if ({t1_val} > 0) {{
+                    csRight.createPriceLine({{ price: {t1_val}, color: '#00E676', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Solid, axisLabelVisible: true, title: 'W3 T1 (1.618x $' + {t1_val}.toFixed(1) + ')' }});
+                }}
+                if ({t2_val} > 0) {{
+                    csRight.createPriceLine({{ price: {t2_val}, color: '#f59e0b', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: 'W3 T2 (2.618x $' + {t2_val}.toFixed(1) + ')' }});
+                }}
+                if ({sl_val} > 0) {{
+                    csRight.createPriceLine({{ price: {sl_val}, color: '#ff7b72', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Solid, axisLabelVisible: true, title: 'W3 失效防守 ($' + {sl_val}.toFixed(1) + ')' }});
+                }}
+
                 chartRight.timeScale().fitContent();
 
-                // 3. 視窗尺寸自適應
+                // 3. 自適應 Resize
                 const resizeObserver = new ResizeObserver(() => {{
                     chartLeft.applyOptions({{ width: cLeft.clientWidth, height: cLeft.clientHeight }});
                     chartRight.applyOptions({{ width: cRight.clientWidth, height: cRight.clientHeight }});
@@ -283,38 +324,37 @@ def render_dual_tradingview_charts(df_day: pd.DataFrame, wave_res: dict, show_fi
     </html>
     """
     components.html(html_code, height=515)
-    return smarter_audit
+    return w3_audit
 
 def render_nq_wave_prediction_dashboard():
-    st.markdown("### 🌊 納指 (NQ / QQQ) 艾略特波浪日線雙引擎對比終端")
-    st.caption("核心架構: **左屏經典波浪骨架 vs 右屏 SmarterSystems ATR 自適應浪形 (1:1 日線對比)**")
+    st.markdown("### 🌊 納指 (NQ / QQQ) 艾略特波浪雙引擎終端 (經典 5 浪 vs Wave 3 Estudio)")
+    st.caption("核心架構: **左屏經典波浪骨架 vs 右屏 Elliott Wave 3 Estudio 主升動能模型 (1:1 日線對比)**")
 
     df_day = load_data("US.QQQ", "DAY")
     if df_day.empty:
         st.warning("⏳ 尚未檢測到 `US_QQQ_DAY.csv` 數據，請先運行 `python data_fetcher.py`！")
         return
 
-    # 先為 df_day 生成統一的 date_str 欄位，徹底防止底層與衍生計算報錯
     time_col = 'time_key' if 'time_key' in df_day.columns else df_day.columns[0]
     df_day['date_str'] = df_day[time_col].astype(str).str.slice(0, 10)
 
     wave_res = ElliottWaveEngine.analyze_wave_structure(df_day)
     curr_price = float(df_day['close'].iloc[-1])
 
-    smarter_line, smarter_markers, smarter_audit = SmarterWaveAdapter.calculate_smarter_waves(df_day.tail(120), atr_mult=1.3)
+    w3_line, w3_markers, w3_audit = Wave3EstudioAdapter.calculate_wave3_estudio(df_day.tail(120))
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("📌 當前基準現價", f"${curr_price:,.2f}")
     m2.metric("🌊 經典波浪定位", wave_res["current_wave"], f"結構: {wave_res['complex_type']}")
-    m3.metric("🧠 Smarter 鐵律審核", "🟢 3浪擴展有效" if smarter_audit["valid"] else "🔴 3浪最短否決", smarter_audit["alt"])
-    m4.metric("⏱️ 運行時間跨度", f"{wave_res['time_elapsed_bars']} 棒", f"預期週期 ~{wave_res['expected_duration_bars']} 棒")
+    m3.metric("🚀 Wave 3 Estudio 狀態", w3_audit.get("status", "運算中"))
+    m4.metric("🎯 3浪擴展倍數", f"{w3_audit.get('w3_ratio', 1.0)}x", f"1浪基數: ${w3_audit.get('w1_len', 0.0):,.1f}")
 
     st.markdown("---")
 
     # 控制列
     c_title, c_sw = st.columns([3, 1])
     with c_title:
-        st.markdown("#### 📈 TradingView 雙屏對比 (左: 經典波浪 | 右: Smarter 自適應)")
+        st.markdown("#### 📈 TradingView 雙屏對比 (左: 經典 5 浪 | 右: Wave 3 Estudio 專用主升)")
     with c_sw:
         show_fib_p = st.toggle("📐 顯示斐波那契價格線", value=True)
 
@@ -324,11 +364,11 @@ def render_nq_wave_prediction_dashboard():
     st.markdown("---")
 
     # 空間目標與對比矩陣
-    st.markdown("#### 🧭 空間目標推演與 SmarterSystems 算法對比矩陣")
+    st.markdown("#### 🧭 空間目標推演與 Wave 3 Estudio 算法對比矩陣")
     t1, t2, t3 = st.columns(3)
     
     with t1:
-        st.markdown("**📐 Fibonacci 價格防線 (日線)**")
+        st.markdown("**📐 Fibonacci 價格防線 (經典日線)**")
         if wave_res["fib_levels"]:
             fib_df = pd.DataFrame([
                 {"Fib 水位": k, "價格 ($)": f"${v:,.2f}"} for k, v in wave_res["fib_levels"].items()
@@ -346,37 +386,36 @@ def render_nq_wave_prediction_dashboard():
         """)
 
     with t3:
-        st.markdown("**🧠 SmarterSystems 算法共振裁決**")
+        st.markdown("**🚀 Wave 3 Estudio 專案推演矩陣**")
         st.info(f"""
-        • **狀態判定**: `{smarter_audit['note']}`
-        • **路徑指引**: `{smarter_audit['alt']}`
-        • **ATR 捕獲拐點**: `{len(smarter_line)} 處`
-        • **雙引擎共振**: `{'🟢 雙重確認主升/推進' if smarter_audit['valid'] else '🟡 需防範複雜鋸齒洗盤'}`
+        • **主升狀態**: `{w3_audit.get('status', '運算中')}`
+        • **W3 Target 1 (1.618x)**: `${w3_audit.get('t1', 0.0):,.2f}`
+        • **W3 Target 2 (2.618x)**: `${w3_audit.get('t2', 0.0):,.2f}`
+        • **W3 結構失效線 (SL)**: `${w3_audit.get('sl', 0.0):,.2f}`
         """)
 
     st.markdown("---")
 
     # 專屬 AI 智能分析 Prompt
-    st.markdown("#### 🤖 專屬 AI 智能分析 Prompt (大白話解讀 + 雙引擎波浪對比 + 華爾街科技股連網)")
+    st.markdown("#### 🤖 專屬 AI 智能分析 Prompt (大白話解讀 + Wave 3 主升共振 + 華爾街科技股連網)")
     st.caption("點擊下方代碼框右上角一鍵複製，貼給 AI 即刻獲取全盤深度解讀：")
 
-    ai_prompt_text = f"""你現在是華爾街資深宏觀量化策略師與科技股分析專家。請基於以下【納指 QQQ / NQ 日線艾略特波浪雙引擎量化數據（含經典 5 浪骨架 + SmarterSystems ATR 自適應對比）】，用通俗易懂的【大白話】為我深度解讀當前盤面，並即時【聯網檢索華爾街最新科技股動態】：
+    ai_prompt_text = f"""你現在是華爾街資深宏觀量化策略師與科技股分析專家。請基於以下【納指 QQQ / NQ 日線艾略特波浪雙引擎量化數據（含經典 5 浪骨架 + Elliott Wave 3 Estudio 專用主升浪推演）】，用通俗易懂的【大白話】為我深度解讀當前盤面，並即時【聯網檢索華爾街最新科技股動態】：
 
 【1. 艾略特波浪雙引擎量化數據】
 • 監控標的: 納斯達克 100 指數 (QQQ / NQ 日線)
 • 當前基準現價: ${curr_price:,.2f}
 • 經典波浪定位: {wave_res['current_wave']} ({wave_res['wave_phase']})
-• 結構特徵: {wave_res['complex_type']} (擴展倍數: {wave_res['extension_ratio']}x)
-• SmarterSystems 算法對比核驗:
-  - 鐵律核驗狀態: {smarter_audit['note']}
-  - 備選路徑狀態: {smarter_audit['alt']}
-• 空間目標與防守點位:
-  - Target 1 (1.0x 對稱浪) = ${wave_res['next_target_1']:,.2f}
-  - Target 2 (1.618x 擴展浪) = ${wave_res['next_target_2']:,.2f}
-  - 結構失效防守線 (SL) = ${wave_res['invalid_price']:,.2f}
+• 經典結構特徵: {wave_res['complex_type']} (擴展倍數: {wave_res['extension_ratio']}x)
+• Wave 3 Estudio 專用主升推演:
+  - 3浪運行狀態: {w3_audit.get('status', '運算中')}
+  - 當前 3 浪推升倍數: {w3_audit.get('w3_ratio', 1.0)}x (基準 1 浪幅度: ${w3_audit.get('w1_len', 0.0):,.2f})
+  - 3浪 Target 1 (1.618x 擴展) = ${w3_audit.get('t1', 0.0):,.2f}
+  - 3浪 Target 2 (2.618x 極限) = ${w3_audit.get('t2', 0.0):,.2f}
+  - 3浪 啟動失效防守線 (SL) = ${w3_audit.get('sl', 0.0):,.2f}
 
 【2. 請回答以下三個問題（用大白話講，不要用過度複雜的術語）】：
-1. 【雙引擎對比大白話解讀】：結合經典波浪與 SmarterSystems 自適應路徑，當前納指是在主升衝頂還是震盪洗盤？接下來 1~3 天該如何應對？
+1. 【雙引擎對比大白話解讀】：結合經典波浪與 Wave 3 Estudio 模型，當前納指是否處於勝率與空間最大的主升浪階段？接下來 1~3 天該如何應對？
 2. 【華爾街科技股新聞與巨頭動態】：請即刻聯網檢索今日華爾街關於美股科技 7 巨頭（英偉達 NVDA、蘋果 AAPL、微軟 MSFT、谷歌 GOOGL、亞馬遜 AMZN、Meta、特斯拉 TSLA）以及 AI 芯片板塊的最新重大新聞與機構評級。
 3. 【實戰決策】：給出明確的【0DTE / 短期期權操作計劃】（包含開倉區間、止損防守位與止盈目標）。"""
 
