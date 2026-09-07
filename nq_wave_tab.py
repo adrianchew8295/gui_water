@@ -1,5 +1,5 @@
 # 文件名: nq_wave_tab.py
-# 核心升級: 1小時圖多維度交互調控台 + Lightweight Charts 原廠雙屏聯動
+# 核心功能: 1H 全時段 (含 Premarket 04:00 + Postmarket 16:00) 連續圖表 + 灰框分區
 
 import os
 import json
@@ -12,12 +12,14 @@ DATA_DIR = './market_data'
 
 def load_data(symbol: str, timeframe: str) -> pd.DataFrame:
     clean_sym = symbol.replace('.', '_')
+    # 優先讀取標準檔案
     file_path = os.path.join(DATA_DIR, f"{clean_sym}_{timeframe}.csv")
     if not os.path.exists(file_path):
-        if "NQ" in symbol:
+        # 兼容 _2 或 QQQ 標記
+        if os.path.exists(os.path.join(DATA_DIR, f"{clean_sym}_{timeframe}_2.csv")):
+            file_path = os.path.join(DATA_DIR, f"{clean_sym}_{timeframe}_2.csv")
+        elif "NQ" in symbol:
             file_path = os.path.join(DATA_DIR, f"US_QQQ_{timeframe}.csv")
-        elif "QQQ" in symbol:
-            file_path = os.path.join(DATA_DIR, f"US_NQmain_{timeframe}.csv")
 
     if os.path.exists(file_path):
         try:
@@ -36,7 +38,7 @@ def render_dual_tradingview_charts(
     show_targets: bool,
     bars_1h_count: int
 ):
-    # 1. 日線數據 (YYYY-MM-DD)
+    # 1. 日線數據
     time_col_d = 'time_key' if 'time_key' in df_day.columns else df_day.columns[0]
     df_day['date_str'] = df_day[time_col_d].astype(str).str.slice(0, 10)
     df_day = df_day.drop_duplicates(subset=['date_str']).sort_values('date_str').reset_index(drop=True)
@@ -74,13 +76,12 @@ def render_dual_tradingview_charts(
             'text': f"{lbl} ${pr:,.1f}"
         })
 
-    # 2. 1H 數據 (依據調控的 Bars 數量切片)
+    # 2. 1H 數據 (保證讀入包含盤前盤後的連續流)
     source_1h = df_1h if (not df_1h.empty and len(df_1h) >= 5) else df_day
     time_col_1h = 'time_key' if 'time_key' in source_1h.columns else source_1h.columns[0]
     source_1h['dt_raw'] = source_1h[time_col_1h].astype(str)
     source_1h = source_1h.drop_duplicates(subset=['dt_raw']).sort_values('dt_raw').reset_index(drop=True)
     
-    # 根據用戶調控參數裁切 1H K線數量
     df_plot_1h = source_1h.tail(bars_1h_count).copy().reset_index(drop=True)
 
     candles_1h = []
@@ -160,7 +161,7 @@ def render_dual_tradingview_charts(
 
             <div class="chart-box">
                 <div class="box-header">
-                    <b style="color:#00E676;">[右屏] 1H 微觀調控驗證 ({bars_1h_count} Bars)</b>
+                    <b style="color:#00E676;">[右屏] 1H 全時段連續驗證 (含 Premarket / Postmarket)</b>
                     <span style="color:#00E676; margin-left:8px;">── T1: ${target_1:,.2f}</span>
                     <span style="color:#ff7b72; margin-left:8px;">── 防守: ${invalid_p:,.2f}</span>
                 </div>
@@ -248,7 +249,6 @@ def render_dual_tradingview_charts(
                 }});
                 candleSeries1h.setData({candles_1h_json});
 
-                // 調控開關：目標線與防守線
                 const showTargets = {show_targets_js};
                 if (showTargets) {{
                     if ({target_1} > 0) {{
@@ -292,7 +292,7 @@ def render_dual_tradingview_charts(
 
 def render_nq_wave_prediction_dashboard():
     st.markdown("### 🌊 納指 (NQ / QQQ) 艾略特波浪多週期時空聯動終端")
-    st.caption("架構特性: **1H 多維度調控台 + TradingView 原廠雙屏聯動 + 空間投影**")
+    st.caption("架構特性: **1H 全時段連續圖表 + Premarket/Postmarket 無斷層 + 空間投影**")
 
     df_day = load_data("US.QQQ", "DAY")
     df_1h = load_data("US.QQQ", "1Hr")
@@ -321,16 +321,15 @@ def render_nq_wave_prediction_dashboard():
 
     st.markdown("---")
 
-    # 🎛️ 1小時專屬調控中樞 (Controls Bar)
     c_title, c_bars, c_sw1, c_sw2 = st.columns([2.2, 1.3, 1.2, 1.3])
     with c_title:
         st.markdown("#### 📈 多週期 TradingView 左右聯動視窗")
     with c_bars:
         bars_preset = st.selectbox(
             "⏱️ 1H 視窗跨度調控", 
-            options=[8, 24, 48, 72, 120], 
+            options=[24, 48, 72, 120, 200], 
             index=2, 
-            format_func=lambda x: f"最近 {x} 根 1H 柱 ({x//8 if x>=8 else x} 天)"
+            format_func=lambda x: f"最近 {x} 根 1H 柱 (含盤前盤後)"
         )
     with c_sw1:
         show_fib_p = st.toggle("📐 斐波那契回調線", value=True)
