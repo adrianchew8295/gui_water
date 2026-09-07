@@ -1,86 +1,123 @@
 # 文件名: data_fetcher.py
-# 核心功能: 專為 QQQ 打造的多週期歷史數據引擎 (Weekly, Daily, 1Hr, 5M)
+# 核心功能: 全週期歷史基座同步器 (WEEK, DAY, 5M, 以及全時段 1Hr 重採樣)
 
 import os
 import time
 import datetime
 import pandas as pd
 import pytz
-from moomoo import OpenQuoteContext, RET_OK, KLType, AuType
+import yfinance as yf
+from moomoo import OpenQuoteContext, RET_OK, KLType, AuType, SubType
 
 tz_ny = pytz.timezone("America/New_York")
 DATA_DIR = './market_data'
 os.makedirs(DATA_DIR, exist_ok=True)
 
-TARGET_CODE = "US.QQQ"
+TARGETS = [
+    {"code": "US.QQQ", "yf_sym": "QQQ", "name": "納指 ETF"},
+    {"code": "CC.BTCUSD", "yf_sym": "BTC-USD", "name": "比特幣"}
+]
 
-def fetch_qqq_multi_timeframe():
-    print(f"🚀 [多週期數據引擎] 開始拉取 {TARGET_CODE} 的完整歷史基座...")
-    
+def fetch_history_opend(quote_ctx, code: str, ktype: KLType, days_back: int, count: int) -> pd.DataFrame:
+    now_ny = datetime.datetime.now(tz_ny)
+    start_str = (now_ny - datetime.timedelta(days=days_back)).strftime("%Y-%m-%d")
+    end_str = now_ny.strftime("%Y-%m-%d")
+    try:
+        ret, df_k, msg = quote_ctx.request_history_kline(
+            code=code, start=start_str, end=end_str, ktype=ktype, autype=AuType.NONE, max_count=count
+        )
+        if ret == RET_OK and not df_k.empty:
+            df = df_k[['time_key', 'open', 'close', 'high', 'low', 'volume']].copy()
+            df['time_key'] = pd.to_datetime(df['time_key'])
+            return df.sort_values('time_key').reset_index(drop=True)
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+def fetch_5m_full_stream(quote_ctx, code: str, yf_sym: str) -> pd.DataFrame:
+    """抓取包含盤前盤後的 5M 數據 (優先 OpenD，備援 yfinance)"""
+    # 1. 嘗試 OpenD 5M
+    now_ny = datetime.datetime.now(tz_ny)
+    start_str = (now_ny - datetime.timedelta(days=20)).strftime("%Y-%m-%d")
+    end_str = now_ny.strftime("%Y-%m-%d")
+    try:
+        quote_ctx.subscribe([code], [SubType.K_5M])
+        time.sleep(0.3)
+        ret, df_k, _ = quote_ctx.request_history_kline(
+            code=code, start=start_str, end=end_str, ktype=KLType.K_5M, autype=AuType.NONE, max_count=3000
+        )
+        if ret == RET_OK and not df_k.empty:
+            df = df_k[['time_key', 'open', 'close', 'high', 'low', 'volume']].copy()
+            df['time_key'] = pd.to_datetime(df['time_key'])
+            return df.sort_values('time_key').reset_index(drop=True)
+    except Exception:
+        pass
+
+    # 2. 備援 yfinance 5M
+    try:
+        df_yf = yf.download(tickers=yf_sym, period="1mo", interval="5m", prepost=True, progress=False, auto_adjust=False)
+        if not df_yf.empty:
+            df_yf.columns = [c[0].lower() if isinstance(df_yf.columns, pd.MultiIndex) else c.lower() for c in df_yf.columns]
+            df_yf = df_yf.reset_index()
+            dt_col = 'Datetime' if 'Datetime' in df_yf.columns else ('Date' if 'Date' in df_yf.columns else df_yf.columns[0])
+            df_yf['time_key'] = pd.to_datetime(df_yf[dt_col])
+            if df_yf['time_key'].dt.tz is None:
+                df_yf['time_key'] = df_yf['time_key'].dt.tz_localize('UTC').dt.tz_convert(tz_ny)
+            else:
+                df_yf['time_key'] = df_yf['time_key'].dt.tz_convert(tz_ny)
+            df_yf['time_key'] = df_yf['time_key'].dt.tz_localize(None)
+            clean_df = df_yf[['time_key', 'open', 'close', 'high', 'low', 'volume']].dropna()
+            return clean_df.sort_values('time_key').reset_index(drop=True)
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+def run_sync():
+    print("🚀 【全週期數據同步啟動】正在獲取 WEEK, DAY, 1Hr, 5M 全量連續基座...")
+    quote_ctx = None
     try:
         quote_ctx = OpenQuoteContext(host='127.0.0.1', port=11111)
     except Exception as e:
-        print(f"❌ 無法連接 OpenD，請確認本地網關是否已啟動並登入！錯誤: {e}")
-        return
+        print(f"⚠️ OpenD 未連線或離線: {e}，將啟用 yfinance 備援...")
 
-    now_ny = datetime.datetime.now(tz_ny)
-    end_date = now_ny.strftime("%Y-%m-%d")
-    
-    # 時間跨度定義
-    start_date_1yr = (now_ny - datetime.timedelta(days=365)).strftime("%Y-%m-%d") # 周線、日線、1小時 (1年)
-    start_date_10d = (now_ny - datetime.timedelta(days=15)).strftime("%Y-%m-%d")  # 5分鐘 (最近10-15天高頻)
+    for item in TARGETS:
+        code = item["code"]
+        clean_code = code.replace('.', '_')
+        yf_sym = item["yf_sym"]
+        print(f"\n[*] 正在同步標的: {code} ({item['name']})")
 
-    timeframes = [
-        {"name": "WEEK (週線)", "ktype": KLType.K_WEEK, "start": start_date_1yr, "suffix": "_WEEK.csv"},
-        {"name": "DAY (日線)", "ktype": KLType.K_DAY, "start": start_date_1yr, "suffix": "_DAY.csv"},
-        {"name": "1Hr (1小時)", "ktype": KLType.K_60M, "start": start_date_1yr, "suffix": "_1Hr.csv"},
-        {"name": "5M (5分鐘)", "ktype": KLType.K_5M, "start": start_date_10d, "suffix": "_5M.csv"}
-    ]
+        # 1. 抓取 5M 全時段原始流
+        df_5m = fetch_5m_full_stream(quote_ctx, code, yf_sym) if quote_ctx else pd.DataFrame()
+        if not df_5m.empty:
+            df_5m.to_csv(os.path.join(DATA_DIR, f"{clean_code}_5M.csv"), index=False)
+            print(f"  ✅ [5M 落盤成功] {len(df_5m)} 根 (含盤前盤後)")
 
-    clean_code = TARGET_CODE.replace('.', '_')
-
-    for tf in timeframes:
-        print(f"\n[*] 正在拉取 {TARGET_CODE} 專屬 {tf['name']} 數據...")
-        all_dfs = []
-        page_req_key = None
-        page = 1
-        
-        while True:
-            ret, data, page_req_key = quote_ctx.request_history_kline(
-                code=TARGET_CODE,
-                start=tf["start"],
-                end=end_date,
-                ktype=tf["ktype"],
-                autype=AuType.NONE,
-                max_count=1000,
-                page_req_key=page_req_key
-            )
-            
-            if ret == RET_OK:
-                if not data.empty:
-                    all_dfs.append(data)
-                    print(f"    -> 成功獲取第 {page} 頁 ({len(data)} 根 K 線)")
-                if page_req_key is None:
-                    break
-                page += 1
-                time.sleep(0.3)
-            else:
-                print(f"❌ {tf['name']} 拉取失敗: {data}")
-                break
-                
-        if all_dfs:
-            df_full = pd.concat(all_dfs, ignore_index=True)
-            df_full.columns = [c.lower() for c in df_full.columns]
-            df_full = df_full.drop_duplicates(subset=['time_key']).sort_values('time_key').reset_index(drop=True)
-            
-            file_path = os.path.join(DATA_DIR, f"{clean_code}{tf['suffix']}")
-            df_full.to_csv(file_path, index=False)
-            print(f"✅ {tf['name']} 存檔成功！已寫入 {len(df_full)} 根 K 線至: {file_path}")
+            # 2. 本地重採樣為全時段連續 1Hr
+            df_temp = df_5m.copy().set_index('time_key')
+            df_1h = df_temp.resample('1h', closed='left', label='left').agg({
+                'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
+            }).dropna().reset_index()
+            df_1h.to_csv(os.path.join(DATA_DIR, f"{clean_code}_1Hr.csv"), index=False)
+            print(f"  ✅ [1Hr 重採樣成功] {len(df_1h)} 根 (連續不跳空)")
         else:
-            print(f"⚠️ {tf['name']} 未獲取到有效數據。")
+            print(f"  ❌ 5M / 1Hr 拉取失敗")
 
-    quote_ctx.close()
-    print("\n🎉 [多週期數據引擎] QQQ 四大週期歷史基座全部落盤完畢！")
+        # 3. 日線 (DAY)
+        df_day = fetch_history_opend(quote_ctx, code, KLType.K_DAY, 365, 250) if quote_ctx else pd.DataFrame()
+        if not df_day.empty:
+            df_day.to_csv(os.path.join(DATA_DIR, f"{clean_code}_DAY.csv"), index=False)
+            print(f"  ✅ [DAY 日線落盤] {len(df_day)} 根")
+
+        # 4. 週線 (WEEK)
+        df_week = fetch_history_opend(quote_ctx, code, KLType.K_WEEK, 750, 100) if quote_ctx else pd.DataFrame()
+        if not df_week.empty:
+            df_week.to_csv(os.path.join(DATA_DIR, f"{clean_code}_WEEK.csv"), index=False)
+            print(f"  ✅ [WEEK 週線落盤] {len(df_week)} 根")
+
+    if quote_ctx:
+        try: quote_ctx.close()
+        except: pass
+    print("\n🎉 【數據同步完畢】所有 CSV 檔案已沉澱至 ./market_data/！")
 
 if __name__ == "__main__":
-    fetch_qqq_multi_timeframe()
+    run_sync()
