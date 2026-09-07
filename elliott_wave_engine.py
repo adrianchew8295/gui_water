@@ -1,12 +1,10 @@
 # 文件名: elliott_wave_engine.py
-# 核心功能: 嚴格依據 Frost & Prechter《Elliott Wave Principle》原著算法構建的波浪理論時空推演引擎
+# 核心功能: 依據 Frost & Prechter 原著演算法構建的波浪理論時空推演引擎
 
 import numpy as np
 import pandas as pd
 import datetime
 from typing import Dict, Any, List
-
-FIB_NUMBERS = [1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377]
 
 class ElliottWaveEngine:
     @staticmethod
@@ -51,7 +49,7 @@ class ElliottWaveEngine:
 
     @classmethod
     def analyze_wave_structure(cls, df: pd.DataFrame) -> Dict[str, Any]:
-        """依據 Frost & Prechter 原著進行全量時空推演與複雜浪分類"""
+        """波浪時空推演與指標計算"""
         res = {
             "current_wave": "波浪識別中",
             "wave_phase": "中繼",
@@ -85,31 +83,24 @@ class ElliottWaveEngine:
         last_idx = len(df) - 1
         curr_price = float(df['close'].iloc[-1] if 'close' in df.columns else df['Close'].iloc[-1])
 
-        # 1. 計算各浪長度與時間跨度 (Bars)
         w1_len = abs(p1["price"] - p0["price"])
         w1_time = max(1, abs(p1["index"] - p0["index"]))
-        w2_len = abs(p2["price"] - p1["price"])
         w2_time = max(1, abs(p2["index"] - p1["index"]))
         w3_len = abs(p3["price"] - p2["price"])
         w3_time = max(1, abs(p3["index"] - p2["index"]))
-        w4_len = abs(p4["price"] - p3["price"])
-        w4_time = max(1, abs(p4["index"] - p3["index"]))
 
         current_time_spent = last_idx - p4["index"]
         res["time_elapsed_bars"] = current_time_spent
 
-        # 2. 判定主浪型與擴展 (Extension - Chapter 1)
         if w1_len > 0:
             w3_ratio = round(w3_len / w1_len, 2)
             if w3_ratio >= 1.618:
                 res["is_extended"] = True
                 res["extension_ratio"] = w3_ratio
 
-        # 3. 嚴格數學計算 Fibonacci 回調位 (Chapter 4 Retracements)
         is_bullish = p1["price"] > p0["price"] and p3["price"] > p1["price"]
 
         if is_bullish:
-            # 多頭結構：回調支撐在波峰下方
             peak_ref = max(p1["price"], p3["price"], curr_price)
             trough_ref = min(p0["price"], p2["price"], p4["price"])
             span = peak_ref - trough_ref
@@ -127,18 +118,14 @@ class ElliottWaveEngine:
             res["trend_dir"] = "🟢 多頭上升驅動 (Impulse Up)"
 
             if p4["type"] == "TROUGH":
-                # 當前自 p4 波谷向上走第 5 浪衝頂
                 res["current_wave"] = "🌊 第 ⑤ 浪 (多頭最後衝頂浪)"
                 res["wave_phase"] = "推動末端 / 衝頂加速"
                 res["sub_wave"] = "Sub-Wave 5-3"
 
-                # 依據原著：Target 1 (5浪 = 1浪長度), Target 2 (5浪 = 0.618 倍 1浪+3浪)
                 res["next_target_1"] = round(p4["price"] + w1_len, 2)
                 res["next_target_2"] = round(p4["price"] + 0.618 * (w1_len + w3_len), 2)
-                # 鐵律：第 4 浪不得跌破第 1 浪頂點
                 res["invalid_price"] = round(p1["price"], 2)
 
-                # 時間預測 (Time Projection): 5 浪時間常等於 1 浪或 0.618 倍 3 浪
                 exp_bars = max(int(w1_time), int(w3_time * 0.618))
                 res["expected_duration_bars"] = exp_bars
 
@@ -148,13 +135,12 @@ class ElliottWaveEngine:
                     res["complex_type"] = "標準五浪上升結構 (5-Wave Impulse)"
 
                 res["prediction_narrative"] = (
-                    f"依據《艾略特波浪理論》原著，NQ/QQQ 當前處於第 ⑤ 浪主升衝頂階段。"
+                    f"依據波浪理論，當前處於第 ⑤ 浪主升衝頂階段。"
                     f"首要目標看至 1.0x 對稱位 **${res['next_target_1']}**，"
                     f"極限衝頂目標看至 1.618x 擴展位 **${res['next_target_2']}**；"
-                    f"波浪失效防守線設在第 ① 浪頂點 **${res['invalid_price']}**。"
+                    f"失效防守線設在第 ① 浪頂點 **${res['invalid_price']}**。"
                 )
             else:
-                # 當前自 p4 波峰向下走第 4 浪調整
                 res["current_wave"] = "🌊 第 ④ 浪 (複雜修正浪 / Complex WXY)"
                 res["is_complex"] = True
                 res["complex_type"] = "雙重三浪 (W-X-Y) / 平台型橫盤整理"
@@ -165,7 +151,6 @@ class ElliottWaveEngine:
                 res["next_target_2"] = round(p3["price"] - 0.500 * w3_len, 2)
                 res["invalid_price"] = round(p1["price"], 2)
 
-                # 第 4 浪時間常與第 2 浪呈斐波那契倍數 (1.382x / 1.618x)
                 exp_bars = int(w2_time * 1.618)
                 res["expected_duration_bars"] = exp_bars
 
@@ -174,7 +159,6 @@ class ElliottWaveEngine:
                     f"預計在 Fib 0.382 ~ 0.500 支撐區間（**${res['next_target_1']} ~ ${res['next_target_2']}**）完成震盪築底。"
                 )
         else:
-            # 空頭驅動 / 調整浪
             trough_ref = min(p1["price"], p3["price"], curr_price)
             peak_ref = max(p0["price"], p2["price"], p4["price"])
             span = peak_ref - trough_ref
@@ -203,7 +187,6 @@ class ElliottWaveEngine:
                 f"處於 ABC 調整浪 Wave C 下殺階段，下行目標指向 **${res['next_target_1']}**。"
             )
 
-        # 4. 計算費氏時間窗口預測 (Fibonacci Time Windows)
         p4_date_str = p4["time"]
         try:
             p4_dt = datetime.datetime.strptime(p4_date_str, "%Y-%m-%d")
@@ -217,7 +200,6 @@ class ElliottWaveEngine:
         except Exception:
             pass
 
-        # 5. 整理波浪拐點表
         for idx, p in enumerate(pivots[-6:]):
             res["wave_table"].append({
                 "波浪節點": f"Wave Pivot #{idx+1}",
